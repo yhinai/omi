@@ -542,9 +542,15 @@ function App() {
           </div>
           <button 
             onClick={runManualDetection}
-            className="mt-2 bg-pink-500 hover:bg-pink-600 px-2 py-1 rounded text-white text-xs"
+            className="mt-2 bg-pink-500 hover:bg-pink-600 px-2 py-1 rounded text-white text-xs mr-2"
           >
             🔍 Test Detection
+          </button>
+          <button 
+            onClick={testVoice}
+            className="mt-2 bg-blue-500 hover:bg-blue-600 px-2 py-1 rounded text-white text-xs"
+          >
+            🔊 Test Voice
           </button>
           {cameraError && <div className="text-red-300 mt-1">Error: {cameraError}</div>}
         </div>
