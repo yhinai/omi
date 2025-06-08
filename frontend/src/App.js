@@ -722,6 +722,24 @@ function App() {
           </div>
         </div>
 
+        {/* Current Direction Display */}
+        {navigationActive && currentDirection && (
+          <div className="absolute top-1/2 left-4 right-4 transform -translate-y-1/2 bg-blue-600/95 text-white p-4 rounded-lg z-40 shadow-lg">
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <div className="font-bold text-lg mb-1">🧭 Navigation</div>
+                <div className="text-sm leading-relaxed">{currentDirection}</div>
+              </div>
+              <button 
+                onClick={stopNavigation}
+                className="ml-4 bg-red-500 hover:bg-red-600 px-3 py-2 rounded text-sm font-bold"
+              >
+                Stop
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Navigation Status */}
         {navigationActive && (
           <div className="absolute top-20 right-4 bg-blue-600/90 text-white p-3 rounded-lg z-30 max-w-xs">
