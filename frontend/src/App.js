@@ -418,8 +418,9 @@ function App() {
             <div className="flex items-center space-x-2">
               <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
               <span className="text-white text-sm font-medium">LIVE</span>
-              <div className="ml-4 text-white text-xs">
-                🔊 Voice: ON
+              <div className="ml-4 text-white text-xs flex items-center space-x-1">
+                <span>🔊</span>
+                <span>{speechSupported ? (voiceEnabled ? 'Voice: ON' : 'Tap to enable voice') : 'Voice: Not supported'}</span>
               </div>
             </div>
           </div>
