@@ -746,7 +746,7 @@ function App() {
             <div className="font-bold text-sm">🗺️ Navigation Active</div>
             <div className="text-xs mt-1">Following walking route</div>
             <button 
-              onClick={() => setNavigationActive(false)}
+              onClick={stopNavigation}
               className="mt-2 bg-red-500 hover:bg-red-600 px-2 py-1 rounded text-xs"
             >
               Stop Navigation
