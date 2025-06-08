@@ -38,20 +38,30 @@ function App() {
         console.log('Model loaded successfully!');
 
         // Get camera access - optimized for MacBook
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: { 
-            width: { ideal: 1280, min: 640 }, 
-            height: { ideal: 720, min: 480 },
-            facingMode: 'user', // Front camera for better UX
-            frameRate: { ideal: 30, min: 15 }
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            video: { 
+              width: { ideal: 1280, min: 640 }, 
+              height: { ideal: 720, min: 480 },
+              facingMode: 'user', // Front camera for better UX
+              frameRate: { ideal: 30, min: 15 }
+            }
+          });
+          
+          setCameraStatus('connected');
+          
+          if (videoRef.current) {
+            videoRef.current.srcObject = stream;
+            await videoRef.current.play();
+            console.log('Camera connected successfully!');
           }
-        });
-        
-        setCameraStatus('connected');
-        
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          videoRef.current.play();
+        } catch (cameraError) {
+          console.error('Camera error:', cameraError);
+          setCameraError(cameraError.message);
+          setCameraStatus('error');
+          
+          // If camera fails, create a test canvas for demo
+          createTestCanvas();
         }
         
         setIsLoading(false);
@@ -60,6 +70,38 @@ function App() {
         setCameraError(error.message);
         setCameraStatus('error');
         setIsLoading(false);
+      }
+    };
+
+    // Create test canvas when camera isn't available
+    const createTestCanvas = () => {
+      if (videoRef.current) {
+        const canvas = document.createElement('canvas');
+        canvas.width = 640;
+        canvas.height = 480;
+        const ctx = canvas.getContext('2d');
+        
+        // Draw test scene
+        ctx.fillStyle = '#1a1a1a';
+        ctx.fillRect(0, 0, 640, 480);
+        
+        // Draw person rectangle
+        ctx.fillStyle = '#ff6b6b';
+        ctx.fillRect(200, 150, 80, 200);
+        ctx.fillStyle = '#white';
+        ctx.font = '14px Arial';
+        ctx.fillText('Test Person', 210, 140);
+        
+        // Draw chair rectangle  
+        ctx.fillStyle = '#4ecdc4';
+        ctx.fillRect(350, 250, 100, 80);
+        ctx.fillText('Test Chair', 360, 240);
+        
+        // Convert canvas to video stream
+        const stream = canvas.captureStream(30);
+        videoRef.current.srcObject = stream;
+        videoRef.current.play();
+        console.log('Using test canvas for demo');
       }
     };
 
