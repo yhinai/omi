@@ -487,7 +487,11 @@ function App() {
               <span className="text-white text-sm font-medium">LIVE</span>
               <div className="ml-4 text-white text-xs flex items-center space-x-1">
                 <span>🔊</span>
-                <span>{speechSupported ? (voiceEnabled ? 'Voice: ON' : 'Tap to enable voice') : 'Voice: Not supported'}</span>
+                <span>
+                  {!speechSupported ? 'Voice: Not supported' : 
+                   !voiceEnabled ? (isMobile ? 'Tap screen to enable voice' : 'Click to enable voice') : 
+                   'Voice: ON'}
+                </span>
               </div>
             </div>
           </div>
