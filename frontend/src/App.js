@@ -20,6 +20,9 @@ function App() {
   const [userLocation, setUserLocation] = useState(null);
   const [navigationActive, setNavigationActive] = useState(false);
   const [currentRoute, setCurrentRoute] = useState(null);
+  const [currentDirection, setCurrentDirection] = useState('');
+  const [lastDirectionTime, setLastDirectionTime] = useState(0);
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
 
   // Vehicle types for detection
   const vehicleTypes = ['car', 'truck', 'bus', 'motorcycle', 'bicycle', 'train'];
