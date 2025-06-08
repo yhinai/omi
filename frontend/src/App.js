@@ -489,12 +489,28 @@ function App() {
     }
   };
 
-  // Initialize voice on first user interaction
+  // Chrome iOS specific voice initialization
   const initializeVoice = () => {
     if (!voiceInitialized && window.speechSynthesis) {
-      speak('Voice system ready');
+      if (isChrome) {
+        // For Chrome iOS, try multiple initialization attempts
+        console.log('Initializing voice for Chrome iOS...');
+        
+        // First attempt: Silent utterance
+        const silentUtterance = new SpeechSynthesisUtterance('');
+        silentUtterance.volume = 0.01;
+        window.speechSynthesis.speak(silentUtterance);
+        
+        // Second attempt: Audible test
+        setTimeout(() => {
+          speak('Voice system ready for Chrome');
+        }, 200);
+      } else {
+        speak('Voice system ready');
+      }
+      
       setVoiceInitialized(true);
-      console.log('Voice initialized');
+      console.log('Voice initialized for', isChrome ? 'Chrome iOS' : 'other browser');
     }
   };
 
