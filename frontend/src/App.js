@@ -386,29 +386,49 @@ function App() {
     return R * c;
   };
 
-  // Enhanced speak function with voice selection
+  // Enhanced speak function with Chrome iOS fixes
   const speak = (text) => {
     try {
-      if (window.speechSynthesis) {
-        window.speechSynthesis.cancel();
+      if (!window.speechSynthesis) {
+        console.log('Speech synthesis not available');
+        return;
+      }
+
+      // Cancel any existing speech
+      window.speechSynthesis.cancel();
+      
+      const speakWithDelay = () => {
+        const utterance = new SpeechSynthesisUtterance(text);
         
-        setTimeout(() => {
-          const utterance = new SpeechSynthesisUtterance(text);
+        // Chrome iOS specific settings
+        if (isChrome) {
+          utterance.volume = 1.0;
+          utterance.rate = 0.9;
+          utterance.pitch = selectedVoice === 'male' ? 0.8 : 1.0;
+          utterance.lang = 'en-US';
           
-          // Select voice based on preference
+          // For Chrome iOS, use default voice if available voices aren't working
+          const voices = speechSynthesis.getVoices();
+          if (voices.length > 0) {
+            // Try to find a good default voice
+            const defaultVoice = voices.find(v => v.default) || voices[0];
+            if (defaultVoice) {
+              utterance.voice = defaultVoice;
+              console.log('Chrome iOS: Using voice:', defaultVoice.name);
+            }
+          }
+        } else {
+          // Regular voice selection for other browsers
           if (availableVoices.length > 0) {
             let voice;
             if (selectedVoice === 'male') {
-              // Look for male voices (deeper pitch, male names)
               voice = availableVoices.find(v => 
                 v.name.toLowerCase().includes('male') ||
                 v.name.toLowerCase().includes('david') ||
                 v.name.toLowerCase().includes('daniel') ||
-                v.name.toLowerCase().includes('alex') ||
-                (v.name.toLowerCase().includes('google') && v.name.toLowerCase().includes('us') && !v.name.toLowerCase().includes('female'))
+                v.name.toLowerCase().includes('alex')
               );
             } else {
-              // Look for female voices
               voice = availableVoices.find(v => 
                 v.name.toLowerCase().includes('female') ||
                 v.name.toLowerCase().includes('susan') ||
@@ -428,13 +448,35 @@ function App() {
           utterance.pitch = selectedVoice === 'male' ? 0.7 : 1.1;
           utterance.volume = 1.0;
           utterance.lang = 'en-US';
+        }
+        
+        utterance.onstart = () => {
+          console.log('🔊 Speaking:', text);
+          setVoiceRetryCount(0);
+        };
+        
+        utterance.onerror = (e) => {
+          console.error('Speech error:', e.error);
           
-          utterance.onstart = () => console.log('🔊 Speaking:', text);
-          utterance.onerror = (e) => console.error('Speech error:', e);
-          
-          window.speechSynthesis.speak(utterance);
-        }, 100);
-      }
+          // Chrome iOS retry logic
+          if (isChrome && voiceRetryCount < 2) {
+            console.log('Chrome iOS: Retrying speech...');
+            setVoiceRetryCount(prev => prev + 1);
+            setTimeout(() => speakWithDelay(), 500);
+          }
+        };
+        
+        utterance.onend = () => {
+          console.log('🔊 Speech completed');
+        };
+
+        window.speechSynthesis.speak(utterance);
+      };
+      
+      // Chrome iOS needs longer delay
+      const delay = isChrome ? 300 : 100;
+      setTimeout(speakWithDelay, delay);
+      
     } catch (error) {
       console.error('Voice error:', error);
     }
