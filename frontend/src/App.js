@@ -345,6 +345,16 @@ function App() {
         if (now - lastDirectionTime > 30000) { // 30 second cooldown
           const nextDirection = formatNavigationDirection(nextStep);
           setCurrentDirection(nextDirection);
+          
+          // Update next direction to the step after next
+          const stepAfterNext = nextStepIndex + 1;
+          if (stepAfterNext < steps.length) {
+            const futureDirection = formatNavigationDirection(steps[stepAfterNext]);
+            setNextDirection(futureDirection);
+          } else {
+            setNextDirection('You will arrive at your destination');
+          }
+          
           speak(`In ${Math.round(distanceToNext)} meters, ${nextDirection}`);
           setLastDirectionTime(now);
           setCurrentStepIndex(nextStepIndex);
