@@ -15,6 +15,8 @@ function App() {
   const [lastVoiceAnnouncement, setLastVoiceAnnouncement] = useState({});
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
+  const [isMobile, setIsMobile] = useState(false);
+  const [notifications, setNotifications] = useState([]);
 
   // Initialize voice support and enable on user interaction
   useEffect(() => {
