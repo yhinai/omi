@@ -173,16 +173,26 @@ function App() {
         setIsModelLoaded(true);
         console.log('Model loaded successfully!');
 
-        // Get camera access - optimized for MacBook
+        // Get camera access - optimized for mobile devices
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({
+          const constraints = {
             video: { 
-              width: { ideal: 1280, min: 640 }, 
-              height: { ideal: 720, min: 480 },
-              facingMode: 'user',
+              width: { ideal: 1280, min: 320 }, 
+              height: { ideal: 720, min: 240 },
+              facingMode: 'environment', // Back camera for mobile, better for object detection
               frameRate: { ideal: 30, min: 15 }
             }
-          });
+          };
+
+          // Try back camera first, then front camera
+          let stream;
+          try {
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+          } catch (backCameraError) {
+            console.log('Back camera failed, trying front camera');
+            constraints.video.facingMode = 'user';
+            stream = await navigator.mediaDevices.getUserMedia(constraints);
+          }
           
           setCameraStatus('connected');
           
