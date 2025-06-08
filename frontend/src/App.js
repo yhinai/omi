@@ -789,6 +789,7 @@ function App() {
               <span className="text-white text-sm font-medium">LIVE</span>
               <div className="ml-4 text-white text-xs">
                 🔊 Voice: {voiceInitialized ? 'ON' : 'Tap to enable'}
+                {isChrome && <span className="text-yellow-300"> (Chrome)</span>}
               </div>
             </div>
           </div>
