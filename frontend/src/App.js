@@ -35,6 +35,8 @@ function App() {
           }
         });
         
+        setCameraStatus('connected');
+        
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
           videoRef.current.play();
@@ -43,6 +45,8 @@ function App() {
         setIsLoading(false);
       } catch (error) {
         console.error('Error initializing app:', error);
+        setCameraError(error.message);
+        setCameraStatus('error');
         setIsLoading(false);
       }
     };
