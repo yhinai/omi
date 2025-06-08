@@ -8,11 +8,11 @@ function App() {
   const [model, setModel] = useState(null);
   const [detections, setDetections] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
-  const [alerts, setAlerts] = useState([]);
   const [isModelLoaded, setIsModelLoaded] = useState(false);
   const [cameraError, setCameraError] = useState(null);
   const [cameraStatus, setCameraStatus] = useState('requesting');
   const [detectionCount, setDetectionCount] = useState(0);
+  const [lastVoiceAnnouncement, setLastVoiceAnnouncement] = useState({});
 
   // Manual detection trigger for testing
   const runManualDetection = async () => {
