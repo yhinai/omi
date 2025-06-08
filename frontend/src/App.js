@@ -385,6 +385,7 @@ function App() {
   const stopNavigation = () => {
     setNavigationActive(false);
     setCurrentDirection('');
+    setNextDirection('');
     setCurrentRoute(null);
     setCurrentStepIndex(0);
     if (window.navigationWatchId) {
