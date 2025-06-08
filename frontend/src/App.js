@@ -256,6 +256,17 @@ function App() {
           </div>
         </div>
 
+        {/* Debug Panel */}
+        <div className="absolute top-20 right-4 bg-black/70 text-white p-3 rounded-lg text-xs max-w-xs z-30">
+          <div className="font-bold mb-2">🔧 Debug Info</div>
+          <div>Backend: {typeof tf !== 'undefined' ? tf.getBackend() : 'loading...'}</div>
+          <div>Camera: {cameraStatus}</div>
+          <div>Model: {isModelLoaded ? 'loaded' : 'loading'}</div>
+          <div>Video Ready: {videoRef.current?.readyState || 0}/4</div>
+          <div>Detections: {detections.length}</div>
+          {cameraError && <div className="text-red-300 mt-1">Error: {cameraError}</div>}
+        </div>
+
         {/* Alert Notifications - TikTok style */}
         <div className="absolute top-20 left-4 right-4 z-20 space-y-2">
           {alerts.map(alert => (
