@@ -16,36 +16,92 @@ function App() {
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [speechSupported, setSpeechSupported] = useState(false);
 
-  // Voice announcement with cooldown
-  const announceDetection = (objectClass, confidence) => {
-    const now = Date.now();
-    const lastAnnounced = lastVoiceAnnouncement[objectClass] || 0;
-    const cooldownPeriod = 30000; // 30 seconds
-
-    // Only announce if 30 seconds have passed since last announcement for this object
-    if (now - lastAnnounced > cooldownPeriod) {
-      const message = `${objectClass} detected with ${confidence} percent confidence`;
+  // Initialize voice support and enable on user interaction
+  useEffect(() => {
+    // Check if speech synthesis is supported
+    if ('speechSynthesis' in window) {
+      setSpeechSupported(true);
+      console.log('Speech synthesis supported');
       
-      // Use Web Speech API for voice output
-      if ('speechSynthesis' in window) {
-        const utterance = new SpeechSynthesisUtterance(message);
-        utterance.rate = 0.9;
-        utterance.pitch = 1.0;
-        utterance.volume = 0.8;
-        speechSynthesis.speak(utterance);
-        console.log(`🔊 Voice: ${message}`);
-      } else {
-        console.log(`🔊 Voice not supported: ${message}`);
+      // On iOS, we need user interaction to enable speech
+      const enableVoiceOnInteraction = () => {
+        if (!voiceEnabled) {
+          // Test voice with empty utterance to initialize on iOS
+          const testUtterance = new SpeechSynthesisUtterance('');
+          testUtterance.volume = 0;
+          speechSynthesis.speak(testUtterance);
+          setVoiceEnabled(true);
+          console.log('Voice enabled after user interaction');
+        }
+      };
+
+      // Add event listeners for user interaction
+      const events = ['touchstart', 'click', 'keydown'];
+      events.forEach(event => {
+        document.addEventListener(event, enableVoiceOnInteraction, { once: true });
+      });
+
+      return () => {
+        events.forEach(event => {
+          document.removeEventListener(event, enableVoiceOnInteraction);
+        });
+      };
+    } else {
+      console.log('Speech synthesis not supported');
+      setSpeechSupported(false);
+    }
+  }, [voiceEnabled]);
+
+  // Voice announcement with cooldown and iOS compatibility
+  const announceDetection = (objectClass, confidence) => {
+    try {
+      if (!speechSupported || !voiceEnabled) {
+        console.log('🔇 Voice not available - speech synthesis not supported or not enabled');
+        return;
       }
 
-      // Update last announcement time
-      setLastVoiceAnnouncement(prev => ({
-        ...prev,
-        [objectClass]: now
-      }));
-    } else {
-      const timeLeft = Math.round((cooldownPeriod - (now - lastAnnounced)) / 1000);
-      console.log(`🔇 Voice cooldown: ${objectClass} - ${timeLeft}s remaining`);
+      const now = Date.now();
+      const lastAnnounced = lastVoiceAnnouncement[objectClass] || 0;
+      const cooldownPeriod = 30000; // 30 seconds
+
+      // Only announce if 30 seconds have passed since last announcement for this object
+      if (now - lastAnnounced > cooldownPeriod) {
+        const message = `${objectClass} detected with ${confidence} percent confidence`;
+        
+        // Use Web Speech API for voice output with iOS-specific settings
+        const utterance = new SpeechSynthesisUtterance(message);
+        utterance.rate = 0.8; // Slower for better clarity on mobile
+        utterance.pitch = 1.0;
+        utterance.volume = 1.0; // Full volume for mobile
+        utterance.lang = 'en-US'; // Explicit language for better compatibility
+        
+        // iOS-specific handling
+        utterance.onstart = () => {
+          console.log(`🔊 Voice started: ${message}`);
+        };
+        
+        utterance.onerror = (event) => {
+          console.error('Speech synthesis error:', event.error);
+        };
+        
+        utterance.onend = () => {
+          console.log('🔊 Voice announcement completed');
+        };
+
+        speechSynthesis.speak(utterance);
+        console.log(`🔊 Voice: ${message}`);
+
+        // Update last announcement time
+        setLastVoiceAnnouncement(prev => ({
+          ...prev,
+          [objectClass]: now
+        }));
+      } else {
+        const timeLeft = Math.round((cooldownPeriod - (now - lastAnnounced)) / 1000);
+        console.log(`🔇 Voice cooldown: ${objectClass} - ${timeLeft}s remaining`);
+      }
+    } catch (error) {
+      console.error('Voice announcement error:', error);
     }
   };
 
