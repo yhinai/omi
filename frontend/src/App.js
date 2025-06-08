@@ -11,6 +11,8 @@ function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [alerts, setAlerts] = useState([]);
   const [isModelLoaded, setIsModelLoaded] = useState(false);
+  const [cameraError, setCameraError] = useState(null);
+  const [cameraStatus, setCameraStatus] = useState('requesting');
 
   // Initialize camera and model
   useEffect(() => {
