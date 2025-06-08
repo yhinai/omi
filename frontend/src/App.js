@@ -21,8 +21,11 @@ function App() {
   const [navigationActive, setNavigationActive] = useState(false);
   const [currentRoute, setCurrentRoute] = useState(null);
   const [currentDirection, setCurrentDirection] = useState('');
+  const [nextDirection, setNextDirection] = useState('');
   const [lastDirectionTime, setLastDirectionTime] = useState(0);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [isChrome, setIsChrome] = useState(false);
+  const [voiceRetryCount, setVoiceRetryCount] = useState(0);
 
   // Vehicle types for detection
   const vehicleTypes = ['car', 'truck', 'bus', 'motorcycle', 'bicycle', 'train'];
