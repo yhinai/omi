@@ -215,14 +215,23 @@ function App() {
         
         // Start with first direction
         if (route.legs && route.legs[0].steps && route.legs[0].steps.length > 0) {
-          const firstStep = route.legs[0].steps[0];
+          const steps = route.legs[0].steps;
+          const firstStep = steps[0];
           const firstDirection = formatNavigationDirection(firstStep);
           setCurrentDirection(firstDirection);
+          
+          // Set next direction if available
+          if (steps.length > 1) {
+            const secondStep = steps[1];
+            const secondDirection = formatNavigationDirection(secondStep);
+            setNextDirection(secondDirection);
+          }
+          
           speak(firstDirection);
           setLastDirectionTime(Date.now());
           
           // Set up location tracking for turn-by-turn
-          startLocationTracking(route.legs[0].steps);
+          startLocationTracking(steps);
         }
       } else {
         speak('Unable to find walking route');
