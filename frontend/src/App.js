@@ -171,10 +171,10 @@ function App() {
     }
   };
 
-  // Get walking directions using OSRM
+  // Get walking directions using OSRM with detailed street names
   const getWalkingDirections = async (start, end) => {
     try {
-      const url = `https://router.project-osrm.org/route/v1/foot/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true`;
+      const url = `https://router.project-osrm.org/route/v1/foot/${start.lng},${start.lat};${end.lng},${end.lat}?overview=full&geometries=geojson&steps=true&annotations=true`;
       
       const response = await fetch(url);
       const data = await response.json();
@@ -188,10 +188,18 @@ function App() {
         
         setCurrentRoute(route);
         setNavigationActive(true);
+        setCurrentStepIndex(0);
         
-        // Start turn-by-turn directions
-        if (route.legs && route.legs[0].steps) {
-          speakDirections(route.legs[0].steps);
+        // Start with first direction
+        if (route.legs && route.legs[0].steps && route.legs[0].steps.length > 0) {
+          const firstStep = route.legs[0].steps[0];
+          const firstDirection = formatNavigationDirection(firstStep);
+          setCurrentDirection(firstDirection);
+          speak(firstDirection);
+          setLastDirectionTime(Date.now());
+          
+          // Set up location tracking for turn-by-turn
+          startLocationTracking(route.legs[0].steps);
         }
       } else {
         speak('Unable to find walking route');
@@ -202,15 +210,145 @@ function App() {
     }
   };
 
-  // Speak turn-by-turn directions
-  const speakDirections = (steps) => {
-    steps.forEach((step, index) => {
-      setTimeout(() => {
-        const instruction = step.maneuver?.instruction || 'Continue straight';
-        const distance = Math.round(step.distance);
-        speak(`Step ${index + 1}: ${instruction}. Distance: ${distance} meters`);
-      }, index * 3000); // 3 seconds between each instruction
-    });
+  // Format navigation directions like real GPS apps
+  const formatNavigationDirection = (step) => {
+    const maneuver = step.maneuver;
+    const distance = Math.round(step.distance);
+    const streetName = step.name || 'the road';
+    
+    let direction = '';
+    
+    switch (maneuver.type) {
+      case 'depart':
+        direction = `Start by walking on ${streetName}`;
+        break;
+      case 'turn':
+        const turnDirection = maneuver.modifier;
+        if (turnDirection === 'left') {
+          direction = `Turn left onto ${streetName}`;
+        } else if (turnDirection === 'right') {
+          direction = `Turn right onto ${streetName}`;
+        } else if (turnDirection === 'slight left') {
+          direction = `Turn slightly left onto ${streetName}`;
+        } else if (turnDirection === 'slight right') {
+          direction = `Turn slightly right onto ${streetName}`;
+        } else {
+          direction = `Turn ${turnDirection} onto ${streetName}`;
+        }
+        break;
+      case 'continue':
+        direction = `Continue on ${streetName}`;
+        break;
+      case 'merge':
+        direction = `Merge onto ${streetName}`;
+        break;
+      case 'ramp':
+        direction = `Take the ramp to ${streetName}`;
+        break;
+      case 'arrive':
+        direction = 'You have arrived at your destination';
+        break;
+      default:
+        direction = `Head ${maneuver.modifier || 'straight'} on ${streetName}`;
+    }
+    
+    // Add distance for non-arrival instructions
+    if (maneuver.type !== 'arrive' && distance > 0) {
+      if (distance > 100) {
+        direction += ` for ${Math.round(distance)} meters`;
+      } else if (distance > 20) {
+        direction += ` for ${distance} meters`;
+      }
+    }
+    
+    return direction;
+  };
+
+  // Start location tracking for navigation
+  const startLocationTracking = (steps) => {
+    if (!navigator.geolocation) return;
+    
+    const watchId = navigator.geolocation.watchPosition(
+      (position) => {
+        const currentLat = position.coords.latitude;
+        const currentLng = position.coords.longitude;
+        
+        // Check if we're close to the next turn
+        checkNavigationProgress(currentLat, currentLng, steps);
+      },
+      (error) => {
+        console.error('Location tracking error:', error);
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 10000,
+        maximumAge: 5000
+      }
+    );
+    
+    // Store watch ID to clear later
+    window.navigationWatchId = watchId;
+  };
+
+  // Check navigation progress and announce next directions
+  const checkNavigationProgress = (currentLat, currentLng, steps) => {
+    if (currentStepIndex >= steps.length) return;
+    
+    const currentStep = steps[currentStepIndex];
+    const nextStepIndex = currentStepIndex + 1;
+    
+    if (nextStepIndex < steps.length) {
+      const nextStep = steps[nextStepIndex];
+      const nextStepLocation = nextStep.maneuver.location;
+      
+      // Calculate distance to next turn
+      const distanceToNext = calculateDistance(
+        currentLat, currentLng,
+        nextStepLocation[1], nextStepLocation[0]
+      );
+      
+      // If within 50 meters of next turn, announce it (with 30-second cooldown)
+      if (distanceToNext < 50) {
+        const now = Date.now();
+        if (now - lastDirectionTime > 30000) { // 30 second cooldown
+          const nextDirection = formatNavigationDirection(nextStep);
+          setCurrentDirection(nextDirection);
+          speak(`In ${Math.round(distanceToNext)} meters, ${nextDirection}`);
+          setLastDirectionTime(now);
+          setCurrentStepIndex(nextStepIndex);
+        }
+      }
+    }
+    
+    // Check if we've arrived at destination
+    if (currentStepIndex === steps.length - 1) {
+      const destination = steps[steps.length - 1].maneuver.location;
+      const distanceToDestination = calculateDistance(
+        currentLat, currentLng,
+        destination[1], destination[0]
+      );
+      
+      if (distanceToDestination < 20) {
+        speak('You have arrived at your destination');
+        setCurrentDirection('You have arrived at your destination');
+        setNavigationActive(false);
+        if (window.navigationWatchId) {
+          navigator.geolocation.clearWatch(window.navigationWatchId);
+        }
+      }
+    }
+  };
+
+  // Stop navigation
+  const stopNavigation = () => {
+    setNavigationActive(false);
+    setCurrentDirection('');
+    setCurrentRoute(null);
+    setCurrentStepIndex(0);
+    if (window.navigationWatchId) {
+      navigator.geolocation.clearWatch(window.navigationWatchId);
+    }
+    speak('Navigation stopped');
   };
 
   // Calculate distance between two points
