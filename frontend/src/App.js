@@ -254,7 +254,7 @@ function App() {
     initializeApp();
   }, []);
 
-  // Object detection loop with better dependency management
+  // Object detection loop with better dependency management and error handling
   useEffect(() => {
     console.log('Detection effect triggered:', { model: !!model, video: !!videoRef.current, isLoading });
     
@@ -303,12 +303,16 @@ function App() {
           console.log('Relevant detections:', relevantDetections);
           setDetections(relevantDetections);
           
-          // Voice announcements for detected objects
+          // Voice announcements for detected objects (with error handling)
           if (relevantDetections.length > 0) {
             console.log('Processing voice announcements for detections');
-            relevantDetections.forEach(detection => {
-              announceDetection(detection.class, Math.round(detection.score * 100));
-            });
+            try {
+              relevantDetections.forEach(detection => {
+                announceDetection(detection.class, Math.round(detection.score * 100));
+              });
+            } catch (voiceError) {
+              console.error('Voice announcement error:', voiceError);
+            }
           }
         } else {
           console.log('Video not ready:', {
@@ -325,19 +329,19 @@ function App() {
     const initialTimeout = setTimeout(() => {
       console.log('Running initial detection...');
       detectObjects();
-    }, 2000);
+    }, 3000); // Longer delay for mobile
 
     const interval = setInterval(() => {
       console.log('Interval tick - running detection');
       detectObjects();
-    }, 2000); // 2 seconds interval for voice announcements
+    }, 3000); // Slower interval for mobile stability
     
     return () => {
       console.log('Cleaning up detection interval');
       clearTimeout(initialTimeout);
       clearInterval(interval);
     };
-  }, [model, isLoading, lastVoiceAnnouncement]);
+  }, [model, isLoading]); // Removed lastVoiceAnnouncement from dependencies to prevent loops
 
   const renderDetectionBoxes = () => {
     if (!videoRef.current || detections.length === 0) return null;
