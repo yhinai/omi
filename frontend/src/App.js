@@ -13,6 +13,8 @@ function App() {
   const [cameraStatus, setCameraStatus] = useState('requesting');
   const [detectionCount, setDetectionCount] = useState(0);
   const [lastVoiceAnnouncement, setLastVoiceAnnouncement] = useState({});
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [speechSupported, setSpeechSupported] = useState(false);
 
   // Voice announcement with cooldown
   const announceDetection = (objectClass, confidence) => {
