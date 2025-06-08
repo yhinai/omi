@@ -108,16 +108,33 @@ function App() {
     initializeApp();
   }, []);
 
-  // Object detection loop
+  // Object detection loop with better dependency management
   useEffect(() => {
-    if (!model || !videoRef.current) return;
+    console.log('Detection effect triggered:', { model: !!model, video: !!videoRef.current });
+    
+    if (!model) {
+      console.log('No model available yet');
+      return;
+    }
+    
+    if (!videoRef.current) {
+      console.log('No video element available yet');
+      return;
+    }
+
+    console.log('Starting detection interval...');
 
     const detectObjects = async () => {
       try {
         const video = videoRef.current;
         
+        if (!video) {
+          console.log('Video ref lost');
+          return;
+        }
+        
         // Enhanced video readiness check
-        if (video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
           console.log('Running detection...', { 
             readyState: video.readyState, 
             dimensions: `${video.videoWidth}x${video.videoHeight}`,
@@ -137,6 +154,7 @@ function App() {
           
           // Create alerts for detected objects
           if (relevantDetections.length > 0) {
+            console.log('Creating alerts for detections');
             const newAlerts = relevantDetections.map(detection => ({
               id: Math.random(),
               class: detection.class,
@@ -161,9 +179,23 @@ function App() {
       }
     };
 
-    const interval = setInterval(detectObjects, 500); // Slower interval for debugging
-    return () => clearInterval(interval);
-  }, [model]);
+    // Initial detection after short delay
+    const initialTimeout = setTimeout(() => {
+      console.log('Running initial detection...');
+      detectObjects();
+    }, 1000);
+
+    const interval = setInterval(() => {
+      console.log('Interval tick - running detection');
+      detectObjects();
+    }, 1000); // 1 second for better debugging
+    
+    return () => {
+      console.log('Cleaning up detection interval');
+      clearTimeout(initialTimeout);
+      clearInterval(interval);
+    };
+  }, [model, isLoading]); // Added isLoading to dependencies
 
   // Auto-remove alerts after 3 seconds
   useEffect(() => {
