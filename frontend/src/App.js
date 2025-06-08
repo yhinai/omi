@@ -18,6 +18,18 @@ function App() {
   useEffect(() => {
     const initializeApp = async () => {
       try {
+        // Configure TensorFlow.js backend for better compatibility
+        await tf.ready();
+        console.log('TensorFlow.js backend:', tf.getBackend());
+        
+        // Force CPU backend if WebGL fails
+        if (tf.getBackend() === 'webgl') {
+          console.log('Using WebGL backend');
+        } else {
+          console.log('WebGL not available, using CPU backend');
+          await tf.setBackend('cpu');
+        }
+        
         // Load TensorFlow.js model
         console.log('Loading COCO-SSD model...');
         const loadedModel = await cocoSsd.load();
