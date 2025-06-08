@@ -33,7 +33,7 @@ body {
   animation: fadeInUp 0.6s ease-out;
 }
 
-/* TikTok-style gradients */
+/* Gradient text effects */
 .gradient-text {
   background: linear-gradient(45deg, #ff0050, #ff4081, #7c4dff);
   -webkit-background-clip: text;
@@ -80,4 +80,77 @@ body {
 
 .animate-pulse-custom {
   animation: pulse-custom 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Voice command button animations */
+@keyframes listening-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7);
+  }
+  50% {
+    box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+  }
+}
+
+.listening-animation {
+  animation: listening-pulse 1.5s infinite;
+}
+
+/* Detection box styling */
+.detection-box {
+  border: 3px solid;
+  border-radius: 8px;
+  background-opacity: 0.2;
+  transition: all 0.3s ease;
+}
+
+.detection-box:hover {
+  background-opacity: 0.3;
+  transform: scale(1.02);
+}
+
+/* Navigation status styling */
+.navigation-active {
+  animation: fadeInUp 0.5s ease-out;
+}
+
+/* Voice control panel styling */
+.voice-panel {
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+/* Mobile optimizations */
+@media (max-width: 768px) {
+  .debug-panel {
+    display: none;
+  }
+  
+  .voice-panel {
+    font-size: 0.75rem;
+  }
+  
+  .detection-box {
+    border-width: 2px;
+  }
+}
+
+/* High contrast mode support */
+@media (prefers-contrast: high) {
+  .detection-box {
+    border-width: 4px;
+  }
+  
+  .voice-panel {
+    background: rgba(0, 0, 0, 0.9);
+  }
+}
+
+/* Reduced motion support */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none;
+    animation: none;
+  }
 }
