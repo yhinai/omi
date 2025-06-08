@@ -522,6 +522,7 @@ function App() {
           <div>Detections: {detections.length}</div>
           <div>Detection Runs: {detectionCount}</div>
           <div>Voice: {speechSupported ? (voiceEnabled ? 'enabled' : 'needs interaction') : 'not supported'}</div>
+          <div>Mobile: {isMobile ? 'yes' : 'no'}</div>
           <div className="mt-2">
             <div className="text-yellow-300 font-bold">Voice Cooldowns:</div>
             {Object.entries(lastVoiceAnnouncement).map(([objectType, timestamp]) => {
