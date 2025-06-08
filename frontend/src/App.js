@@ -568,11 +568,12 @@ function App() {
             )}
             
             <div className="text-gray-400 text-xs mt-3">
-              🔊 Voice announcements with 30-second cooldown
-              {speechSupported && !voiceEnabled && (
-                <div className="text-yellow-400 mt-1">
-                  📱 Tap anywhere to enable voice on mobile
-                </div>
+              {speechSupported ? (
+                voiceEnabled ? 
+                  '🔊 Voice announcements with 30-second cooldown' :
+                  `📱 ${isMobile ? 'Tap screen' : 'Click anywhere'} to enable voice announcements`
+              ) : (
+                '📱 Voice not supported - using visual notifications'
               )}
             </div>
           </div>
