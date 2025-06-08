@@ -35,17 +35,37 @@ function App() {
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
   const recognition = SpeechRecognition ? new SpeechRecognition() : null;
 
-  // Initialize voices
+  // Detect browser for voice compatibility
+  useEffect(() => {
+    const isChromeBrowser = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
+    const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+    setIsChrome(isChromeBrowser && isMobile);
+    console.log('Browser detection:', { isChromeBrowser, isMobile, isChrome: isChromeBrowser && isMobile });
+  }, []);
+
+  // Initialize voices with Chrome iOS specific handling
   useEffect(() => {
     const loadVoices = () => {
       const voices = speechSynthesis.getVoices();
       setAvailableVoices(voices);
-      console.log('Available voices:', voices.map(v => `${v.name} (${v.lang})`));
+      console.log('Available voices:', voices.map(v => `${v.name} (${v.lang}) ${v.default ? '[DEFAULT]' : ''}`));
+      
+      // For Chrome iOS, sometimes voices load later
+      if (isChrome && voices.length === 0) {
+        console.log('Chrome iOS: No voices yet, will retry...');
+        setTimeout(loadVoices, 500);
+      }
     };
 
     loadVoices();
     speechSynthesis.onvoiceschanged = loadVoices;
-  }, []);
+    
+    // Chrome iOS specific: Force voice loading
+    if (isChrome) {
+      setTimeout(loadVoices, 1000);
+      setTimeout(loadVoices, 2000);
+    }
+  }, [isChrome]);
 
   // Get user location
   useEffect(() => {
