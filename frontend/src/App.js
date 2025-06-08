@@ -71,35 +71,55 @@ function App() {
     if (!model || !videoRef.current) return;
 
     const detectObjects = async () => {
-      if (videoRef.current && videoRef.current.readyState === 4) {
-        const predictions = await model.detect(videoRef.current);
+      try {
+        const video = videoRef.current;
         
-        // Filter for chairs and persons only
-        const relevantDetections = predictions.filter(prediction => 
-          prediction.class === 'person' || prediction.class === 'chair'
-        );
-        
-        setDetections(relevantDetections);
-        
-        // Create alerts for detected objects
-        if (relevantDetections.length > 0) {
-          const newAlerts = relevantDetections.map(detection => ({
-            id: Math.random(),
-            class: detection.class,
-            confidence: Math.round(detection.score * 100),
-            timestamp: Date.now()
-          }));
+        // Enhanced video readiness check
+        if (video && video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          console.log('Running detection...', { 
+            readyState: video.readyState, 
+            dimensions: `${video.videoWidth}x${video.videoHeight}`,
+            backend: tf.getBackend()
+          });
           
-          setAlerts(prev => {
-            // Keep only recent alerts (last 3 seconds)
-            const filtered = prev.filter(alert => Date.now() - alert.timestamp < 3000);
-            return [...filtered, ...newAlerts].slice(-5); // Keep max 5 alerts
+          const predictions = await model.detect(video);
+          console.log('All predictions:', predictions.map(p => ({ class: p.class, score: p.score })));
+          
+          // Filter for chairs and persons only
+          const relevantDetections = predictions.filter(prediction => 
+            prediction.class === 'person' || prediction.class === 'chair'
+          );
+          
+          console.log('Relevant detections:', relevantDetections);
+          setDetections(relevantDetections);
+          
+          // Create alerts for detected objects
+          if (relevantDetections.length > 0) {
+            const newAlerts = relevantDetections.map(detection => ({
+              id: Math.random(),
+              class: detection.class,
+              confidence: Math.round(detection.score * 100),
+              timestamp: Date.now()
+            }));
+            
+            setAlerts(prev => {
+              // Keep only recent alerts (last 3 seconds)
+              const filtered = prev.filter(alert => Date.now() - alert.timestamp < 3000);
+              return [...filtered, ...newAlerts].slice(-5); // Keep max 5 alerts
+            });
+          }
+        } else {
+          console.log('Video not ready:', {
+            readyState: video?.readyState,
+            dimensions: `${video?.videoWidth || 0}x${video?.videoHeight || 0}`
           });
         }
+      } catch (error) {
+        console.error('Detection error:', error);
       }
     };
 
-    const interval = setInterval(detectObjects, 200); // Detect every 200ms
+    const interval = setInterval(detectObjects, 500); // Slower interval for debugging
     return () => clearInterval(interval);
   }, [model]);
 
