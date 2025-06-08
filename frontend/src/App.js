@@ -18,27 +18,57 @@ function App() {
   const [isMobile, setIsMobile] = useState(false);
   const [notifications, setNotifications] = useState([]);
 
-  // Initialize voice support and enable on user interaction
+  // Initialize voice support and detect mobile
   useEffect(() => {
+    // Detect if we're on mobile
+    const checkMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+    setIsMobile(checkMobile);
+    
     // Check if speech synthesis is supported
     if ('speechSynthesis' in window) {
       setSpeechSupported(true);
-      console.log('Speech synthesis supported');
+      console.log('Speech synthesis supported, Mobile:', checkMobile);
       
-      // On iOS, we need user interaction to enable speech
-      const enableVoiceOnInteraction = () => {
+      // For mobile devices, we need a more aggressive approach
+      const enableVoiceOnInteraction = async () => {
         if (!voiceEnabled) {
-          // Test voice with empty utterance to initialize on iOS
-          const testUtterance = new SpeechSynthesisUtterance('');
-          testUtterance.volume = 0;
-          speechSynthesis.speak(testUtterance);
-          setVoiceEnabled(true);
-          console.log('Voice enabled after user interaction');
+          try {
+            // Stop any existing speech
+            speechSynthesis.cancel();
+            
+            // Wait a bit for the cancel to complete
+            setTimeout(() => {
+              // Create a test utterance to "wake up" the speech engine
+              const testUtterance = new SpeechSynthesisUtterance('Voice enabled');
+              testUtterance.volume = 0.1;
+              testUtterance.rate = 1;
+              testUtterance.lang = 'en-US';
+              
+              testUtterance.onstart = () => {
+                console.log('Voice test started - voice enabled!');
+                setVoiceEnabled(true);
+              };
+              
+              testUtterance.onerror = (e) => {
+                console.error('Voice test failed:', e);
+                setVoiceEnabled(false);
+              };
+              
+              testUtterance.onend = () => {
+                console.log('Voice test completed');
+              };
+              
+              speechSynthesis.speak(testUtterance);
+            }, 100);
+            
+          } catch (error) {
+            console.error('Voice initialization error:', error);
+          }
         }
       };
 
       // Add event listeners for user interaction
-      const events = ['touchstart', 'click', 'keydown'];
+      const events = ['touchstart', 'touchend', 'click', 'keydown'];
       events.forEach(event => {
         document.addEventListener(event, enableVoiceOnInteraction, { once: true });
       });
@@ -54,14 +84,25 @@ function App() {
     }
   }, [voiceEnabled]);
 
-  // Voice announcement with cooldown and iOS compatibility
+  // Show notification (fallback for when voice doesn't work)
+  const showNotification = (message) => {
+    const notification = {
+      id: Date.now(),
+      message,
+      timestamp: Date.now()
+    };
+    
+    setNotifications(prev => [...prev, notification]);
+    
+    // Remove notification after 3 seconds
+    setTimeout(() => {
+      setNotifications(prev => prev.filter(n => n.id !== notification.id));
+    }, 3000);
+  };
+
+  // Enhanced voice announcement with iOS-specific handling and fallback
   const announceDetection = (objectClass, confidence) => {
     try {
-      if (!speechSupported || !voiceEnabled) {
-        console.log('🔇 Voice not available - speech synthesis not supported or not enabled');
-        return;
-      }
-
       const now = Date.now();
       const lastAnnounced = lastVoiceAnnouncement[objectClass] || 0;
       const cooldownPeriod = 30000; // 30 seconds
@@ -70,40 +111,60 @@ function App() {
       if (now - lastAnnounced > cooldownPeriod) {
         const message = `${objectClass} detected with ${confidence} percent confidence`;
         
-        // Use Web Speech API for voice output with iOS-specific settings
-        const utterance = new SpeechSynthesisUtterance(message);
-        utterance.rate = 0.8; // Slower for better clarity on mobile
-        utterance.pitch = 1.0;
-        utterance.volume = 1.0; // Full volume for mobile
-        utterance.lang = 'en-US'; // Explicit language for better compatibility
-        
-        // iOS-specific handling
-        utterance.onstart = () => {
-          console.log(`🔊 Voice started: ${message}`);
-        };
-        
-        utterance.onerror = (event) => {
-          console.error('Speech synthesis error:', event.error);
-        };
-        
-        utterance.onend = () => {
-          console.log('🔊 Voice announcement completed');
-        };
-
-        speechSynthesis.speak(utterance);
-        console.log(`🔊 Voice: ${message}`);
-
-        // Update last announcement time
+        // Update last announcement time first
         setLastVoiceAnnouncement(prev => ({
           ...prev,
           [objectClass]: now
         }));
+        
+        // Try voice first
+        if (speechSupported && voiceEnabled) {
+          try {
+            // Cancel any existing speech
+            speechSynthesis.cancel();
+            
+            setTimeout(() => {
+              const utterance = new SpeechSynthesisUtterance(message);
+              utterance.rate = 0.7; // Slower for mobile
+              utterance.pitch = 1.0;
+              utterance.volume = 1.0;
+              utterance.lang = 'en-US';
+              
+              utterance.onstart = () => {
+                console.log(`🔊 Voice started: ${message}`);
+              };
+              
+              utterance.onerror = (event) => {
+                console.error('Speech synthesis error:', event.error);
+                // Fallback to notification
+                showNotification(`🎯 ${objectClass.toUpperCase()} detected (${confidence}%)`);
+              };
+              
+              utterance.onend = () => {
+                console.log('🔊 Voice announcement completed');
+              };
+
+              speechSynthesis.speak(utterance);
+            }, 200); // Small delay for iOS
+            
+          } catch (speechError) {
+            console.error('Speech error:', speechError);
+            // Fallback to notification
+            showNotification(`🎯 ${objectClass.toUpperCase()} detected (${confidence}%)`);
+          }
+        } else {
+          // Voice not available, show notification
+          console.log(`🔇 Voice not available, showing notification: ${message}`);
+          showNotification(`🎯 ${objectClass.toUpperCase()} detected (${confidence}%)`);
+        }
+        
+        console.log(`🔊 Detection announcement: ${message}`);
       } else {
         const timeLeft = Math.round((cooldownPeriod - (now - lastAnnounced)) / 1000);
-        console.log(`🔇 Voice cooldown: ${objectClass} - ${timeLeft}s remaining`);
+        console.log(`🔇 Announcement cooldown: ${objectClass} - ${timeLeft}s remaining`);
       }
     } catch (error) {
-      console.error('Voice announcement error:', error);
+      console.error('Announcement error:', error);
     }
   };
 
