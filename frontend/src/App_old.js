@@ -5,6 +5,7 @@ import * as cocoSsd from '@tensorflow-models/coco-ssd';
 
 function App() {
   const videoRef = useRef(null);
+  const canvasRef = useRef(null);
   const [model, setModel] = useState(null);
   const [detections, setDetections] = useState([]);
   const [isLoading, setIsLoading] = useState(true);
@@ -13,58 +14,6 @@ function App() {
   const [cameraError, setCameraError] = useState(null);
   const [cameraStatus, setCameraStatus] = useState('requesting');
   const [detectionCount, setDetectionCount] = useState(0);
-
-  // Manual detection trigger for testing
-  const runManualDetection = async () => {
-    if (!model || !videoRef.current) {
-      console.log('Cannot run manual detection - missing model or video');
-      return;
-    }
-    
-    try {
-      console.log('=== MANUAL DETECTION TRIGGERED ===');
-      const video = videoRef.current;
-      console.log('Video state:', {
-        readyState: video.readyState,
-        dimensions: `${video.videoWidth}x${video.videoHeight}`,
-        playing: !video.paused,
-        currentTime: video.currentTime
-      });
-      
-      const predictions = await model.detect(video);
-      console.log('Manual detection results:', predictions);
-      setDetectionCount(prev => prev + 1);
-      
-      // Test with all objects, not just person/chair
-      if (predictions.length > 0) {
-        console.log('🎉 OBJECTS DETECTED:', predictions.map(p => `${p.class} (${Math.round(p.score * 100)}%)`));
-        
-        // Filter for chairs and persons only
-        const relevantDetections = predictions.filter(prediction => 
-          prediction.class === 'person' || prediction.class === 'chair'
-        );
-        
-        setDetections(relevantDetections);
-        
-        if (relevantDetections.length > 0) {
-          const newAlerts = relevantDetections.map(detection => ({
-            id: Math.random(),
-            class: detection.class,
-            confidence: Math.round(detection.score * 100),
-            timestamp: Date.now()
-          }));
-          
-          setAlerts(prev => {
-            const filtered = prev.filter(alert => Date.now() - alert.timestamp < 3000);
-            return [...filtered, ...newAlerts].slice(-5);
-          });
-        }
-      }
-      
-    } catch (error) {
-      console.error('Manual detection error:', error);
-    }
-  };
 
   // Initialize camera and model
   useEffect(() => {
@@ -95,7 +44,7 @@ function App() {
             video: { 
               width: { ideal: 1280, min: 640 }, 
               height: { ideal: 720, min: 480 },
-              facingMode: 'user',
+              facingMode: 'user', // Front camera for better UX
               frameRate: { ideal: 30, min: 15 }
             }
           });
@@ -140,7 +89,7 @@ function App() {
         // Draw person rectangle
         ctx.fillStyle = '#ff6b6b';
         ctx.fillRect(200, 150, 80, 200);
-        ctx.fillStyle = 'white';
+        ctx.fillStyle = '#white';
         ctx.font = '14px Arial';
         ctx.fillText('Test Person', 210, 140);
         
@@ -162,7 +111,7 @@ function App() {
 
   // Object detection loop with better dependency management
   useEffect(() => {
-    console.log('Detection effect triggered:', { model: !!model, video: !!videoRef.current, isLoading });
+    console.log('Detection effect triggered:', { model: !!model, video: !!videoRef.current });
     
     if (!model) {
       console.log('No model available yet');
@@ -171,11 +120,6 @@ function App() {
     
     if (!videoRef.current) {
       console.log('No video element available yet');
-      return;
-    }
-
-    if (isLoading) {
-      console.log('Still loading, waiting...');
       return;
     }
 
@@ -240,7 +184,7 @@ function App() {
     const initialTimeout = setTimeout(() => {
       console.log('Running initial detection...');
       detectObjects();
-    }, 2000);
+    }, 1000);
 
     const interval = setInterval(() => {
       console.log('Interval tick - running detection');
@@ -252,7 +196,7 @@ function App() {
       clearTimeout(initialTimeout);
       clearInterval(interval);
     };
-  }, [model, isLoading]);
+  }, [model, isLoading]); // Added isLoading to dependencies
 
   // Auto-remove alerts after 3 seconds
   useEffect(() => {
@@ -262,7 +206,36 @@ function App() {
     return () => clearTimeout(timeout);
   }, [alerts]);
 
-  const renderDetectionBoxes = () => {
+  // Manual detection trigger for testing
+  const runManualDetection = async () => {
+    if (!model || !videoRef.current) {
+      console.log('Cannot run manual detection - missing model or video');
+      return;
+    }
+    
+    try {
+      console.log('=== MANUAL DETECTION TRIGGERED ===');
+      const video = videoRef.current;
+      console.log('Video state:', {
+        readyState: video.readyState,
+        dimensions: `${video.videoWidth}x${video.videoHeight}`,
+        playing: !video.paused,
+        currentTime: video.currentTime
+      });
+      
+      const predictions = await model.detect(video);
+      console.log('Manual detection results:', predictions);
+      setDetectionCount(prev => prev + 1);
+      
+      // Test with all objects, not just person/chair
+      if (predictions.length > 0) {
+        console.log('🎉 OBJECTS DETECTED:', predictions.map(p => `${p.class} (${Math.round(p.score * 100)}%)`));
+      }
+      
+    } catch (error) {
+      console.error('Manual detection error:', error);
+    }
+  };
     if (!videoRef.current || detections.length === 0) return null;
     
     const video = videoRef.current;
@@ -353,13 +326,6 @@ function App() {
           <div>Model: {isModelLoaded ? 'loaded' : 'loading'}</div>
           <div>Video Ready: {videoRef.current?.readyState || 0}/4</div>
           <div>Detections: {detections.length}</div>
-          <div>Detection Runs: {detectionCount}</div>
-          <button 
-            onClick={runManualDetection}
-            className="mt-2 bg-pink-500 hover:bg-pink-600 px-2 py-1 rounded text-white text-xs"
-          >
-            🔍 Test Detection
-          </button>
           {cameraError && <div className="text-red-300 mt-1">Error: {cameraError}</div>}
         </div>
 
