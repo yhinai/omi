@@ -828,9 +828,23 @@ function App() {
           <div className="absolute top-1/2 left-4 right-4 transform -translate-y-1/2 bg-blue-600/95 text-white p-4 rounded-lg z-40 shadow-lg">
             <div className="flex items-center justify-between">
               <div className="flex-1">
-                <div className="font-bold text-lg mb-1">🧭 Navigation</div>
-                <div className="text-sm leading-relaxed">{currentDirection}</div>
+                <div className="font-bold text-lg mb-2">🧭 Navigation</div>
+                
+                {/* Current Step */}
+                <div className="mb-3 p-2 bg-blue-700/50 rounded">
+                  <div className="text-xs text-blue-200 font-semibold mb-1">CURRENT:</div>
+                  <div className="text-sm leading-relaxed">{currentDirection}</div>
+                </div>
+                
+                {/* Next Step */}
+                {nextDirection && (
+                  <div className="p-2 bg-blue-800/50 rounded">
+                    <div className="text-xs text-blue-300 font-semibold mb-1">NEXT:</div>
+                    <div className="text-xs leading-relaxed text-blue-100">{nextDirection}</div>
+                  </div>
+                )}
               </div>
+              
               <button 
                 onClick={stopNavigation}
                 className="ml-4 bg-red-500 hover:bg-red-600 px-3 py-2 rounded text-sm font-bold"
