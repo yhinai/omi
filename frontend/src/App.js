@@ -133,9 +133,23 @@ function App() {
         <div className="text-center">
           <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-white mx-auto mb-4"></div>
           <h2 className="text-white text-xl font-bold">
-            {isModelLoaded ? 'Getting camera ready...' : 'Loading AI model...'}
+            {!isModelLoaded ? 'Loading AI model...' : 
+             cameraStatus === 'requesting' ? 'Requesting camera access...' : 
+             'Getting camera ready...'}
           </h2>
-          <p className="text-gray-300 mt-2">Setting up object detection</p>
+          <p className="text-gray-300 mt-2">
+            {!isModelLoaded ? 'Setting up object detection' : 
+             'Please allow camera access when prompted'}
+          </p>
+          {cameraError && (
+            <div className="mt-4 p-4 bg-red-500/20 border border-red-500 rounded-lg">
+              <p className="text-red-300 font-medium">Camera Error:</p>
+              <p className="text-red-200 text-sm mt-1">{cameraError}</p>
+              <p className="text-gray-300 text-xs mt-2">
+                Make sure to allow camera access in your browser settings
+              </p>
+            </div>
+          )}
         </div>
       </div>
     );
