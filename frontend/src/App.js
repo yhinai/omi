@@ -497,6 +497,21 @@ function App() {
           </div>
         </div>
 
+        {/* Notification System (Fallback for voice) */}
+        <div className="absolute top-20 left-4 right-4 z-20 space-y-2">
+          {notifications.map(notification => (
+            <div
+              key={notification.id}
+              className="bg-gradient-to-r from-blue-500 to-purple-600 text-white px-4 py-3 rounded-full shadow-lg animate-bounce flex items-center space-x-3"
+            >
+              <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
+              <span className="font-bold text-lg">
+                {notification.message}
+              </span>
+            </div>
+          ))}
+        </div>
+
         {/* Debug Panel - Hide on small screens */}
         <div className="absolute top-20 right-4 bg-black/70 text-white p-3 rounded-lg text-xs max-w-xs z-30 hidden md:block">
           <div className="font-bold mb-2">🔧 Debug Info</div>
