@@ -426,8 +426,8 @@ function App() {
           </div>
         </div>
 
-        {/* Debug Panel */}
-        <div className="absolute top-20 right-4 bg-black/70 text-white p-3 rounded-lg text-xs max-w-xs z-30">
+        {/* Debug Panel - Hide on small screens */}
+        <div className="absolute top-20 right-4 bg-black/70 text-white p-3 rounded-lg text-xs max-w-xs z-30 hidden md:block">
           <div className="font-bold mb-2">🔧 Debug Info</div>
           <div>Backend: {typeof tf !== 'undefined' ? tf.getBackend() : 'loading...'}</div>
           <div>Camera: {cameraStatus}</div>
@@ -435,6 +435,7 @@ function App() {
           <div>Video Ready: {videoRef.current?.readyState || 0}/4</div>
           <div>Detections: {detections.length}</div>
           <div>Detection Runs: {detectionCount}</div>
+          <div>Voice: {speechSupported ? (voiceEnabled ? 'enabled' : 'needs interaction') : 'not supported'}</div>
           <div className="mt-2">
             <div className="text-yellow-300 font-bold">Voice Cooldowns:</div>
             {Object.entries(lastVoiceAnnouncement).map(([objectType, timestamp]) => {
