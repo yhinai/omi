@@ -206,7 +206,36 @@ function App() {
     return () => clearTimeout(timeout);
   }, [alerts]);
 
-  const renderDetectionBoxes = () => {
+  // Manual detection trigger for testing
+  const runManualDetection = async () => {
+    if (!model || !videoRef.current) {
+      console.log('Cannot run manual detection - missing model or video');
+      return;
+    }
+    
+    try {
+      console.log('=== MANUAL DETECTION TRIGGERED ===');
+      const video = videoRef.current;
+      console.log('Video state:', {
+        readyState: video.readyState,
+        dimensions: `${video.videoWidth}x${video.videoHeight}`,
+        playing: !video.paused,
+        currentTime: video.currentTime
+      });
+      
+      const predictions = await model.detect(video);
+      console.log('Manual detection results:', predictions);
+      setDetectionCount(prev => prev + 1);
+      
+      // Test with all objects, not just person/chair
+      if (predictions.length > 0) {
+        console.log('🎉 OBJECTS DETECTED:', predictions.map(p => `${p.class} (${Math.round(p.score * 100)}%)`));
+      }
+      
+    } catch (error) {
+      console.error('Manual detection error:', error);
+    }
+  };
     if (!videoRef.current || detections.length === 0) return null;
     
     const video = videoRef.current;
