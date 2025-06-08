@@ -213,6 +213,12 @@ function App() {
     }
   };
 
+  // Manual voice test
+  const testVoice = () => {
+    console.log('=== MANUAL VOICE TEST ===');
+    announceDetection('person', 85);
+  };
+
   // Initialize camera and model
   useEffect(() => {
     const initializeApp = async () => {
