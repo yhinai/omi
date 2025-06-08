@@ -926,7 +926,7 @@ function App() {
             <div className="text-gray-400 text-xs mt-3">
               {voiceInitialized ? 
                 '🎤 Say "Take me to train station" for navigation' : 
-                '📱 Tap anywhere to enable voice assistant'
+                `📱 Tap anywhere to enable voice assistant${isChrome ? ' (Chrome detected)' : ''}`
               }
             </div>
           </div>
