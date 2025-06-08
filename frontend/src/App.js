@@ -14,6 +14,39 @@ function App() {
   const [detectionCount, setDetectionCount] = useState(0);
   const [lastVoiceAnnouncement, setLastVoiceAnnouncement] = useState({});
 
+  // Voice announcement with cooldown
+  const announceDetection = (objectClass, confidence) => {
+    const now = Date.now();
+    const lastAnnounced = lastVoiceAnnouncement[objectClass] || 0;
+    const cooldownPeriod = 30000; // 30 seconds
+
+    // Only announce if 30 seconds have passed since last announcement for this object
+    if (now - lastAnnounced > cooldownPeriod) {
+      const message = `${objectClass} detected with ${confidence} percent confidence`;
+      
+      // Use Web Speech API for voice output
+      if ('speechSynthesis' in window) {
+        const utterance = new SpeechSynthesisUtterance(message);
+        utterance.rate = 0.9;
+        utterance.pitch = 1.0;
+        utterance.volume = 0.8;
+        speechSynthesis.speak(utterance);
+        console.log(`🔊 Voice: ${message}`);
+      } else {
+        console.log(`🔊 Voice not supported: ${message}`);
+      }
+
+      // Update last announcement time
+      setLastVoiceAnnouncement(prev => ({
+        ...prev,
+        [objectClass]: now
+      }));
+    } else {
+      const timeLeft = Math.round((cooldownPeriod - (now - lastAnnounced)) / 1000);
+      console.log(`🔇 Voice cooldown: ${objectClass} - ${timeLeft}s remaining`);
+    }
+  };
+
   // Manual detection trigger for testing
   const runManualDetection = async () => {
     if (!model || !videoRef.current) {
@@ -46,17 +79,10 @@ function App() {
         
         setDetections(relevantDetections);
         
+        // Voice announcements for detected objects
         if (relevantDetections.length > 0) {
-          const newAlerts = relevantDetections.map(detection => ({
-            id: Math.random(),
-            class: detection.class,
-            confidence: Math.round(detection.score * 100),
-            timestamp: Date.now()
-          }));
-          
-          setAlerts(prev => {
-            const filtered = prev.filter(alert => Date.now() - alert.timestamp < 3000);
-            return [...filtered, ...newAlerts].slice(-5);
+          relevantDetections.forEach(detection => {
+            announceDetection(detection.class, Math.round(detection.score * 100));
           });
         }
       }
@@ -209,20 +235,11 @@ function App() {
           console.log('Relevant detections:', relevantDetections);
           setDetections(relevantDetections);
           
-          // Create alerts for detected objects
+          // Voice announcements for detected objects
           if (relevantDetections.length > 0) {
-            console.log('Creating alerts for detections');
-            const newAlerts = relevantDetections.map(detection => ({
-              id: Math.random(),
-              class: detection.class,
-              confidence: Math.round(detection.score * 100),
-              timestamp: Date.now()
-            }));
-            
-            setAlerts(prev => {
-              // Keep only recent alerts (last 3 seconds)
-              const filtered = prev.filter(alert => Date.now() - alert.timestamp < 3000);
-              return [...filtered, ...newAlerts].slice(-5); // Keep max 5 alerts
+            console.log('Processing voice announcements for detections');
+            relevantDetections.forEach(detection => {
+              announceDetection(detection.class, Math.round(detection.score * 100));
             });
           }
         } else {
@@ -245,22 +262,14 @@ function App() {
     const interval = setInterval(() => {
       console.log('Interval tick - running detection');
       detectObjects();
-    }, 1000); // 1 second for better debugging
+    }, 2000); // 2 seconds interval for voice announcements
     
     return () => {
       console.log('Cleaning up detection interval');
       clearTimeout(initialTimeout);
       clearInterval(interval);
     };
-  }, [model, isLoading]);
-
-  // Auto-remove alerts after 3 seconds
-  useEffect(() => {
-    const timeout = setTimeout(() => {
-      setAlerts(prev => prev.filter(alert => Date.now() - alert.timestamp < 3000));
-    }, 100);
-    return () => clearTimeout(timeout);
-  }, [alerts]);
+  }, [model, isLoading, lastVoiceAnnouncement]);
 
   const renderDetectionBoxes = () => {
     if (!videoRef.current || detections.length === 0) return null;
@@ -341,6 +350,9 @@ function App() {
             <div className="flex items-center space-x-2">
               <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
               <span className="text-white text-sm font-medium">LIVE</span>
+              <div className="ml-4 text-white text-xs">
+                🔊 Voice: ON
+              </div>
             </div>
           </div>
         </div>
@@ -354,6 +366,17 @@ function App() {
           <div>Video Ready: {videoRef.current?.readyState || 0}/4</div>
           <div>Detections: {detections.length}</div>
           <div>Detection Runs: {detectionCount}</div>
+          <div className="mt-2">
+            <div className="text-yellow-300 font-bold">Voice Cooldowns:</div>
+            {Object.entries(lastVoiceAnnouncement).map(([objectType, timestamp]) => {
+              const timeLeft = Math.max(0, 30 - Math.floor((Date.now() - timestamp) / 1000));
+              return (
+                <div key={objectType} className="text-xs">
+                  {objectType}: {timeLeft > 0 ? `${timeLeft}s` : 'ready'}
+                </div>
+              );
+            })}
+          </div>
           <button 
             onClick={runManualDetection}
             className="mt-2 bg-pink-500 hover:bg-pink-600 px-2 py-1 rounded text-white text-xs"
@@ -361,21 +384,6 @@ function App() {
             🔍 Test Detection
           </button>
           {cameraError && <div className="text-red-300 mt-1">Error: {cameraError}</div>}
-        </div>
-
-        {/* Alert Notifications - TikTok style */}
-        <div className="absolute top-20 left-4 right-4 z-20 space-y-2">
-          {alerts.map(alert => (
-            <div
-              key={alert.id}
-              className="bg-gradient-to-r from-pink-500 to-purple-600 text-white px-4 py-3 rounded-full shadow-lg animate-bounce flex items-center space-x-3"
-            >
-              <div className="w-3 h-3 bg-white rounded-full animate-pulse"></div>
-              <span className="font-bold text-lg">
-                🎯 Detected: {alert.class.toUpperCase()} ({alert.confidence}%)
-              </span>
-            </div>
-          ))}
         </div>
 
         {/* Bottom Info Panel */}
@@ -401,6 +409,10 @@ function App() {
                 👀 Scanning for objects...
               </div>
             )}
+            
+            <div className="text-gray-400 text-xs mt-3">
+              🔊 Voice announcements with 30-second cooldown
+            </div>
           </div>
         </div>
 
