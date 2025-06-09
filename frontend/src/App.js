@@ -17,6 +17,9 @@ function App() {
   const [selectedVoice, setSelectedVoice] = useState('female');
   const [availableVoices, setAvailableVoices] = useState([]);
   const [isListening, setIsListening] = useState(false);
+  const [transcripts, setTranscripts] = useState([]);
+  const [lastTranscriptId, setLastTranscriptId] = useState(0);
+  const [isConnectedToOMI, setIsConnectedToOMI] = useState(false);
   const [userLocation, setUserLocation] = useState(null);
   const [navigationActive, setNavigationActive] = useState(false);
   const [currentRoute, setCurrentRoute] = useState(null);
@@ -26,10 +29,20 @@ function App() {
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [isChrome, setIsChrome] = useState(false);
   const [voiceRetryCount, setVoiceRetryCount] = useState(0);
+  const [isElevenLabsEnabled, setIsElevenLabsEnabled] = useState(true);
+  const [currentAudio, setCurrentAudio] = useState(null);
+  const [isSpeaking, setIsSpeaking] = useState(false);
 
   // Vehicle types for detection
   const vehicleTypes = ['car', 'truck', 'bus', 'motorcycle', 'bicycle', 'train'];
   const detectionTargets = ['person', 'chair', ...vehicleTypes];
+
+  // ElevenLabs configuration
+  const ELEVENLABS_API_KEY = 'sk_92ef1247b19b69721020876f6fec6bab973b593ec23176f1';
+  const ELEVENLABS_VOICE_IDS = {
+    female: 'EXAVITQu4vr4xnSDxMaL', // Bella - Natural, friendly female voice
+    male: 'VR6AewLTigWG4xSOukaG' // Josh - Natural, clear male voice
+  };
 
   // Initialize speech recognition
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -118,26 +131,135 @@ function App() {
     }
   }, [recognition]);
 
-  // Handle voice commands
+  // Poll for new transcripts from OMI backend
+  const pollTranscripts = async () => {
+    try {
+      const response = await fetch(`http://127.0.0.1:8000/api/transcripts?after=${lastTranscriptId}`);
+      const data = await response.json();
+      
+      if (data.transcripts && data.transcripts.length > 0) {
+        setTranscripts(prev => [...prev, ...data.transcripts]);
+        
+        // Get the latest transcript ID
+        const latestId = Math.max(...data.transcripts.map(t => t.id));
+        setLastTranscriptId(latestId);
+        
+        // Process latest transcript
+        const latestTranscript = data.transcripts[data.transcripts.length - 1];
+        if (latestTranscript.is_user && latestTranscript.text) {
+          console.log('OMI Voice command:', latestTranscript.text);
+          await handleVoiceCommand(latestTranscript.text.toLowerCase());
+        } else if (!latestTranscript.is_user && latestTranscript.has_audio && latestTranscript.audio_url) {
+          // Play assistant response audio automatically
+          console.log('Playing assistant response:', latestTranscript.text);
+          await playAssistantResponse(latestTranscript.audio_url);
+        }
+        
+        setIsConnectedToOMI(true);
+      }
+    } catch (error) {
+      console.error('Error polling transcripts:', error);
+      setIsConnectedToOMI(false);
+    }
+  };
+
+  // Start polling for OMI transcripts
+  useEffect(() => {
+    const interval = setInterval(pollTranscripts, 1000); // Poll every second
+    return () => clearInterval(interval);
+  }, [lastTranscriptId]);
+
+  // Enhanced conversational voice command handling
   const handleVoiceCommand = async (command) => {
-    if (command.includes('train') && command.includes('station')) {
-      speak('Searching for nearest train station');
+    try {
+      console.log('Processing voice command:', command);
+      
+      // Send to backend for conversational AI processing
+      const response = await fetch('http://127.0.0.1:8000/api/conversation/command', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: command,
+          session_id: 'default',
+          context: {
+            current_location: userLocation,
+            detected_objects: detections.map(d => d.class),
+            navigation_active: navigationActive,
+            current_direction: currentDirection
+          }
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log('AI Response:', data.response);
+        
+        // Speak the conversational response
+        await speak(data.response);
+        
+        // Check if this was a navigation command and handle accordingly
+        if (data.command_type === 'navigation') {
+          const lowerCommand = command.toLowerCase();
+          if (lowerCommand.includes('train') || lowerCommand.includes('station')) {
+            setTimeout(() => findNearestTransit('train'), 2000);
+          } else if (lowerCommand.includes('bus')) {
+            setTimeout(() => findNearestTransit('bus'), 2000);
+          } else if (lowerCommand.includes('subway') || lowerCommand.includes('metro')) {
+            setTimeout(() => findNearestTransit('subway'), 2000);
+          }
+        }
+      } else {
+        // Fallback to basic responses if API fails
+        await handleBasicVoiceCommand(command);
+      }
+    } catch (error) {
+      console.error('Error processing voice command:', error);
+      await handleBasicVoiceCommand(command);
+    }
+  };
+  
+  // Fallback basic voice command handling
+  const handleBasicVoiceCommand = async (command) => {
+    const lowerCommand = command.toLowerCase();
+    
+    if (lowerCommand.includes('hey') || lowerCommand.includes('hello')) {
+      await speak("Hey there! I'm your vision assistant. How can I help you navigate today?");
+    } else if (lowerCommand.includes('train') && lowerCommand.includes('station')) {
+      await speak("I'll help you find the nearest train station. Let me search for options nearby.");
       await findNearestTransit('train');
-    } else if (command.includes('bus') && command.includes('stop')) {
-      speak('Searching for nearest bus stop');
+    } else if (lowerCommand.includes('bus')) {
+      await speak("Looking for bus stops in your area. One moment please.");
       await findNearestTransit('bus');
-    } else if (command.includes('subway') || command.includes('metro')) {
-      speak('Searching for nearest subway station');
+    } else if (lowerCommand.includes('subway') || lowerCommand.includes('metro')) {
+      await speak("Searching for subway stations around you. Give me a second.");
       await findNearestTransit('subway');
+    } else if (lowerCommand.includes('what') && (lowerCommand.includes('see') || lowerCommand.includes('detect'))) {
+      const objectCount = detections.length;
+      if (objectCount > 0) {
+        const objects = detections.map(d => d.class).join(', ');
+        await speak(`I can see ${objectCount} objects right now: ${objects}. Is there something specific you'd like me to help you with?`);
+      } else {
+        await speak("I'm currently scanning the area. I don't see any specific objects to highlight at the moment. Feel free to ask me anything else!");
+      }
+    } else if (lowerCommand.includes('help')) {
+      await speak("I'm here to help! I can guide you to train stations, bus stops, or subway stations. I can also tell you what objects I see around you. What would you like to do?");
     } else {
-      speak('Sorry, I did not understand that command. Try saying take me to train station');
+      const responses = [
+        "I didn't quite catch that. Could you try asking me to find a train station, bus stop, or tell you what I see?",
+        "Hmm, I'm not sure what you meant. Try saying something like 'take me to the train station' or 'what do you see'?",
+        "I'm still learning! Could you rephrase that? I'm great at finding transportation and describing what's around you."
+      ];
+      const randomResponse = responses[Math.floor(Math.random() * responses.length)];
+      await speak(randomResponse);
     }
   };
 
   // Find nearest transit using Overpass API
   const findNearestTransit = async (type) => {
     if (!userLocation) {
-      speak('Location not available');
+      speak("I need to know your location to help you find transportation. Could you please enable location services, or let me know where you are?");
       return;
     }
 
@@ -182,15 +304,70 @@ function App() {
         );
         
         const name = nearest.tags?.name || `${type} station`;
-        speak(`Found ${name}, ${Math.round(distance)} meters away. Getting walking directions`);
+        // More conversational distance announcement
+        const distanceText = distance > 1000 ? 
+          `about ${(distance/1000).toFixed(1)} kilometers` : 
+          `${Math.round(distance)} meters`;
+        
+        try {
+          const response = await fetch('http://127.0.0.1:8000/api/conversation/process', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              message: `Found ${name}, ${distanceText} away. Getting walking directions`,
+              session_id: 'default',
+              context: {
+                destination_name: name,
+                distance: distance,
+                getting_directions: true
+              }
+            })
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            speak(data.response);
+          } else {
+            speak(`Great! I found ${name}. It's ${distanceText} away. Let me get you the walking directions now.`);
+          }
+        } catch (error) {
+          speak(`Perfect! I found ${name} - it's ${distanceText} from here. Getting your route now.`);
+        }
         
         await getWalkingDirections(userLocation, { lat: nearest.lat, lng: nearest.lon });
       } else {
-        speak(`No ${type} stations found nearby`);
+        // More conversational "not found" message
+        try {
+          const response = await fetch('http://127.0.0.1:8000/api/conversation/process', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              message: `No ${type} stations found in the nearby area`,
+              session_id: 'default',
+              context: {
+                search_type: type,
+                user_location: userLocation
+              }
+            })
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            speak(data.response);
+          } else {
+            speak(`I'm sorry, I couldn't find any ${type} stations in your immediate area. Would you like me to search for a different type of transportation?`);
+          }
+        } catch (error) {
+          speak(`Hmm, I don't see any ${type} stations nearby. Let me know if you'd like me to look for buses or other transportation options instead.`);
+        }
       }
     } catch (error) {
       console.error('Transit search error:', error);
-      speak('Sorry, unable to search for transit stations right now');
+      speak("I'm having trouble searching for transit stations at the moment. This might be a connectivity issue. Would you like me to try again, or is there something else I can help you with?");
     }
   };
 
@@ -207,7 +384,36 @@ function App() {
         const duration = Math.round(route.duration / 60);
         const distance = Math.round(route.distance);
         
-        speak(`Walking route found. ${distance} meters, approximately ${duration} minutes. Starting navigation`);
+        // More conversational route announcement
+        const walkTime = duration === 1 ? '1 minute' : `${duration} minutes`;
+        const walkDistance = distance > 1000 ? `${(distance/1000).toFixed(1)} kilometers` : `${distance} meters`;
+        
+        try {
+          const response = await fetch('http://127.0.0.1:8000/api/conversation/process', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              message: `Walking route calculated: ${walkDistance}, approximately ${walkTime}`,
+              session_id: 'default',
+              context: {
+                route_distance: distance,
+                route_duration: duration,
+                navigation_starting: true
+              }
+            })
+          });
+          
+          if (response.ok) {
+            const data = await response.json();
+            speak(data.response);
+          } else {
+            speak(`Perfect! I've found your route. It's ${walkDistance} and should take about ${walkTime}. Let's get you there - I'll guide you step by step.`);
+          }
+        } catch (error) {
+          speak(`Great! Your route is ready. It's ${walkDistance} and will take about ${walkTime}. Starting navigation now!`);
+        }
         
         setCurrentRoute(route);
         setNavigationActive(true);
@@ -234,11 +440,11 @@ function App() {
           startLocationTracking(steps);
         }
       } else {
-        speak('Unable to find walking route');
+        speak("I'm having trouble calculating a walking route right now. This might be due to network issues or the area might not be well mapped. Would you like me to try a different destination?");
       }
     } catch (error) {
       console.error('Routing error:', error);
-      speak('Sorry, unable to get directions right now');
+      speak("I'm experiencing some technical difficulties getting directions at the moment. This could be a network issue. Please try again in a moment, or let me know if there's anything else I can help you with.");
     }
   };
 
@@ -355,7 +561,12 @@ function App() {
             setNextDirection('You will arrive at your destination');
           }
           
-          speak(`In ${Math.round(distanceToNext)} meters, ${nextDirection}`);
+          // More conversational turn announcements
+          const distanceText = distanceToNext > 100 ? 
+            `in about ${Math.round(distanceToNext/10)*10} meters` :
+            distanceToNext > 20 ? `in ${Math.round(distanceToNext)} meters` : 'coming up';
+          
+          speak(`${distanceText}, ${nextDirection}`);
           setLastDirectionTime(now);
           setCurrentStepIndex(nextStepIndex);
         }
@@ -371,7 +582,7 @@ function App() {
       );
       
       if (distanceToDestination < 20) {
-        speak('You have arrived at your destination');
+        speak("Congratulations! You've arrived at your destination. I hope the journey went smoothly. Is there anything else I can help you with?");
         setCurrentDirection('You have arrived at your destination');
         setNavigationActive(false);
         if (window.navigationWatchId) {
@@ -391,7 +602,7 @@ function App() {
     if (window.navigationWatchId) {
       navigator.geolocation.clearWatch(window.navigationWatchId);
     }
-    speak('Navigation stopped');
+    speak("Navigation has been stopped. If you need directions again, just let me know where you'd like to go!");
   };
 
   // Calculate distance between two points
@@ -406,99 +617,138 @@ function App() {
     return R * c;
   };
 
-  // Enhanced speak function with Chrome iOS fixes
-  const speak = (text) => {
+  // Generate speech using ElevenLabs API
+  const generateElevenLabsSpeech = async (text) => {
+    try {
+      const voiceId = ELEVENLABS_VOICE_IDS[selectedVoice];
+      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'audio/mpeg',
+          'Content-Type': 'application/json',
+          'xi-api-key': ELEVENLABS_API_KEY
+        },
+        body: JSON.stringify({
+          text: text,
+          model_id: 'eleven_monolingual_v1',
+          voice_settings: {
+            stability: 0.5,
+            similarity_boost: 0.75,
+            style: 0.5,
+            use_speaker_boost: true
+          }
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`ElevenLabs API error: ${response.status}`);
+      }
+
+      const audioBlob = await response.blob();
+      return URL.createObjectURL(audioBlob);
+    } catch (error) {
+      console.error('ElevenLabs API error:', error);
+      return null;
+    }
+  };
+
+  // Play audio from URL
+  const playAudio = (audioUrl) => {
+    return new Promise((resolve, reject) => {
+      // Stop any currently playing audio
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      }
+
+      const audio = new Audio(audioUrl);
+      setCurrentAudio(audio);
+      setIsSpeaking(true);
+
+      audio.onended = () => {
+        setIsSpeaking(false);
+        setCurrentAudio(null);
+        URL.revokeObjectURL(audioUrl);
+        resolve();
+      };
+
+      audio.onerror = (error) => {
+        setIsSpeaking(false);
+        setCurrentAudio(null);
+        URL.revokeObjectURL(audioUrl);
+        reject(error);
+      };
+
+      audio.play().catch(reject);
+    });
+  };
+
+  // Fallback browser speech synthesis
+  const speakWithBrowserSynthesis = (text) => {
     try {
       if (!window.speechSynthesis) {
         console.log('Speech synthesis not available');
         return;
       }
 
-      // Cancel any existing speech
       window.speechSynthesis.cancel();
       
-      const speakWithDelay = () => {
-        const utterance = new SpeechSynthesisUtterance(text);
-        
-        // Chrome iOS specific settings
-        if (isChrome) {
-          utterance.volume = 1.0;
-          utterance.rate = 0.9;
-          utterance.pitch = selectedVoice === 'male' ? 0.8 : 1.0;
-          utterance.lang = 'en-US';
-          
-          // For Chrome iOS, use default voice if available voices aren't working
-          const voices = speechSynthesis.getVoices();
-          if (voices.length > 0) {
-            // Try to find a good default voice
-            const defaultVoice = voices.find(v => v.default) || voices[0];
-            if (defaultVoice) {
-              utterance.voice = defaultVoice;
-              console.log('Chrome iOS: Using voice:', defaultVoice.name);
-            }
-          }
-        } else {
-          // Regular voice selection for other browsers
-          if (availableVoices.length > 0) {
-            let voice;
-            if (selectedVoice === 'male') {
-              voice = availableVoices.find(v => 
-                v.name.toLowerCase().includes('male') ||
-                v.name.toLowerCase().includes('david') ||
-                v.name.toLowerCase().includes('daniel') ||
-                v.name.toLowerCase().includes('alex')
-              );
-            } else {
-              voice = availableVoices.find(v => 
-                v.name.toLowerCase().includes('female') ||
-                v.name.toLowerCase().includes('susan') ||
-                v.name.toLowerCase().includes('karen') ||
-                v.name.toLowerCase().includes('victoria') ||
-                v.name.toLowerCase().includes('samantha')
-              );
-            }
-            
-            if (voice) {
-              utterance.voice = voice;
-              console.log('Using voice:', voice.name);
-            }
-          }
-          
-          utterance.rate = selectedVoice === 'male' ? 0.7 : 0.8;
-          utterance.pitch = selectedVoice === 'male' ? 0.7 : 1.1;
-          utterance.volume = 1.0;
-          utterance.lang = 'en-US';
-        }
-        
-        utterance.onstart = () => {
-          console.log('🔊 Speaking:', text);
-          setVoiceRetryCount(0);
-        };
-        
-        utterance.onerror = (e) => {
-          console.error('Speech error:', e.error);
-          
-          // Chrome iOS retry logic
-          if (isChrome && voiceRetryCount < 2) {
-            console.log('Chrome iOS: Retrying speech...');
-            setVoiceRetryCount(prev => prev + 1);
-            setTimeout(() => speakWithDelay(), 500);
-          }
-        };
-        
-        utterance.onend = () => {
-          console.log('🔊 Speech completed');
-        };
-
-        window.speechSynthesis.speak(utterance);
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = selectedVoice === 'male' ? 0.7 : 0.8;
+      utterance.pitch = selectedVoice === 'male' ? 0.7 : 1.1;
+      utterance.volume = 1.0;
+      utterance.lang = 'en-US';
+      
+      utterance.onstart = () => {
+        console.log('🔊 Speaking (Browser):', text);
+        setIsSpeaking(true);
       };
       
-      // Chrome iOS needs longer delay
-      const delay = isChrome ? 300 : 100;
-      setTimeout(speakWithDelay, delay);
+      utterance.onend = () => {
+        console.log('🔊 Speech completed (Browser)');
+        setIsSpeaking(false);
+      };
       
+      utterance.onerror = (e) => {
+        console.error('Browser speech error:', e.error);
+        setIsSpeaking(false);
+      };
+
+      window.speechSynthesis.speak(utterance);
+    } catch (error) {
+      console.error('Browser voice error:', error);
+      setIsSpeaking(false);
+    }
+  };
+
+  // Enhanced speak function with ElevenLabs integration
+  const speak = async (text) => {
+    try {
+      console.log('🔊 Speaking:', text);
+      
+      // Stop any currently playing audio
+      if (currentAudio) {
+        currentAudio.pause();
+        currentAudio.currentTime = 0;
+      }
+      
+      if (isElevenLabsEnabled) {
+        try {
+          const audioUrl = await generateElevenLabsSpeech(text);
+          if (audioUrl) {
+            await playAudio(audioUrl);
+            return;
+          }
+        } catch (error) {
+          console.warn('ElevenLabs failed, falling back to browser synthesis:', error);
+        }
+      }
+      
+      // Fallback to browser speech synthesis
+      speakWithBrowserSynthesis(text);
     } catch (error) {
       console.error('Voice error:', error);
+      setIsSpeaking(false);
     }
   };
 
@@ -509,28 +759,84 @@ function App() {
     }
   };
 
-  // Chrome iOS specific voice initialization
+  // Voice system initialization
   const initializeVoice = () => {
-    if (!voiceInitialized && window.speechSynthesis) {
-      if (isChrome) {
-        // For Chrome iOS, try multiple initialization attempts
-        console.log('Initializing voice for Chrome iOS...');
-        
-        // First attempt: Silent utterance
-        const silentUtterance = new SpeechSynthesisUtterance('');
-        silentUtterance.volume = 0.01;
-        window.speechSynthesis.speak(silentUtterance);
-        
-        // Second attempt: Audible test
-        setTimeout(() => {
-          speak('Voice system ready for Chrome');
-        }, 200);
-      } else {
-        speak('Voice system ready');
-      }
+    if (!voiceInitialized) {
+      console.log('Initializing voice system...');
+      
+      const welcomeMessages = [
+        "Hello! I'm your vision assistant. I'm here to help you navigate and describe what's around you. Just ask me anything!",
+        "Hi there! Your conversational vision assistant is ready. I can help you find places or tell you what I see. How can I assist you?",
+        "Welcome! I'm your AI companion for navigation and visual assistance. Feel free to ask me about directions or what's in your surroundings."
+      ];
+      const randomWelcome = welcomeMessages[Math.floor(Math.random() * welcomeMessages.length)];
+      speak(randomWelcome);
       
       setVoiceInitialized(true);
-      console.log('Voice initialized for', isChrome ? 'Chrome iOS' : 'other browser');
+      console.log('Voice system initialized with', isElevenLabsEnabled ? 'ElevenLabs' : 'browser synthesis');
+    }
+  };
+
+  // Stop any currently playing speech
+  const stopSpeech = () => {
+    if (currentAudio) {
+      currentAudio.pause();
+      currentAudio.currentTime = 0;
+      setCurrentAudio(null);
+    }
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeaking(false);
+  };
+
+  // Play assistant response from backend
+  const playAssistantResponse = async (audioUrl) => {
+    try {
+      // Stop any currently playing audio
+      stopSpeech();
+      
+      // Fetch audio from backend
+      const fullUrl = audioUrl.startsWith('http') ? audioUrl : `http://127.0.0.1:8000${audioUrl}`;
+      const response = await fetch(fullUrl);
+      
+      if (!response.ok) {
+        throw new Error(`Failed to fetch audio: ${response.status}`);
+      }
+      
+      const audioBlob = await response.blob();
+      const audioObjectUrl = URL.createObjectURL(audioBlob);
+      
+      await playAudio(audioObjectUrl);
+    } catch (error) {
+      console.error('Error playing assistant response:', error);
+      // Fallback to text-to-speech if audio fails
+      const transcript = transcripts.find(t => t.audio_url === audioUrl);
+      if (transcript && transcript.text) {
+        speak(transcript.text);
+      }
+    }
+  };
+
+  // Demo function to test assistant conversation
+  const testAssistantConversation = async () => {
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/demo/conversation', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          message: 'Hello, can you help me navigate?'
+        })
+      });
+      
+      if (response.ok) {
+        const data = await response.json();
+        console.log('Demo conversation created:', data);
+      }
+    } catch (error) {
+      console.error('Error testing conversation:', error);
     }
   };
 
@@ -551,28 +857,87 @@ function App() {
     };
   }, [voiceInitialized]);
 
-  // Voice announcement with cooldown
-  const announceDetection = (objectClass, confidence) => {
+  // Enhanced conversational detection announcements
+  const announceDetection = async (objectClass, confidence) => {
     const now = Date.now();
     const lastAnnounced = lastVoiceAnnouncement[objectClass] || 0;
     const cooldownPeriod = 30000; // 30 seconds
 
     if (now - lastAnnounced > cooldownPeriod) {
-      let message = '';
-      if (vehicleTypes.includes(objectClass)) {
-        message = `${objectClass} vehicle detected`;
-      } else {
-        message = `${objectClass} detected`;
+      try {
+        // Send detection to backend for conversational announcement
+        const response = await fetch('http://127.0.0.1:8000/api/conversation/process', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message: `I detected a ${objectClass} with ${Math.round(confidence * 100)}% confidence`,
+            session_id: 'default',
+            context: {
+              detected_object: objectClass,
+              confidence: confidence,
+              is_vehicle: vehicleTypes.includes(objectClass),
+              total_detections: detections.length,
+              user_location: userLocation
+            }
+          })
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          speak(data.response);
+        } else {
+          // Fallback to more natural basic announcements
+          const isVehicle = vehicleTypes.includes(objectClass);
+          const naturalAnnouncements = {
+            person: [
+              "I notice someone nearby",
+              "There's a person in view", 
+              "I can see someone ahead"
+            ],
+            car: [
+              "There's a car coming",
+              "I see a vehicle approaching",
+              "Car detected in the area"
+            ],
+            bus: [
+              "I spot a bus nearby",
+              "There's a bus in the vicinity",
+              "Bus coming into view"
+            ],
+            chair: [
+              "I see a chair here",
+              "There's seating available",
+              "Found a chair nearby"
+            ]
+          };
+          
+          const announcements = naturalAnnouncements[objectClass] || [
+            `I can see a ${objectClass} nearby`,
+            `There's a ${objectClass} in view`,
+            `${objectClass} detected in the area`
+          ];
+          
+          const randomAnnouncement = announcements[Math.floor(Math.random() * announcements.length)];
+          speak(randomAnnouncement);
+        }
+      } catch (error) {
+        console.error('Error with conversational detection:', error);
+        // Simple fallback
+        const isVehicle = vehicleTypes.includes(objectClass);
+        const message = isVehicle ? 
+          `I see a ${objectClass} vehicle nearby` : 
+          `I notice a ${objectClass} in the area`;
+        speak(message);
       }
-      
-      speak(message);
       
       setLastVoiceAnnouncement(prev => ({
         ...prev,
         [objectClass]: now
       }));
       
-      console.log(`🔊 Announced: ${message}`);
+      console.log(`🔊 Announced: ${objectClass}`);
     }
   };
 
@@ -602,12 +967,45 @@ function App() {
     }
   };
 
-  // Test voice function
-  const testVoice = () => {
+  // Enhanced test voice function
+  const testVoice = async () => {
     if (!voiceInitialized) {
       initializeVoice();
     } else {
-      speak('Voice test successful');
+      try {
+        // Get a conversational test message from the AI
+        const response = await fetch('http://127.0.0.1:8000/api/conversation/process', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            message: 'This is a voice system test',
+            session_id: 'default',
+            context: {
+              voice_test: true,
+              elevenlabs_enabled: isElevenLabsEnabled,
+              voice_type: selectedVoice
+            }
+          })
+        });
+        
+        if (response.ok) {
+          const data = await response.json();
+          speak(data.response);
+        } else {
+          const testMessages = [
+            `Hi there! Voice test successful. I'm using ${isElevenLabsEnabled ? 'ElevenLabs AI' : 'browser'} speech with the ${selectedVoice} voice. How can I help you today?`,
+            `Hello! Your voice assistant is working perfectly. I'm ready to help you navigate or tell you about your surroundings. What would you like to do?`,
+            `Voice test complete! I'm here and ready to assist you. Try asking me to find a train station or tell you what I see around you.`
+          ];
+          const randomMessage = testMessages[Math.floor(Math.random() * testMessages.length)];
+          speak(randomMessage);
+        }
+      } catch (error) {
+        console.error('Test voice error:', error);
+        speak(`Voice test successful! I'm your conversational vision assistant, ready to help you navigate and explore your surroundings.`);
+      }
     }
   };
 
@@ -731,12 +1129,12 @@ function App() {
     return detections.map((detection, index) => {
       const [x, y, width, height] = detection.bbox;
       const isVehicle = vehicleTypes.includes(detection.class);
-      const boxColor = isVehicle ? 'border-yellow-500 bg-yellow-500' : 'border-pink-500 bg-pink-500';
+      const boxColor = isVehicle ? 'border-amber-500 bg-amber-500' : 'border-rose-500 bg-rose-500';
       
       return (
         <div
           key={index}
-          className={`absolute border-3 ${boxColor} bg-opacity-20 rounded-lg`}
+          className={`absolute border-2 ${boxColor} bg-opacity-20 rounded-xl backdrop-blur-sm transition-all duration-300 hover:bg-opacity-30`}
           style={{
             left: x * scaleX,
             top: y * scaleY,
@@ -744,7 +1142,7 @@ function App() {
             height: height * scaleY,
           }}
         >
-          <div className={`${isVehicle ? 'bg-yellow-500' : 'bg-pink-500'} text-white px-2 py-1 text-xs rounded-t-lg font-bold`}>
+          <div className={`${isVehicle ? 'bg-amber-600' : 'bg-rose-600'} text-white px-3 py-1 text-xs rounded-t-xl font-medium`}>
             {detection.class} ({Math.round(detection.score * 100)}%)
           </div>
         </div>
@@ -754,184 +1152,255 @@ function App() {
 
   if (isLoading) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-purple-900 via-pink-800 to-red-900 flex items-center justify-center">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-16 w-16 border-b-2 border-white mx-auto mb-4"></div>
-          <h2 className="text-white text-xl font-bold">
-            {!isModelLoaded ? 'Loading AI model...' : 'Getting camera ready...'}
-          </h2>
-          <p className="text-gray-300 mt-2">Setting up navigation assistant</p>
+      <div className="min-h-screen bg-black flex items-center justify-center">
+        <div className="text-center bg-black/10 backdrop-blur-sm p-4 rounded-md">
+          <div className="animate-spin rounded-full h-6 w-6 border-b border-white/50 mx-auto mb-2"></div>
+          <div className="text-white/70 text-xs">
+            {!isModelLoaded ? 'Loading...' : 'Starting...'}
+          </div>
         </div>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-black relative overflow-hidden">
-      <div className="relative w-full h-screen">
-        <video
-          ref={videoRef}
-          className="w-full h-full object-cover"
-          muted
-          playsInline
-        />
-        
-        <div className="absolute inset-0">
-          {renderDetectionBoxes()}
-        </div>
-
-        {/* Top UI Bar */}
-        <div className="absolute top-0 left-0 right-0 bg-gradient-to-b from-black/60 to-transparent p-4 z-10">
-          <div className="flex items-center justify-between">
-            <h1 className="text-white text-xl font-bold">Navigation Assistant</h1>
-            <div className="flex items-center space-x-2">
-              <div className="w-3 h-3 bg-green-500 rounded-full animate-pulse"></div>
-              <span className="text-white text-sm font-medium">LIVE</span>
-              <div className="ml-4 text-white text-xs">
-                🔊 Voice: {voiceInitialized ? 'ON' : 'Tap to enable'}
-                {isChrome && <span className="text-yellow-300"> (Chrome)</span>}
-              </div>
-            </div>
+    <div className="min-h-screen bg-black relative">
+      {/* Full-screen video */}
+      <video
+        ref={videoRef}
+        className="w-full h-screen object-cover"
+        muted
+        playsInline
+      />
+      
+      {/* Enhanced Vision Assistant Header */}
+      <div className="absolute top-4 left-4 bg-black/40 backdrop-blur-md border border-white/20 text-white px-4 py-2 rounded-lg z-30 shadow-lg">
+        <div className="flex items-center space-x-3">
+          <div className="flex items-center space-x-2">
+            <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+            <span className="text-white text-sm font-medium">Vision Assistant</span>
           </div>
+          <div className="text-white/80 text-xs bg-green-500/20 px-2 py-1 rounded">
+            LIVE
+          </div>
+          {isSpeaking && (
+            <div className="text-green-400 text-xs bg-green-500/20 px-2 py-1 rounded animate-pulse">
+              🔊 Speaking
+            </div>
+          )}
         </div>
+      </div>
 
-        {/* Voice Controls */}
-        <div className="absolute top-20 left-4 bg-black/70 text-white p-3 rounded-lg z-30 md:block">
-          <div className="font-bold mb-2">🎤 Voice Controls</div>
-          <div className="space-y-2">
-            <select 
-              value={selectedVoice} 
-              onChange={(e) => setSelectedVoice(e.target.value)}
-              className="bg-gray-800 text-white text-xs p-1 rounded"
-            >
-              <option value="female">Female Voice</option>
-              <option value="male">Male Voice</option>
-            </select>
-            
+      {/* Enhanced Voice Controls Panel */}
+      <div className="absolute top-20 left-4 bg-black/40 backdrop-blur-md border border-white/20 text-white p-4 rounded-lg z-30 shadow-lg">
+        <div className="space-y-3">
+          <div className="text-white/90 text-sm font-medium mb-2">Voice Controls</div>
+          
+          <div className="flex items-center space-x-3">
             <button 
               onClick={startListening}
               disabled={!recognition || isListening}
-              className={`block w-full px-3 py-2 rounded text-xs font-bold ${
-                isListening ? 'bg-red-500' : 'bg-blue-500 hover:bg-blue-600'
+              className={`flex items-center space-x-2 px-3 py-2 rounded-lg text-sm font-medium transition-all shadow-md ${
+                isListening 
+                  ? 'bg-red-500/80 hover:bg-red-500 text-white' 
+                  : 'bg-blue-500/80 hover:bg-blue-500 text-white'
               }`}
             >
-              {isListening ? '🎤 Listening...' : '🎤 Voice Command'}
+              <span>🎤</span>
+              <span>{isListening ? 'Listening...' : 'Voice Command'}</span>
             </button>
-            
-            <div className="text-xs text-gray-300">
-              Say: "Take me to train station"
-            </div>
           </div>
-        </div>
-
-        {/* Current Direction Display */}
-        {navigationActive && currentDirection && (
-          <div className="absolute top-1/2 left-4 right-4 transform -translate-y-1/2 bg-blue-600/95 text-white p-4 rounded-lg z-40 shadow-lg">
-            <div className="flex items-center justify-between">
-              <div className="flex-1">
-                <div className="font-bold text-lg mb-2">🧭 Navigation</div>
-                
-                {/* Current Step */}
-                <div className="mb-3 p-2 bg-blue-700/50 rounded">
-                  <div className="text-xs text-blue-200 font-semibold mb-1">CURRENT:</div>
-                  <div className="text-sm leading-relaxed">{currentDirection}</div>
-                </div>
-                
-                {/* Next Step */}
-                {nextDirection && (
-                  <div className="p-2 bg-blue-800/50 rounded">
-                    <div className="text-xs text-blue-300 font-semibold mb-1">NEXT:</div>
-                    <div className="text-xs leading-relaxed text-blue-100">{nextDirection}</div>
-                  </div>
-                )}
-              </div>
+          
+          <div className="flex items-center justify-between">
+            <div className="flex items-center space-x-2">
+              <select 
+                value={selectedVoice} 
+                onChange={(e) => setSelectedVoice(e.target.value)}
+                className="bg-white/10 border border-white/30 text-white text-xs px-2 py-1 rounded focus:outline-none focus:ring-1 focus:ring-blue-400"
+              >
+                <option value="female" className="bg-gray-800">♀ Bella</option>
+                <option value="male" className="bg-gray-800">♂ Josh</option>
+              </select>
               
-              <button 
-                onClick={stopNavigation}
-                className="ml-4 bg-red-500 hover:bg-red-600 px-3 py-2 rounded text-sm font-bold"
+              <label className="flex items-center space-x-1 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={isElevenLabsEnabled}
+                  onChange={(e) => setIsElevenLabsEnabled(e.target.checked)}
+                  className="w-3 h-3 text-blue-400 bg-white/10 border-white/30 rounded"
+                />
+                <span className="text-white/80 text-xs">Natural AI</span>
+              </label>
+            </div>
+            
+            {isSpeaking && (
+              <button
+                onClick={stopSpeech}
+                className="text-red-400 hover:text-red-300 text-xs font-medium bg-red-500/20 px-2 py-1 rounded"
               >
                 Stop
               </button>
-            </div>
-          </div>
-        )}
-
-        {/* Navigation Status */}
-        {navigationActive && (
-          <div className="absolute top-20 right-4 bg-blue-600/90 text-white p-3 rounded-lg z-30 max-w-xs">
-            <div className="font-bold text-sm">🗺️ Navigation Active</div>
-            <div className="text-xs mt-1">Following walking route</div>
-            <button 
-              onClick={stopNavigation}
-              className="mt-2 bg-red-500 hover:bg-red-600 px-2 py-1 rounded text-xs"
-            >
-              Stop Navigation
-            </button>
-          </div>
-        )}
-
-        {/* Debug Panel - Desktop only */}
-        <div className="absolute bottom-4 right-4 bg-black/70 text-white p-3 rounded-lg text-xs max-w-xs z-30 hidden md:block">
-          <div className="font-bold mb-2">🔧 Debug Info</div>
-          <div>Backend: {tf.getBackend()}</div>
-          <div>Camera: {cameraStatus}</div>
-          <div>Voice: {voiceInitialized ? 'enabled' : 'click to enable'}</div>
-          <div>Location: {userLocation ? '✓' : '✗'}</div>
-          <div>Detections: {detections.length}</div>
-          <div className="mt-2 space-x-1">
-            <button 
-              onClick={runManualDetection}
-              className="bg-pink-500 hover:bg-pink-600 px-2 py-1 rounded text-white text-xs"
-            >
-              🔍 Detect
-            </button>
-            <button 
-              onClick={testVoice}
-              className="bg-blue-500 hover:bg-blue-600 px-2 py-1 rounded text-white text-xs"
-            >
-              🔊 Test
-            </button>
-          </div>
-        </div>
-
-        {/* Bottom Info Panel */}
-        <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-black/80 to-transparent p-6 z-10">
-          <div className="text-center">
-            <div className="text-white text-lg mb-2">
-              Detecting: <span className="font-bold text-pink-400">People</span> & <span className="font-bold text-yellow-400">Vehicles</span>
-            </div>
-            
-            {detections.length > 0 ? (
-              <div className="flex flex-wrap justify-center gap-2 mt-3">
-                {detections.map((detection, index) => {
-                  const isVehicle = vehicleTypes.includes(detection.class);
-                  return (
-                    <div
-                      key={index}
-                      className={`backdrop-blur-sm text-white px-3 py-1 rounded-full text-sm font-medium ${
-                        isVehicle ? 'bg-yellow-500/20' : 'bg-white/20'
-                      }`}
-                    >
-                      {detection.class} - {Math.round(detection.score * 100)}%
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="text-gray-300 text-sm mt-2">
-                👀 Scanning for objects and vehicles...
-              </div>
             )}
-            
-            <div className="text-gray-400 text-xs mt-3">
-              {voiceInitialized ? 
-                '🎤 Say "Take me to train station" for navigation' : 
-                `📱 Tap anywhere to enable voice assistant${isChrome ? ' (Chrome detected)' : ''}`
-              }
-            </div>
+          </div>
+          
+          <div className="text-xs text-white/70 bg-white/10 px-2 py-1 rounded">
+            💡 Try: "Take me to the train station" or "What do you see?"
+            {isElevenLabsEnabled && (
+              <div className="text-green-400 mt-1">✨ Conversational AI Voice Active</div>
+            )}
           </div>
         </div>
       </div>
+
+      {/* Enhanced Status Panel */}
+      <div className="absolute top-4 right-4 bg-black/40 backdrop-blur-md border border-white/20 text-white p-3 rounded-lg z-30 shadow-lg">
+        <div className="space-y-2 text-sm">
+          <div className="text-white/90 font-medium mb-2">System Status</div>
+          
+          <div className="flex items-center justify-between">
+            <span className="text-white/80 text-xs">OMI Device:</span>
+            <div className="flex items-center space-x-1">
+              <div className={`w-2 h-2 rounded-full ${
+                isConnectedToOMI ? 'bg-green-400' : 'bg-red-400'
+              }`}></div>
+              <span className={`text-xs ${
+                isConnectedToOMI ? 'text-green-300' : 'text-red-300'
+              }`}>
+                {isConnectedToOMI ? 'Connected' : 'Disconnected'}
+              </span>
+            </div>
+          </div>
+          
+          <div className="flex items-center justify-between">
+            <span className="text-white/80 text-xs">Detections:</span>
+            <span className="text-white/90 text-xs bg-white/10 px-2 py-1 rounded">
+              {detections.length} objects
+            </span>
+          </div>
+          
+          <div className="flex items-center justify-between">
+            <span className="text-white/80 text-xs">Voice:</span>
+            <span className={`text-xs px-2 py-1 rounded ${
+              voiceInitialized 
+                ? 'text-green-300 bg-green-500/20' 
+                : 'text-yellow-300 bg-yellow-500/20'
+            }`}>
+              {voiceInitialized ? 'Ready' : 'Tap to enable'}
+            </span>
+          </div>
+        </div>
+      </div>
+      
+      {/* Minimal Action Buttons */}
+      <div className="absolute bottom-3 right-3 flex gap-1 z-30">
+        <button 
+          onClick={runManualDetection}
+          className="bg-black/10 hover:bg-black/20 backdrop-blur-sm text-white p-1 rounded transition-all"
+          title="Detect"
+        >
+          <span className="text-xs">🔍</span>
+        </button>
+        <button 
+          onClick={testVoice}
+          disabled={isSpeaking}
+          className={`backdrop-blur-sm text-white p-1 rounded transition-all ${
+            isSpeaking 
+              ? 'bg-gray-400/20 cursor-not-allowed' 
+              : 'bg-black/10 hover:bg-black/20'
+          }`}
+          title="Test"
+        >
+          <span className="text-xs">🔊</span>
+        </button>
+      </div>
+      
+      {/* Detection Overlay */}
+      <div className="absolute inset-0 pointer-events-none">
+        {renderDetectionBoxes()}
+      </div>
+
+      {/* Ultra-minimal Navigation */}
+      {navigationActive && currentDirection && (
+        <div className="absolute bottom-16 left-1/2 transform -translate-x-1/2 bg-black/10 backdrop-blur-sm text-white px-3 py-1 rounded-md z-40 max-w-sm">
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex-1 text-xs text-white/80">
+              🧭 {currentDirection.substring(0, 35)}...
+            </div>
+            <button 
+              onClick={stopNavigation}
+              className="bg-red-400/60 hover:bg-red-400/80 px-1 py-0.5 rounded text-xs text-white transition-all"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
+
+
+
+      
+      {/* Enhanced OMI Transcripts Panel */}
+      {transcripts.length > 0 && (
+        <div className="absolute bottom-4 left-4 bg-black/40 backdrop-blur-md border border-white/20 text-white p-4 rounded-lg z-30 max-w-md shadow-lg">
+          <div className="flex items-center justify-between mb-3">
+            <div className="text-white/90 text-sm font-medium">OMI Transcripts</div>
+            <div className={`w-2 h-2 rounded-full ${
+              isConnectedToOMI ? 'bg-green-400' : 'bg-red-400'
+            }`}></div>
+          </div>
+          
+          <div className="space-y-2 max-h-32 overflow-y-auto">
+            {transcripts.slice(-3).map((transcript, index) => (
+              <div key={transcript.id} className={`p-3 rounded-lg border text-sm ${
+                transcript.is_user 
+                  ? 'bg-blue-500/20 border-blue-400/30 text-blue-200' 
+                  : 'bg-white/10 border-white/20 text-white/90'
+              }`}>
+                <div className="flex items-start space-x-2">
+                  <span className="text-xs">
+                    {transcript.is_user ? '👤' : '🤖'}
+                  </span>
+                  <div className="flex-1">
+                    <div className="font-medium text-xs mb-1">
+                      {transcript.is_user ? 'You:' : 'Assistant:'}
+                    </div>
+                    <div className="text-xs leading-relaxed">
+                      {transcript.text}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          
+          <div className="mt-2 text-xs text-white/60 text-center">
+            {isConnectedToOMI ? 
+              '🟢 Device Connected - Listening for commands' : 
+              '🔴 Device Disconnected'
+            }
+          </div>
+        </div>
+      )}
+
+      {/* Ultra-minimal Detection */}
+      {detections.length > 0 && (
+        <div className="absolute bottom-12 left-3 bg-black/5 backdrop-blur-sm text-white px-2 py-1 rounded-md z-30">
+          <div className="flex gap-1 text-xs text-white/60">
+            {detections.slice(0, 2).map((detection, index) => {
+              const isVehicle = vehicleTypes.includes(detection.class);
+              return (
+                <span
+                  key={index}
+                  className={isVehicle ? 'text-amber-300/80' : 'text-rose-300/80'}
+                >
+                  {detection.class.substring(0, 3)}
+                </span>
+              );
+            })}
+            {detections.length > 2 && <span>+{detections.length - 2}</span>}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
