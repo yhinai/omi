@@ -55,7 +55,7 @@ class VoiceRequest(BaseModel):
     voice_type: str = "female"  # female or male
 
 # ElevenLabs configuration
-ELEVENLABS_API_KEY = "sk_92ef1247b19b69721020876f6fec6bab973b593ec23176f1"
+ELEVENLABS_API_KEY = "ELEVENLABS_API_KEY"
 ELEVENLABS_VOICE_IDS = {
     "female": "EXAVITQu4vr4xnSDxMaL",  # Bella
     "male": "VR6AewLTigWG4xSOukaG"     # Josh
