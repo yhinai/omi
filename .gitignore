@@ -3,6 +3,8 @@ logs/
 *.log
 *.pid
 .env
+.env.*
+!.env.example
 __pycache__/
 *.pyc
 .DS_Store
