@@ -21,6 +21,7 @@ import struct
 import sys
 import sysconfig
 import time
+import uuid
 import wave
 
 
@@ -46,6 +47,7 @@ SAMPLE_RATE = 16000
 BYTES_PER_SECOND = SAMPLE_RATE * 2
 MAX_BUFFER_BYTES = BYTES_PER_SECOND * 30
 RETRY_DELAYS = (1.0, 2.0, 4.0)
+WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC = 20.0, 45.0
 GEMINI_API_KEY = ""
 GEMINI_STT_MODEL = "gemini-3.8-flash"
 GEMINI_THINKING_LEVEL = "low"
@@ -96,6 +98,7 @@ def _load_dotenv(local_path=None, fallback_path=None, environ=None):
 
 
 def configure(env=None):
+    global WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC
     global GEMINI_API_KEY, GEMINI_STT_MODEL, GEMINI_THINKING_LEVEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
     global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, PORT, HEALTH_PORT
     global HERMES_LIVE_WEBHOOK, HERMES_RESEARCH_WEBHOOK, WAKE_WORD, RESEARCH_INTERVAL_SEC
@@ -114,6 +117,10 @@ def configure(env=None):
     POST_LOOKAHEAD_SEC = float(env.get("OMI_POST_LOOKAHEAD_SEC", "1"))
     IDLE_FLUSH_SEC = float(env.get("OMI_IDLE_FLUSH_SEC", "8"))
     RMS_SILENCE_THRESHOLD = float(env.get("OMI_RMS_THRESHOLD", "80"))
+    WINDOW_DEADLINE_SEC = float(env.get("OMI_WINDOW_DEADLINE_SEC", "20"))
+    MAX_WINDOW_AGE_SEC = float(env.get("OMI_MAX_WINDOW_AGE_SEC", "45"))
+    if not all(math.isfinite(v) and v > 0 for v in (WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC)):
+        raise ValueError("Window deadline and maximum queue age must be finite and positive")
     if not all(math.isfinite(v) and v >= 0 for v in
                (PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC, IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD)):
         raise ValueError("Audio settings must be finite, nonnegative numbers")
@@ -128,6 +135,12 @@ def configure(env=None):
     WAKE_WORD = env.get("OMI_WAKE_WORD", "hermes").strip().lower()
 
 
+class OutputFileHandler(RotatingFileHandler):
+    def handleError(self, record):
+        # Logging normally swallows disk errors; output health must see them.
+        raise sys.exc_info()[1]
+
+
 def configure_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
     for target, filename, fmt in (
@@ -140,7 +153,8 @@ def configure_logging():
         for handler in target.handlers[:]:
             target.removeHandler(handler)
             handler.close()
-        handler = RotatingFileHandler(os.path.join(LOG_DIR, filename), maxBytes=5 * 1024 * 1024, backupCount=3)
+        handler_class = RotatingFileHandler if target is logger else OutputFileHandler
+        handler = handler_class(os.path.join(LOG_DIR, filename), maxBytes=5 * 1024 * 1024, backupCount=3)
         handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
         target.addHandler(handler)
 
@@ -172,6 +186,8 @@ class AudioWindow:
     audio_start_at: float | None = None
     received_at: float | None = None
     sample_offset: int | None = None
+    enqueued_at: float = field(default_factory=lambda: time.monotonic())
+    first_received_mono: float | None = None
 
 
 @dataclass(frozen=True)
@@ -187,62 +203,135 @@ class GeminiResponseError(Exception):
         super().__init__(f"Gemini response: {kind}")
 
 
-# Construct queues in the running event loop.
-stt_queue = None
-audio_sessions = deque()
-current_session = None
-_next_session_id = 0
-audio_pcm_buffer, audio_pre_tail = bytearray(), bytearray()
-audio_sample_rate = SAMPLE_RATE
-audio_ring, audio_ring_bytes = deque(), 0
-daily_notes = None
-rolling_research_buffer = []
-last_research_time = time.monotonic()
-live_listeners = {}  # WebSocket -> bounded outgoing queue
-webhook_tasks = set()
-background_tasks = {}
-http_session = None
-stopping = False
-metrics = {
-    "started_at": time.monotonic(), "last_packet_at": None, "last_stt_success_at": None,
-    "last_error": None, "windows_processed": 0, "windows_retried": 0,
-    "windows_dropped": 0, "windows_evicted": 0, "buffer_bytes_evicted": 0, "windows_skipped": 0, "packets_rejected": 0, "stt_in_flight": False,
-    "last_transcript_at": None, "last_outcome": None, "transcripts_emitted": 0,
-    "windows_no_speech": 0, "windows_blocked": 0, "windows_truncated": 0, "windows_invalid_response": 0,
-}
+def new_metrics():
+    return {
+        "started_at": time.monotonic(), "last_packet_at": None, "last_stt_success_at": None,
+        "last_error": None, "windows_processed": 0, "windows_retried": 0,
+        "windows_dropped": 0, "windows_evicted": 0, "buffer_bytes_evicted": 0, "windows_skipped": 0, "packets_rejected": 0, "stt_in_flight": False,
+        "last_transcript_at": None, "last_outcome": None, "transcripts_emitted": 0,
+        "lost_audio_sec_failed": 0.0, "lost_audio_sec_stale": 0.0,
+        "lost_audio_sec_queue_evicted": 0.0, "lost_audio_sec_buffer_evicted": 0.0,
+        "output_errors": 0, "last_output_error": None,
+        "hermes_sent": 0, "hermes_failed": 0, "hermes_dropped": 0, "hermes_research_lines_dropped": 0,
+        "windows_no_speech": 0, "windows_blocked": 0, "windows_truncated": 0, "windows_invalid_response": 0,
+    }
 
 
-async def post_webhook(url, payload):
-    try:
-        async with http_session.post(url, data=payload, allow_redirects=False,
-                headers={"Content-Type": "application/json", "X-Request-ID": f"omi-{time.time_ns()}"},
-                timeout=aiohttp.ClientTimeout(total=15)) as response:
-            if not 200 <= response.status < 300:
-                raise aiohttp.ClientResponseError(response.request_info, response.history,
-                                                  status=response.status)
-            await response.read()
-    except Exception as e:
-        logger.warning("Hermes delivery failed: %s", type(e).__name__)
+@dataclass
+class BridgeState:
+    stt_queue: asyncio.Queue | None = None
+    audio_sessions: deque = field(default_factory=deque)
+    current_session: AudioSession | None = None
+    _next_session_id: int = 0
+    audio_ring: deque = field(default_factory=deque)
+    audio_ring_bytes: int = 0
+    daily_notes: object = None
+    rolling_research_buffer: deque = field(default_factory=lambda: deque(maxlen=1000))
+    last_research_time: float = field(default_factory=lambda: time.monotonic())
+    live_listeners: dict = field(default_factory=dict)
+    background_tasks: dict = field(default_factory=dict)
+    http_session: aiohttp.ClientSession | None = None
+    stopping: bool = False
+    metrics: dict = field(default_factory=new_metrics)
+    pending_webhooks: deque = field(default_factory=deque)
+    pending_windows: dict = field(default_factory=dict)
+    active_window: AudioWindow | None = None
+    latency_samples: dict = field(default_factory=lambda: {
+        name: deque(maxlen=128) for name in ("receipt_to_transcript_sec", "gemini_request_duration_sec")})
+
+
+state = BridgeState()
+
+
+def record_latency(name, seconds):
+    state.latency_samples[name].append(max(0.0, seconds))
+
+
+def latency_summary(samples):
+    if not samples:
+        return {"samples": 0, "last": None, "p50": None, "p95": None}
+    ordered = sorted(samples)
+    return {"samples": len(samples), "last": round(samples[-1], 3),
+            "p50": round(ordered[math.ceil(len(ordered) * .50) - 1], 3),
+            "p95": round(ordered[math.ceil(len(ordered) * .95) - 1], 3)}
+
+
+def oldest_pending_audio_age(now):
+    # Receipt marks survive partial slicing/trimming; playback history is not pending work.
+    starts = [session.receipts[0][2] for session in state.audio_sessions
+              if session.pcm and session.receipts]
+    windows = list(state.pending_windows.values())
+    if state.active_window is not None:
+        windows.append(state.active_window)
+    starts.extend(window.first_received_mono if window.first_received_mono is not None
+                  else window.enqueued_at for window in windows if window.pcm)
+    return round(max(0.0, now - min(starts)), 3) if starts else None
+
+
+@dataclass
+class WebhookBatch:
+    url: str
+    payload: bytes
+    batch_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    attempts: int = 0
+    retry_at: float = 0.0
 
 
 def schedule_webhook(url, payload):
     if not url:
+        return True
+    if len(state.pending_webhooks) >= 10:
+        state.metrics["hermes_dropped"] += 1
+        logger.warning("Hermes delivery buffer full; batch not admitted")
+        return False
+    state.pending_webhooks.append(WebhookBatch(url, payload))
+    return True
+
+
+async def deliver_next_webhook():
+    if not state.pending_webhooks:
+        return True
+    batch = state.pending_webhooks[0]
+    if time.monotonic() < batch.retry_at:
+        return False
+    try:
+        async with state.http_session.post(batch.url, data=batch.payload, allow_redirects=False,
+                headers={"Content-Type": "application/json", "X-Request-ID": batch.batch_id},
+                timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if not 200 <= response.status < 300:
+                raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
+            await response.read()
+    except (aiohttp.ClientError, TimeoutError, OSError) as error:
+        state.metrics["hermes_failed"] += 1
+        batch.attempts += 1
+        batch.retry_at = time.monotonic() + min(30, 2 ** min(batch.attempts, 5))
+        logger.warning("Hermes delivery retained for retry: %s", type(error).__name__)
+        return False
+    state.pending_webhooks.popleft()
+    state.metrics["hermes_sent"] += 1
+    return True
+
+
+def queue_research_batch():
+    if not state.rolling_research_buffer or not HERMES_RESEARCH_WEBHOOK:
         return
-    if len(webhook_tasks) >= 8:
-        logger.warning("Hermes delivery backlog is full")
+    # Leave accumulated text alone while the bounded delivery buffer is full.
+    if len(state.pending_webhooks) >= 10:
         return
-    task = asyncio.create_task(post_webhook(url, payload))
-    webhook_tasks.add(task)
-    task.add_done_callback(webhook_tasks.discard)
+    payload = json.dumps({"text": "\n".join(state.rolling_research_buffer),
+                          "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}).encode()
+    if schedule_webhook(HERMES_RESEARCH_WEBHOOK, payload):
+        state.rolling_research_buffer.clear()
+        state.last_research_time = time.monotonic()
 
 
 def broadcast(message):
-    for ws, queue in list(live_listeners.items()):
+    for ws, queue in list(state.live_listeners.items()):
         try:
             queue.put_nowait(message)
         except asyncio.QueueFull:
             # Let the existing sender close a slow listener, without creating more tasks.
-            live_listeners.pop(ws, None)
+            state.live_listeners.pop(ws, None)
             while not queue.empty():
                 queue.get_nowait()
             queue.put_nowait(None)
@@ -298,32 +387,89 @@ class DailyNotes:
 
 
 def flush_daily_paragraph():
-    if daily_notes is not None:
-        daily_notes.close_paragraph()
+    if state.daily_notes is not None:
+        state.daily_notes.close_paragraph()
 
 
-def record_transcript_line(text, audio_start_at=None, received_at=None, processed_at=None,
-                           session_id=None, sample_offset=None):
-    text = " ".join(text.split()).strip()
-    if not text:
-        return
+def output_failed(target, error):
+    state.metrics["output_errors"] += 1
+    state.metrics["last_output_error"] = f"{target}: {type(error).__name__}"
+    logger.error("Transcript output failed: %s", state.metrics["last_output_error"])
+
+
+def write_event(event):
+    """JSONL is authoritative; projections are independent, synchronous best effort."""
+    try:
+        event_logger.info(json.dumps(event, ensure_ascii=False))
+    except Exception as error:
+        output_failed("jsonl", error)
+        return False
+    timestamp, text = event["timestamp"], event["text"]
+    errors_before = state.metrics["output_errors"]
+    try:
+        transcript_logger.info("[%s] %s", timestamp, text)
+    except Exception as error:
+        output_failed("text", error)
+    try:
+        if state.daily_notes is not None:
+            if event["type"] == "gap":
+                state.daily_notes.close_paragraph()
+            state.daily_notes.add(timestamp, text)
+            if event["type"] == "gap":
+                state.daily_notes.close_paragraph()
+    except Exception as error:
+        output_failed("markdown", error)
+        if state.daily_notes is not None:
+            state.daily_notes.close_paragraph()
+    if errors_before == state.metrics["output_errors"]:
+        state.metrics["last_output_error"] = None
+    broadcast(json.dumps(event))
+    return True
+
+
+def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=None,
+               session_id=None, sample_offset=None):
     processed_at = time.time() if processed_at is None else processed_at
     source_at = audio_start_at if audio_start_at is not None else processed_at
-    timestamp = datetime.fromtimestamp(source_at).strftime("%Y-%m-%d %H:%M:%S")
-    event = {"timestamp": timestamp, "text": text, "audio_start_at": audio_start_at,
-             "received_at": received_at, "processed_at": processed_at,
-             "session_id": session_id, "sample_offset": sample_offset,
-             "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time"}
-    transcript_logger.info("[%s] %s", timestamp, text)
-    event_logger.info(json.dumps(event, ensure_ascii=False))
-    if daily_notes is not None:
-        daily_notes.add(timestamp, text)
+    return {"event_id": uuid.uuid4().hex, "type": kind,
+            "timestamp": datetime.fromtimestamp(source_at).strftime("%Y-%m-%d %H:%M:%S"),
+            "text": text, "audio_start_at": audio_start_at, "received_at": received_at,
+            "processed_at": processed_at, "session_id": session_id, "sample_offset": sample_offset,
+            "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time"}
+
+
+def record_gap(reason, seconds, *, session_id=None, sample_offset=None, audio_start_at=None,
+               received_at=None):
+    if seconds <= 0:
+        return
+    state.metrics[f"lost_audio_sec_{reason}"] += seconds
+    event = make_event("gap", f"[GAP: {seconds:.3f}s audio untranscribed; {reason}]",
+                       audio_start_at=audio_start_at, received_at=received_at,
+                       session_id=session_id, sample_offset=sample_offset)
+    event.update(reason=reason, duration_sec=seconds)
+    write_event(event)
+
+
+def record_window_gap(reason, window):
+    record_gap(reason, window.core_sec, session_id=window.session_id,
+               sample_offset=window.sample_offset, audio_start_at=window.audio_start_at,
+               received_at=window.received_at)
+
+
+def record_transcript_line(text, **timing):
+    text = " ".join(text.split()).strip()
+    if not text:
+        return False
+    event = make_event("transcript", text, **timing)
+    if not write_event(event):
+        return False
     if HERMES_RESEARCH_WEBHOOK:
-        rolling_research_buffer.append(f"[{timestamp}] {text}")
-    broadcast(json.dumps({"type": "transcript", **event}))
+        if len(state.rolling_research_buffer) == state.rolling_research_buffer.maxlen:
+            state.metrics["hermes_research_lines_dropped"] += 1
+        state.rolling_research_buffer.append(f"[{event['timestamp']}] {text}")
     if WAKE_WORD and WAKE_WORD in text.lower():
-        schedule_webhook(HERMES_LIVE_WEBHOOK, json.dumps(
-            {"speaker": "user", **event}).encode())
+        schedule_webhook(HERMES_LIVE_WEBHOOK, json.dumps({"speaker": "user", **event}).encode())
+    return True
 
 
 def pcm16_rms(pcm_bytes: bytes) -> float:
@@ -449,11 +595,12 @@ async def gemini_stt_request(pcm_bytes: bytes, sr: int, pre_sec: float, core_sec
         overlap_note = (
             f"This clip has a {pre_sec:.1f}s pre-overlap at the start and a {post_sec:.1f}s lookahead tail at the end "
             f"(centering a {core_sec:.1f}s window). The previous window ended with: \"{prev_ctx}\". "
-            "Use the overlap so no boundary words are clipped, and output ONLY the new continuation after those words. "
+            "The quoted context is only for boundary matching, not a request to continue it. "
+            "Return only speech audible in this clip after that overlap; never infer or invent a continuation. "
         )
 
     prompt = (
-        "Transcribe the speech in this audio clip into clean, uniform, single-paragraph English prose. "
+        "Transcribe only intelligible words actually spoken in this audio clip into a single English paragraph. "
         + overlap_note
         + "Do not include timestamps, speaker labels, markdown, or commentary. "
         "If there is no intelligible speech beyond the previous context, return ONLY an empty string."
@@ -461,10 +608,11 @@ async def gemini_stt_request(pcm_bytes: bytes, sr: int, pre_sec: float, core_sec
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_STT_MODEL}:generateContent"
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "audio/wav", "data": b64_wav}}]}],
-        "generationConfig": {"thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL}},
+        "generationConfig": {"temperature": 0.0, "maxOutputTokens": 160,
+                             "thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL}},
     }
-    async with http_session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY},
-                                 allow_redirects=False) as response:
+    async with state.http_session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY},
+                                 allow_redirects=False, timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10)) as response:
         if not 200 <= response.status < 300:
             raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
         try:
@@ -494,23 +642,29 @@ async def gemini_stt_request(pcm_bytes: bytes, sr: int, pre_sec: float, core_sec
 
 
 async def enqueue_stt_window(full_pcm, sr, pre_s, core_s, post_s, reset_context_after=False,
-                             session_id=None, audio_start_at=None, received_at=None, sample_offset=None):
+                             session_id=None, audio_start_at=None, received_at=None, sample_offset=None,
+                             first_received_mono=None):
     """Prefer fresh windows during overload; preserve all pending work during shutdown."""
     if session_id is None:
-        session_id = current_session.session_id if current_session else _next_session_id
+        session_id = state.current_session.session_id if state.current_session else state._next_session_id
     window = AudioWindow(full_pcm, sr, pre_s, core_s, post_s, reset_context_after,
-                         session_id, audio_start_at, received_at, sample_offset)
-    if stopping:
-        await stt_queue.put(window)
+                         session_id, audio_start_at, received_at, sample_offset,
+                         first_received_mono=first_received_mono)
+    if state.stopping:
+        await state.stt_queue.put(window)
+        state.pending_windows[id(window)] = window
         return
-    if stt_queue.full():
-        dropped = stt_queue.get_nowait()
-        stt_queue.task_done()
+    if state.stt_queue.full():
+        dropped = state.stt_queue.get_nowait()
+        state.pending_windows.pop(id(dropped), None)
+        state.stt_queue.task_done()
         if dropped is not None and dropped.pcm:
-            metrics["windows_dropped"] += 1
-            metrics["windows_evicted"] += 1
+            state.metrics["windows_dropped"] += 1
+            state.metrics["windows_evicted"] += 1
+            record_window_gap("queue_evicted", dropped)
             logger.warning("STT backlog full: evicted oldest window (%.2fs core)", dropped.core_sec)
-    stt_queue.put_nowait(window)
+    state.stt_queue.put_nowait(window)
+    state.pending_windows[id(window)] = window
 
 
 def _transient_error(error):
@@ -531,11 +685,40 @@ def _error_label(error):
     return type(error).__name__  # Avoid leaking request URLs or credentials into telemetry.
 
 
+async def transcribe_with_retries(window, previous_context):
+    """The outer timeout bounds attempts AND backoff, including the last request."""
+    async with asyncio.timeout(WINDOW_DEADLINE_SEC):
+        deadline = asyncio.get_running_loop().time() + WINDOW_DEADLINE_SEC
+        for attempt in range(len(RETRY_DELAYS) + 1):
+            try:
+                started = time.monotonic()
+                try:
+                    return await gemini_stt_request(window.pcm, window.sample_rate,
+                        window.pre_sec, window.core_sec, window.post_sec, previous_context)
+                finally:
+                    record_latency("gemini_request_duration_sec", time.monotonic() - started)
+            except Exception as error:
+                state.metrics["last_error"] = _error_label(error)
+                if isinstance(error, GeminiResponseError):
+                    state.metrics[f"windows_{error.kind}"] += 1
+                    state.metrics["last_outcome"] = error.kind
+                if not _transient_error(error) or attempt == len(RETRY_DELAYS):
+                    raise
+                delay = RETRY_DELAYS[attempt]
+                if asyncio.get_running_loop().time() + delay >= deadline:
+                    raise TimeoutError("Window processing deadline exhausted") from None
+                state.metrics["windows_retried"] += 1
+                logger.warning("%s; retry %d/3 in %.1fs", _error_label(error), attempt + 1, delay)
+                await asyncio.sleep(delay)
+
+
 async def stt_consumer_worker():
     """One ordered consumer, one initial attempt plus at most three transient retries."""
     last_transcript_tail, context_session, next_sample = "", None, None
     while True:
-        window = await stt_queue.get()
+        window = await state.stt_queue.get()
+        state.pending_windows.pop(id(window), None)
+        state.active_window = window
         try:
             if window is None:
                 return
@@ -544,69 +727,71 @@ async def stt_consumer_worker():
                 flush_daily_paragraph()
             next_sample = (window.sample_offset + round(window.core_sec * window.sample_rate)
                            if window.sample_offset is not None else None)
+            if (window.pcm and not state.stopping
+                    and time.monotonic() - window.enqueued_at > MAX_WINDOW_AGE_SEC):
+                state.metrics["windows_dropped"] += 1
+                record_window_gap("stale", window)
+                last_transcript_tail = ""
+                flush_daily_paragraph()
+                continue
             pre_b = int(window.pre_sec * BYTES_PER_SECOND)
             core_b = int(window.core_sec * BYTES_PER_SECOND)
             core = window.pcm[pre_b:pre_b + core_b]
             if core and pcm16_rms(core) >= RMS_SILENCE_THRESHOLD:
-                metrics["stt_in_flight"] = True
+                state.metrics["stt_in_flight"] = True
                 result = None
-                for attempt in range(len(RETRY_DELAYS) + 1):
-                    try:
-                        result = await gemini_stt_request(window.pcm, window.sample_rate,
-                            window.pre_sec, window.core_sec, window.post_sec, last_transcript_tail)
-                        metrics["last_stt_success_at"] = time.monotonic()
-                        metrics["windows_processed"] += 1
-                        metrics["last_error"] = None
-                        metrics["last_outcome"] = result.outcome
-                        if result.outcome == "no_speech":
-                            metrics["windows_no_speech"] += 1
-                        break
-                    except Exception as error:
-                        metrics["last_error"] = _error_label(error)
-                        retryable = _transient_error(error)
-                        if isinstance(error, GeminiResponseError):
-                            metrics[f"windows_{error.kind}"] += 1
-                            metrics["last_outcome"] = error.kind
-                        if not retryable or attempt == len(RETRY_DELAYS):
-                            metrics["windows_dropped"] += 1
-                            last_transcript_tail = ""
-                            logger.error("STT window dropped after %d attempt(s): %s", attempt + 1, metrics["last_error"])
-                            break
-                        metrics["windows_retried"] += 1
-                        logger.warning("%s; retry %d/3 in %.1fs", metrics["last_error"], attempt + 1, RETRY_DELAYS[attempt])
-                        await asyncio.sleep(RETRY_DELAYS[attempt])
+                try:
+                    result = await transcribe_with_retries(window, last_transcript_tail)
+                    state.metrics["last_stt_success_at"] = time.monotonic()
+                    state.metrics["windows_processed"] += 1
+                    state.metrics["last_error"] = None
+                    state.metrics["last_outcome"] = result.outcome
+                    if result.outcome == "no_speech":
+                        state.metrics["windows_no_speech"] += 1
+                except Exception as error:
+                    state.metrics["last_error"] = _error_label(error)
+                    state.metrics["windows_dropped"] += 1
+                    record_window_gap("failed", window)
+                    last_transcript_tail = ""
+                    flush_daily_paragraph()
+                    logger.error("STT window dropped: %s", state.metrics["last_error"])
                 if result and result.outcome == "speech":
                     cleaned = dedupe_boundary_overlap(last_transcript_tail, result.text)
                     if cleaned:
-                        record_transcript_line(cleaned, audio_start_at=window.audio_start_at,
+                        emitted = record_transcript_line(cleaned, audio_start_at=window.audio_start_at,
                                                received_at=window.received_at, session_id=window.session_id,
                                                sample_offset=window.sample_offset)
-                        metrics["last_transcript_at"] = time.monotonic()
-                        metrics["transcripts_emitted"] += 1
+                        if emitted is not False:
+                            state.metrics["last_transcript_at"] = time.monotonic()
+                            state.metrics["transcripts_emitted"] += 1
+                            if window.first_received_mono is not None:
+                                record_latency("receipt_to_transcript_sec",
+                                               time.monotonic() - window.first_received_mono)
                         last_transcript_tail = " ".join((last_transcript_tail + " " + cleaned).split()[-24:])
             elif core:
-                metrics["windows_skipped"] += 1
+                state.metrics["windows_skipped"] += 1
             if window.reset_context_after:
                 last_transcript_tail = ""
                 flush_daily_paragraph()
         except Exception as error:
             # A failed output file or malformed response must not silently kill the sole consumer.
-            metrics["last_error"] = _error_label(error)
-            metrics["windows_dropped"] += 1
+            state.metrics["last_error"] = _error_label(error)
+            state.metrics["windows_dropped"] += 1
+            record_window_gap("failed", window)
             last_transcript_tail = ""
             logger.exception("STT window processing failed")
         finally:
-            metrics["stt_in_flight"] = False
-            stt_queue.task_done()
+            state.active_window = None
+            state.metrics["stt_in_flight"] = False
+            state.stt_queue.task_done()
 
 
 def buffered_audio_bytes():
-    return sum(len(session.pcm) for session in audio_sessions)
+    return sum(len(session.pcm) for session in state.audio_sessions)
 
 
 def ingest_raw_pcm(raw, sr=SAMPLE_RATE):
-    global current_session, _next_session_id, audio_pcm_buffer, audio_pre_tail, audio_ring_bytes
-    if stopping:
+    if state.stopping:
         raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
     if sr != SAMPLE_RATE or len(raw) % 2:
         raise web.HTTPBadRequest(text="Expected 16000 Hz mono PCM16 with complete two-byte samples")
@@ -614,48 +799,52 @@ def ingest_raw_pcm(raw, sr=SAMPLE_RATE):
         return
     now, received_at = time.monotonic(), time.time()
     # Retain every valid live packet before applying the pending-transcription limit.
-    audio_ring.append((now, SAMPLE_RATE, raw))
-    audio_ring_bytes += len(raw)
+    state.audio_ring.append((now, SAMPLE_RATE, raw))
+    state.audio_ring_bytes += len(raw)
     max_ring_bytes = BYTES_PER_SECOND * RING_BUFFER_SECONDS
-    while audio_ring_bytes > max_ring_bytes:
-        stamp, old_sr, old = audio_ring.popleft()
-        remove = min(audio_ring_bytes - max_ring_bytes, len(old))
-        audio_ring_bytes -= remove
+    while state.audio_ring_bytes > max_ring_bytes:
+        stamp, old_sr, old = state.audio_ring.popleft()
+        remove = min(state.audio_ring_bytes - max_ring_bytes, len(old))
+        state.audio_ring_bytes -= remove
         if remove < len(old):
-            audio_ring.appendleft((stamp, old_sr, old[remove:]))
-    if current_session is None or current_session.closed or now - current_session.last_packet_at > IDLE_FLUSH_SEC:
-        if current_session:
-            current_session.closed = True
-        _next_session_id += 1
-        current_session = AudioSession(_next_session_id, now, first_received_at=received_at,
+            state.audio_ring.appendleft((stamp, old_sr, old[remove:]))
+    if state.current_session is None or state.current_session.closed or now - state.current_session.last_packet_at > IDLE_FLUSH_SEC:
+        if state.current_session:
+            state.current_session.closed = True
+        state._next_session_id += 1
+        state.current_session = AudioSession(state._next_session_id, now, first_received_at=received_at,
                                        last_received_at=received_at,
                                        audio_start_at=received_at - len(raw) / BYTES_PER_SECOND)
-        audio_sessions.append(current_session)
-        audio_pcm_buffer, audio_pre_tail = current_session.pcm, current_session.pre_tail
-    current_session.last_packet_at = now
-    current_session.last_received_at = received_at
-    current_session.received_samples += len(raw) // 2
-    current_session.receipts.append((current_session.received_samples, received_at))
-    current_session.pcm.extend(raw)
-    metrics["last_packet_at"] = now
+        state.audio_sessions.append(state.current_session)
+    state.current_session.last_packet_at = now
+    state.current_session.last_received_at = received_at
+    state.current_session.received_samples += len(raw) // 2
+    state.current_session.receipts.append((state.current_session.received_samples, received_at, now))
+    state.current_session.pcm.extend(raw)
+    state.metrics["last_packet_at"] = now
     excess = buffered_audio_bytes() - MAX_BUFFER_BYTES
     if excess > 0:
-        for session in audio_sessions:
+        for session in state.audio_sessions:
             remove = min(excess, len(session.pcm))
             if not remove:
                 continue
+            record_gap("buffer_evicted", remove / BYTES_PER_SECOND,
+                       session_id=session.session_id, sample_offset=session.consumed_samples,
+                       audio_start_at=(session.audio_start_at + session.consumed_samples / SAMPLE_RATE
+                                       if session.audio_start_at is not None else None),
+                       received_at=session.last_received_at)
             del session.pcm[:remove]
             session.consumed_samples += remove // 2
             session.pre_tail.clear()
             while session.receipts and session.receipts[0][0] <= session.consumed_samples:
                 session.receipts.popleft()
-            metrics["buffer_bytes_evicted"] += remove
-            metrics["windows_dropped"] += 1
+            state.metrics["buffer_bytes_evicted"] += remove
+            state.metrics["windows_dropped"] += 1
             excess -= remove
             if not excess:
                 break
         logger.warning("Raw backlog full: evicted oldest PCM; total evicted bytes=%d",
-                       metrics["buffer_bytes_evicted"])
+                       state.metrics["buffer_bytes_evicted"])
     broadcast(raw)
 
 
@@ -673,14 +862,15 @@ async def _slice_one(session, final=False):
     audio_start_at = (session.audio_start_at + session.consumed_samples / SAMPLE_RATE
                       if session.audio_start_at is not None else None)
     end_sample = session.consumed_samples + end // 2
-    received_at = next((stamp for sample, stamp in session.receipts if sample >= end_sample),
+    received_at = next((stamp for sample, stamp, _ in session.receipts if sample >= end_sample),
                        session.last_received_at)
+    first_received_mono = session.receipts[0][2] if session.receipts else None
     if audio_start_at is not None and received_at is not None:
         # Backfilled/bursty uploads must not imply that audio was captured after it arrived.
         audio_start_at = min(audio_start_at, received_at - end / bps)
     await enqueue_stt_window(full, SAMPLE_RATE, len(session.pre_tail) / bps,
                              len(core) / bps, (end - core_cut) / bps, final, session.session_id,
-                             audio_start_at, received_at, session.consumed_samples)
+                             audio_start_at, received_at, session.consumed_samples, first_received_mono)
     # No await between successful queue admission and committing the consumed prefix.
     del session.pcm[:core_cut]
     session.consumed_samples += core_cut // 2
@@ -691,11 +881,11 @@ async def _slice_one(session, final=False):
 
 async def flush_remaining_buffer(reset_context=True):
     """Close sessions in order; admit all complete PCM samples before a reset marker."""
-    for session in audio_sessions:
+    for session in state.audio_sessions:
         session.closed = True
     need_b = int((CORE_WINDOW_SEC + POST_LOOKAHEAD_SEC) * BYTES_PER_SECOND) & ~1
-    while audio_sessions:
-        session = audio_sessions[0]
+    while state.audio_sessions:
+        session = state.audio_sessions[0]
         while len(session.pcm) >= need_b:
             await _slice_one(session)
         if len(session.pcm) >= 2:
@@ -704,9 +894,9 @@ async def flush_remaining_buffer(reset_context=True):
             await enqueue_stt_window(b"", SAMPLE_RATE, 0, 0, 0, reset_context, session.session_id)
         session.pcm.clear()
         session.pre_tail.clear()
-        audio_sessions.popleft()
-    if current_session:
-        current_session.closed = True
+        state.audio_sessions.popleft()
+    if state.current_session:
+        state.current_session.closed = True
     if reset_context:
         # Also handles an entirely empty buffer: the reset remains ordered behind older STT jobs.
         await enqueue_stt_window(b"", SAMPLE_RATE, 0, 0, 0, True)
@@ -716,8 +906,8 @@ async def window_slicer_worker():
     need_b = int((CORE_WINDOW_SEC + POST_LOOKAHEAD_SEC) * BYTES_PER_SECOND) & ~1
     while True:
         await asyncio.sleep(0.2)
-        while audio_sessions:
-            session = audio_sessions[0]
+        while state.audio_sessions:
+            session = state.audio_sessions[0]
             if time.monotonic() - session.last_packet_at > IDLE_FLUSH_SEC:
                 session.closed = True
             if len(session.pcm) >= need_b:
@@ -729,42 +919,45 @@ async def window_slicer_worker():
                     await enqueue_stt_window(b"", SAMPLE_RATE, 0, 0, 0, True, session.session_id)
                 session.pcm.clear()
                 session.pre_tail.clear()
-                audio_sessions.popleft()
+                state.audio_sessions.popleft()
             else:
                 break
 
 
 async def research_worker():
-    global last_research_time
     while True:
-        await asyncio.sleep(5)
-        if time.monotonic() - last_research_time >= RESEARCH_INTERVAL_SEC and len(rolling_research_buffer) >= 2:
-            chunk = "\n".join(rolling_research_buffer)
-            rolling_research_buffer.clear()
-            last_research_time = time.monotonic()
-            schedule_webhook(HERMES_RESEARCH_WEBHOOK, json.dumps(
-                {"text": chunk, "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}).encode())
+        await asyncio.sleep(1)
+        if time.monotonic() - state.last_research_time >= RESEARCH_INTERVAL_SEC:
+            queue_research_batch()
+        await deliver_next_webhook()
 
 
 def build_health_dict():
     now = time.monotonic()
-    workers_alive = bool(background_tasks) and all(not task.done() for task in background_tasks.values())
-    overloaded = stt_queue is not None and stt_queue.full()
+    workers_alive = bool(state.background_tasks) and all(not task.done() for task in state.background_tasks.values())
+    overloaded = state.stt_queue is not None and state.stt_queue.full()
     return {
-        "status": "ok" if GEMINI_API_KEY and workers_alive and not stopping and not overloaded and not metrics["last_error"] else "degraded",
+        "status": "ok" if GEMINI_API_KEY and workers_alive and not state.stopping and not overloaded and not state.metrics["last_error"] and not state.metrics["last_output_error"] else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
         "gemini_key_configured": bool(GEMINI_API_KEY), "model": GEMINI_STT_MODEL,
         "thinking_level": GEMINI_THINKING_LEVEL,
+        "core_window_sec": CORE_WINDOW_SEC, "window_deadline_sec": WINDOW_DEADLINE_SEC,
+        "max_window_age_sec": MAX_WINDOW_AGE_SEC,
+        "latency": {name: latency_summary(samples) for name, samples in state.latency_samples.items()},
+        "oldest_pending_audio_age_sec": oldest_pending_audio_age(now),
+        "hermes_pending": len(state.pending_webhooks),
+        **{k: round(v, 6) if isinstance(v, float) else v for k, v in state.metrics.items()
+           if k.startswith("lost_audio_sec_") or k in ("output_errors", "last_output_error", "hermes_sent", "hermes_failed", "hermes_dropped", "hermes_research_lines_dropped")},
         "python_version": platform.python_version(), "openssl_version": ssl.OPENSSL_VERSION,
-        "workers_alive": workers_alive, "stopping": stopping,
-        "uptime_sec": round(now - metrics["started_at"], 1),
-        "last_packet_age_sec": round(now - metrics["last_packet_at"], 1) if metrics["last_packet_at"] is not None else None,
-        "last_stt_success_age_sec": round(now - metrics["last_stt_success_at"], 1) if metrics["last_stt_success_at"] is not None else None,
-        "last_transcript_age_sec": round(now - metrics["last_transcript_at"], 1) if metrics["last_transcript_at"] is not None else None,
-        "queue_depth": stt_queue.qsize() if stt_queue is not None else 0,
+        "workers_alive": workers_alive, "stopping": state.stopping,
+        "uptime_sec": round(now - state.metrics["started_at"], 1),
+        "last_packet_age_sec": round(now - state.metrics["last_packet_at"], 1) if state.metrics["last_packet_at"] is not None else None,
+        "last_stt_success_age_sec": round(now - state.metrics["last_stt_success_at"], 1) if state.metrics["last_stt_success_at"] is not None else None,
+        "last_transcript_age_sec": round(now - state.metrics["last_transcript_at"], 1) if state.metrics["last_transcript_at"] is not None else None,
+        "queue_depth": state.stt_queue.qsize() if state.stt_queue is not None else 0,
         "queue_capacity": 24, "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
-        "ring_buffer_sec": round(audio_ring_bytes / BYTES_PER_SECOND, 1),
-        **{key: metrics[key] for key in ("windows_processed", "windows_retried", "windows_dropped",
+        "ring_buffer_sec": round(state.audio_ring_bytes / BYTES_PER_SECOND, 1),
+        **{key: state.metrics[key] for key in ("windows_processed", "windows_retried", "windows_dropped",
                                         "windows_skipped", "windows_evicted", "buffer_bytes_evicted", "packets_rejected", "stt_in_flight", "last_error",
                                         "last_outcome", "transcripts_emitted", "windows_no_speech", "windows_blocked",
                                         "windows_truncated", "windows_invalid_response")},
@@ -797,7 +990,7 @@ async def handle_listen_ws(request):
     ws = web.WebSocketResponse(heartbeat=20)
     await ws.prepare(request)
     queue = asyncio.Queue(maxsize=8)
-    live_listeners[ws] = queue
+    state.live_listeners[ws] = queue
 
     async def sender():
         try:
@@ -817,38 +1010,35 @@ async def handle_listen_ws(request):
         async for _ in ws:
             pass
     finally:
-        live_listeners.pop(ws, None)
+        state.live_listeners.pop(ws, None)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     return ws
 
 
 async def on_startup(app):
-    global stt_queue, stopping, daily_notes, http_session
     if not GEMINI_API_KEY:
         raise ValueError("Gemini API key is required")
-    stt_queue = asyncio.Queue(maxsize=24)
-    daily_notes = DailyNotes(LOG_DIR)
-    http_session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=25, connect=10, sock_read=20),
+    state.stt_queue = asyncio.Queue(maxsize=24)
+    state.daily_notes = DailyNotes(LOG_DIR)
+    state.http_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10),
         connector=aiohttp.TCPConnector(limit=10, limit_per_host=4), cookie_jar=aiohttp.DummyCookieJar())
-    stopping = False
-    metrics["started_at"] = time.monotonic()
+    state.stopping = False
+    state.metrics["started_at"] = time.monotonic()
     for name, factory in (("slicer_task", window_slicer_worker), ("stt_worker_task", stt_consumer_worker),
                           ("research_task", research_worker)):
         app[name] = asyncio.create_task(factory())
-        background_tasks[name] = app[name]
+        state.background_tasks[name] = app[name]
 
 
 async def on_shutdown(app):
-    global stopping
-    stopping = True
-    await asyncio.gather(*(ws.close() for ws in list(live_listeners)), return_exceptions=True)
+    state.stopping = True
+    await asyncio.gather(*(ws.close() for ws in list(state.live_listeners)), return_exceptions=True)
 
 
 async def on_cleanup(app):
-    global stopping, http_session
-    stopping = True
+    state.stopping = True
     logger.info("Shutdown: draining accepted audio and pending STT windows")
     for name in ("slicer_task", "research_task"):
         app[name].cancel()
@@ -859,22 +1049,28 @@ async def on_cleanup(app):
             await worker  # Surface a worker failure rather than hanging forever on queue.join().
             raise RuntimeError("STT worker stopped before shutdown drain")
         await flush_remaining_buffer()
-        await stt_queue.join()
-        await stt_queue.put(None)
+        await state.stt_queue.join()
+        await state.stt_queue.put(None)
         await worker
         flush_daily_paragraph()
-        if rolling_research_buffer:
-            schedule_webhook(HERMES_RESEARCH_WEBHOOK, json.dumps({"text": "\n".join(rolling_research_buffer),
-                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}).encode())
-            rolling_research_buffer.clear()
-        if webhook_tasks:
-            await asyncio.gather(*list(webhook_tasks), return_exceptions=True)
+        queue_research_batch()
+        # RAM retries cannot survive process exit. Bound best-effort shutdown delivery.
+        try:
+            async with asyncio.timeout(20):
+                while state.pending_webhooks:
+                    state.pending_webhooks[0].retry_at = 0
+                    if not await deliver_next_webhook():
+                        break
+        except TimeoutError:
+            logger.warning("Hermes shutdown delivery deadline reached")
+        if state.pending_webhooks or state.rolling_research_buffer:
+            logger.warning("Shutdown with pending Hermes data in RAM")
         logger.info("Shutdown drain complete")
     finally:
-        if http_session is not None:
-            await http_session.close()
-            http_session = None
-        background_tasks.clear()
+        if state.http_session is not None:
+            await state.http_session.close()
+            state.http_session = None
+        state.background_tasks.clear()
 
 
 def create_app(start_workers=True):
@@ -928,11 +1124,11 @@ async def handle_audio_last(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="seconds must be an integer")
     if not 1 <= seconds <= RING_BUFFER_SECONDS:
         raise web.HTTPBadRequest(text=f"seconds must be between 1 and {RING_BUFFER_SECONDS}")
-    sr = audio_sample_rate
+    sr = SAMPLE_RATE
     need_bytes = sr * 2 * seconds
     collected = deque()
     total = 0
-    for _, chunk_sr, pcm in reversed(audio_ring):
+    for _, chunk_sr, pcm in reversed(state.audio_ring):
         sr = chunk_sr
         collected.appendleft(pcm)
         total += len(pcm)
@@ -969,7 +1165,7 @@ btn.onclick=()=>{
   ws.onopen=()=>{status.textContent='Connected';btn.disabled=true;};
   ws.onclose=()=>{status.textContent='Disconnected';btn.disabled=false;};
   ws.onmessage=(e)=>{
-    if(typeof e.data==='string'){const m=JSON.parse(e.data);if(m.type==='transcript'){log.textContent+=`[${m.timestamp}] ${m.text}\n\n`;log.scrollTop=log.scrollHeight;}}
+    if(typeof e.data==='string'){const m=JSON.parse(e.data);if(m.type==='transcript'||m.type==='gap'){log.textContent+=`[${m.timestamp}] ${m.text}\n\n`;log.scrollTop=log.scrollHeight;}}
     else{const i16=new Int16Array(e.data),f32=new Float32Array(i16.length);for(let i=0;i<i16.length;i++)f32[i]=i16[i]/32768.0;const b=ctx.createBuffer(1,f32.length,16000);b.getChannelData(0).set(f32);const s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);if(nextTime<ctx.currentTime)nextTime=ctx.currentTime+0.05;s.start(nextTime);nextTime+=b.duration;}
   };
 };

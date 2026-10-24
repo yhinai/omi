@@ -1,5 +1,6 @@
 .venv/
 logs/
+omi_live_research.md
 *.log
 *.pid
 .env
