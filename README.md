@@ -16,7 +16,7 @@ Transcript log + daily paragraphs + Hermes webhooks
 
 ## Setup
 
-Standard CPython **3.14.x** is required. The launcher creates a project-local `.venv` and installs `requirements.txt`; no Hermes Python installation is required. It checks the runtime before restarting a running bridge and refuses to overwrite an existing environment made with an incompatible Python.
+Standard CPython **3.15.x** is required. The launcher creates a project-local `.venv` and installs `requirements.txt`; no Hermes Python installation is required. The bridge and launcher reject other Python minor versions, prereleases, and free-threaded builds. The launcher checks the runtime before restarting a running bridge and refuses to overwrite an incompatible environment.
 
 ```bash
 cd ~/omi
@@ -26,9 +26,9 @@ cp .env.example .env
 ./start.sh
 ```
 
-For a new environment, the launcher looks for `python3.14` on `PATH`, in Homebrew or python.org locations, and in uv's managed Python directory. Set `OMI_PYTHON=/absolute/path/to/python3.14` to choose the interpreter explicitly. On a Mac without Python 3.14, install it with `brew install python@3.14` first.
+For a new environment, the launcher looks for `python3.15` on `PATH`, in Homebrew or python.org locations, and in uv's managed Python directory. Set `OMI_PYTHON=/absolute/path/to/python3.15` to choose the interpreter explicitly. On a Mac without Python 3.15, install it with `brew install python@3.15` first.
 
-When upgrading an older environment, test the new interpreter and dependencies in a separate temporary environment first. Stop the bridge with `./start.sh stop` so queued audio drains, move the old `.venv` to a backup, and recreate `.venv` at its final path using `python3.14 -m venv .venv`. Reinstall dependencies and run the verification checks below before `./start.sh start`. Virtual environments contain absolute paths; moving a prebuilt environment into place is unsupported.
+When upgrading an older environment, test the new interpreter and dependencies in a separate temporary environment first. Stop the bridge with `./start.sh stop` so queued audio drains, move the old `.venv` to a backup, and recreate `.venv` at its final path using `python3.15 -m venv .venv`. Reinstall dependencies and run the verification checks below before `./start.sh start`. Virtual environments contain absolute paths; moving a prebuilt environment into place is unsupported.
 
 Configuration precedence is **process environment → `~/omi/.env` → `~/.hermes/.env` → defaults**. `GEMINI_API_KEY` and `GOOGLE_API_KEY` are accepted. A missing or placeholder key prevents startup. Local `.env` values use `KEY=value` syntax; quote values containing spaces.
 
@@ -57,8 +57,8 @@ The ingestion endpoint accepts `Content-Type: application/octet-stream`, `sample
 ~/omi/start.sh start       # Start if stopped
 ~/omi/start.sh stop        # Gracefully stop the tracked bridge
 ~/omi/start.sh status      # Check the tracked process and health
-~/omi/.venv/bin/python ~/omi/omi_bridge.py --check-config
-curl -fsS http://127.0.0.1:8788/health | python3 -m json.tool
+~/omi/.venv/bin/python3.15 ~/omi/omi_bridge.py --check-config
+curl -fsS http://127.0.0.1:8788/health | ~/omi/.venv/bin/python3.15 -m json.tool
 ```
 
 The launcher tracks `logs/omi_bridge.pid` and its process identity. It refuses to kill an unrelated process occupying either bridge port and reports startup success only after the new process responds to its health check.
@@ -92,7 +92,7 @@ The existing Funnel configuration exposes the monitor and audio-download routes 
 
 ```bash
 cd ~/omi
-.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python3.15 -m unittest discover -s tests -v
 ```
 
 Tests use synthetic audio and mocked Gemini responses, without paid API calls. For a live check, speak a short phrase, confirm a new transcript line, then turn off Omi and confirm the final tail appears.

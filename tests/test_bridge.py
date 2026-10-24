@@ -1,5 +1,6 @@
 """Offline regressions for audio retention, configuration, and shutdown."""
 import asyncio
+from collections import namedtuple
 import importlib.util
 import io
 import os
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 import urllib.error
@@ -25,6 +27,37 @@ else:
     import omi_bridge as bridge
 
 SPEECH = b"\x00\x10" * 8000  # Half a second above the silence gate.
+VersionInfo = namedtuple("VersionInfo", "major minor micro releaselevel serial")
+
+
+class RuntimeTests(unittest.TestCase):
+    def runtime(self, version=(3, 15, 0, "final", 0), implementation="cpython", gil_disabled=0):
+        runtime = SimpleNamespace(version_info=VersionInfo(*version),
+                                  implementation=SimpleNamespace(name=implementation))
+        config = SimpleNamespace(get_config_var=lambda name: gil_disabled)
+        return mock.patch.multiple(bridge, sys=runtime, sysconfig=config)
+
+    def test_standard_final_cpython315_patch_releases_are_supported(self):
+        for micro in (0, 1, 99):
+            for gil_disabled in (None, 0):
+                with self.subTest(micro=micro, gil_disabled=gil_disabled), \
+                     self.runtime(version=(3, 15, micro, "final", 0), gil_disabled=gil_disabled):
+                    self.assertIsNone(bridge.require_python315())
+
+    def test_other_python_versions_and_prereleases_are_rejected(self):
+        versions = [(3, 14, 99, "final", 0), (3, 16, 0, "final", 0), (2, 7, 18, "final", 0)]
+        versions += [(3, 15, 0, level, 1) for level in ("alpha", "beta", "candidate")]
+        for version in versions:
+            with self.subTest(version=version), self.runtime(version=version):
+                with self.assertRaisesRegex(RuntimeError, "CPython 3\\.15"):
+                    bridge.require_python315()
+
+    def test_alternative_implementation_and_free_threaded_build_are_rejected(self):
+        for implementation, gil_disabled in (("pypy", 0), ("cpython", 1)):
+            with self.subTest(implementation=implementation, gil_disabled=gil_disabled), \
+                 self.runtime(implementation=implementation, gil_disabled=gil_disabled):
+                with self.assertRaisesRegex(RuntimeError, "CPython 3\\.15"):
+                    bridge.require_python315()
 
 
 class ImportTests(unittest.TestCase):

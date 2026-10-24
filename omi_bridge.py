@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.15
 """Single-device PCM16 -> bounded, sequential Gemini transcription bridge."""
 import asyncio
 import base64
@@ -20,10 +20,24 @@ import socket
 import ssl
 import struct
 import sys
+import sysconfig
 import time
 import urllib.error
 import urllib.request
 import wave
+
+
+def require_python315():
+    if (sys.implementation.name != "cpython" or sys.version_info[:2] != (3, 15)
+            or sys.version_info.releaselevel != "final" or sysconfig.get_config_var("Py_GIL_DISABLED")):
+        raise RuntimeError("Omi requires standard CPython 3.15.x (GIL enabled)")
+
+
+if __name__ == "__main__":
+    try:
+        require_python315()
+    except RuntimeError as error:
+        sys.exit(str(error))
 
 from aiohttp import web
 
@@ -147,7 +161,7 @@ class AudioWindow:
     session_id: int = 0
 
 
-# Queues are constructed in the running event loop (Python 3.9 compatibility).
+# Construct queues in the running event loop.
 stt_queue = None
 audio_sessions = deque()
 current_session = None
