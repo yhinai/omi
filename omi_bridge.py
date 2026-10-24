@@ -16,14 +16,11 @@ import platform
 import re
 import shlex
 import signal
-import socket
 import ssl
 import struct
 import sys
 import sysconfig
 import time
-import urllib.error
-import urllib.request
 import wave
 
 
@@ -39,6 +36,7 @@ if __name__ == "__main__":
     except RuntimeError as error:
         sys.exit(str(error))
 
+import aiohttp
 from aiohttp import web
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,7 +48,8 @@ MAX_BUFFER_BYTES = BYTES_PER_SECOND * 30
 RETRY_DELAYS = (1.0, 2.0, 4.0)
 GEMINI_API_KEY = ""
 GEMINI_STT_MODEL = "gemini-3.8-flash"
-PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC = 1.0, 5.0, 1.0
+GEMINI_THINKING_LEVEL = "low"
+PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC = 1.0, 8.0, 1.0
 IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD = 8.0, 80.0
 RING_BUFFER_SECONDS = 300
 PORT, HEALTH_PORT = 8787, 8788
@@ -59,6 +58,7 @@ HERMES_RESEARCH_WEBHOOK = "http://127.0.0.1:8644/webhooks/omi-research"
 WAKE_WORD, RESEARCH_INTERVAL_SEC = "hermes", 90
 logger = logging.getLogger("omi_bridge")
 transcript_logger = logging.getLogger("omi_transcript")
+event_logger = logging.getLogger("omi_transcript_events")
 
 
 def _read_env_file(path):
@@ -96,7 +96,7 @@ def _load_dotenv(local_path=None, fallback_path=None, environ=None):
 
 
 def configure(env=None):
-    global GEMINI_API_KEY, GEMINI_STT_MODEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
+    global GEMINI_API_KEY, GEMINI_STT_MODEL, GEMINI_THINKING_LEVEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
     global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, PORT, HEALTH_PORT
     global HERMES_LIVE_WEBHOOK, HERMES_RESEARCH_WEBHOOK, WAKE_WORD, RESEARCH_INTERVAL_SEC
     env = _load_dotenv() if env is None else env
@@ -106,8 +106,11 @@ def configure(env=None):
     GEMINI_STT_MODEL = env.get("OMI_GEMINI_STT_MODEL", "gemini-3.8-flash").strip()
     if not re.fullmatch(r"[A-Za-z0-9._-]+", GEMINI_STT_MODEL):
         raise ValueError("OMI_GEMINI_STT_MODEL must be a model ID")
+    GEMINI_THINKING_LEVEL = env.get("OMI_GEMINI_THINKING_LEVEL", "low").strip().lower()
+    if GEMINI_THINKING_LEVEL not in ("low", "medium", "high"):
+        raise ValueError("OMI_GEMINI_THINKING_LEVEL must be low, medium, or high")
     PRE_OVERLAP_SEC = float(env.get("OMI_PRE_OVERLAP_SEC", "1"))
-    CORE_WINDOW_SEC = float(env.get("OMI_CORE_WINDOW_SEC", "5"))
+    CORE_WINDOW_SEC = float(env.get("OMI_CORE_WINDOW_SEC", "8"))
     POST_LOOKAHEAD_SEC = float(env.get("OMI_POST_LOOKAHEAD_SEC", "1"))
     IDLE_FLUSH_SEC = float(env.get("OMI_IDLE_FLUSH_SEC", "8"))
     RMS_SILENCE_THRESHOLD = float(env.get("OMI_RMS_THRESHOLD", "80"))
@@ -130,6 +133,7 @@ def configure_logging():
     for target, filename, fmt in (
         (logger, "omi_bridge.log", "[%(asctime)s] %(message)s"),
         (transcript_logger, "omi_live_transcript.log", "%(message)s"),
+        (event_logger, "omi_transcript_events.jsonl", "%(message)s"),
     ):
         target.setLevel(logging.INFO)
         target.propagate = False
@@ -148,6 +152,12 @@ class AudioSession:
     pcm: bytearray = field(default_factory=bytearray)
     pre_tail: bytearray = field(default_factory=bytearray)
     closed: bool = False
+    first_received_at: float | None = None
+    last_received_at: float | None = None
+    audio_start_at: float | None = None
+    consumed_samples: int = 0
+    received_samples: int = 0
+    receipts: deque = field(default_factory=deque)
 
 
 @dataclass
@@ -159,6 +169,22 @@ class AudioWindow:
     post_sec: float
     reset_context_after: bool = False
     session_id: int = 0
+    audio_start_at: float | None = None
+    received_at: float | None = None
+    sample_offset: int | None = None
+
+
+@dataclass(frozen=True)
+class STTResult:
+    text: str
+    outcome: str = "speech"
+    finish_reason: str = "STOP"
+
+
+class GeminiResponseError(Exception):
+    def __init__(self, kind, retryable=False):
+        self.kind, self.retryable = kind, retryable
+        super().__init__(f"Gemini response: {kind}")
 
 
 # Construct queues in the running event loop.
@@ -175,23 +201,27 @@ last_research_time = time.monotonic()
 live_listeners = {}  # WebSocket -> bounded outgoing queue
 webhook_tasks = set()
 background_tasks = {}
+http_session = None
 stopping = False
 metrics = {
     "started_at": time.monotonic(), "last_packet_at": None, "last_stt_success_at": None,
     "last_error": None, "windows_processed": 0, "windows_retried": 0,
-    "windows_dropped": 0, "windows_skipped": 0, "packets_rejected": 0, "stt_in_flight": False,
+    "windows_dropped": 0, "windows_evicted": 0, "buffer_bytes_evicted": 0, "windows_skipped": 0, "packets_rejected": 0, "stt_in_flight": False,
+    "last_transcript_at": None, "last_outcome": None, "transcripts_emitted": 0,
+    "windows_no_speech": 0, "windows_blocked": 0, "windows_truncated": 0, "windows_invalid_response": 0,
 }
 
 
-def post_webhook_sync(url, payload):
-    req = urllib.request.Request(url, data=payload, method="POST",
-        headers={"Content-Type": "application/json", "X-Request-ID": f"omi-{time.time_ns()}"})
+async def post_webhook(url, payload):
     try:
-        with urllib.request.urlopen(req, timeout=15):
-            pass
+        async with http_session.post(url, data=payload, allow_redirects=False,
+                headers={"Content-Type": "application/json", "X-Request-ID": f"omi-{time.time_ns()}"},
+                timeout=aiohttp.ClientTimeout(total=15)) as response:
+            if not 200 <= response.status < 300:
+                raise aiohttp.ClientResponseError(response.request_info, response.history,
+                                                  status=response.status)
+            await response.read()
     except Exception as e:
-        if isinstance(e, urllib.error.HTTPError) and e.fp is not None:
-            e.close()
         logger.warning("Hermes delivery failed: %s", type(e).__name__)
 
 
@@ -201,7 +231,7 @@ def schedule_webhook(url, payload):
     if len(webhook_tasks) >= 8:
         logger.warning("Hermes delivery backlog is full")
         return
-    task = asyncio.create_task(asyncio.to_thread(post_webhook_sync, url, payload))
+    task = asyncio.create_task(post_webhook(url, payload))
     webhook_tasks.add(task)
     task.add_done_callback(webhook_tasks.discard)
 
@@ -272,21 +302,28 @@ def flush_daily_paragraph():
         daily_notes.close_paragraph()
 
 
-def record_transcript_line(text):
+def record_transcript_line(text, audio_start_at=None, received_at=None, processed_at=None,
+                           session_id=None, sample_offset=None):
     text = " ".join(text.split()).strip()
     if not text:
         return
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    processed_at = time.time() if processed_at is None else processed_at
+    source_at = audio_start_at if audio_start_at is not None else processed_at
+    timestamp = datetime.fromtimestamp(source_at).strftime("%Y-%m-%d %H:%M:%S")
+    event = {"timestamp": timestamp, "text": text, "audio_start_at": audio_start_at,
+             "received_at": received_at, "processed_at": processed_at,
+             "session_id": session_id, "sample_offset": sample_offset,
+             "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time"}
     transcript_logger.info("[%s] %s", timestamp, text)
+    event_logger.info(json.dumps(event, ensure_ascii=False))
     if daily_notes is not None:
         daily_notes.add(timestamp, text)
     if HERMES_RESEARCH_WEBHOOK:
         rolling_research_buffer.append(f"[{timestamp}] {text}")
-    broadcast(json.dumps({"type": "transcript", "timestamp": timestamp, "text": text}))
+    broadcast(json.dumps({"type": "transcript", **event}))
     if WAKE_WORD and WAKE_WORD in text.lower():
         schedule_webhook(HERMES_LIVE_WEBHOOK, json.dumps(
-            {"text": text, "speaker": "user", "timestamp": timestamp}).encode())
+            {"speaker": "user", **event}).encode())
 
 
 def pcm16_rms(pcm_bytes: bytes) -> float:
@@ -330,7 +367,75 @@ def dedupe_boundary_overlap(prev_tail: str, new_text: str) -> str:
     return " ".join(new_words[best_k:]).strip() if best_k else new_text.strip()
 
 
-def _gemini_stt_request_sync(pcm_bytes: bytes, sr: int, pre_sec: float, core_sec: float, post_sec: float, prev_ctx: str) -> str:
+def parse_gemini_response(data):
+    """A completed, explicit text result is different from a blocked or incomplete response."""
+    if not isinstance(data, dict):
+        raise GeminiResponseError("invalid_response")
+    feedback = data.get("promptFeedback")
+    if feedback is None:
+        feedback = {}
+    if not isinstance(feedback, dict):
+        raise GeminiResponseError("invalid_response")
+    if feedback.get("blockReason") not in (None, "", "BLOCK_REASON_UNSPECIFIED"):
+        raise GeminiResponseError("blocked")
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        raise GeminiResponseError("invalid_response")
+    candidate = candidates[0]
+    finish = candidate.get("finishReason")
+    if finish in ("MAX_TOKENS", "CONTINUATION"):
+        raise GeminiResponseError("truncated")
+    if finish in ("SAFETY", "RECITATION", "BLOCKLIST", "PROHIBITED_CONTENT", "SPII", "LANGUAGE", "IMAGE_SAFETY"):
+        raise GeminiResponseError("blocked")
+    if finish != "STOP":
+        raise GeminiResponseError("invalid_response")
+    usage = data.get("usageMetadata")
+    # Google can omit empty text/content when a completed request generated no reply tokens.
+    no_reply_tokens = isinstance(usage, dict) and type(usage.get("candidatesTokenCount")) is int and usage["candidatesTokenCount"] == 0
+    if isinstance(usage, dict) and "candidatesTokenCount" not in usage:
+        # Proto JSON omits zero-valued counts. Require the remaining counts to reconcile.
+        prompt, thoughts, total = (usage.get("promptTokenCount"), usage.get("thoughtsTokenCount", 0),
+                                    usage.get("totalTokenCount"))
+        no_reply_tokens = (all(type(value) is int and value >= 0 for value in (prompt, thoughts, total))
+                           and total == prompt + thoughts)
+    if no_reply_tokens:
+        content = candidate.get("content")
+        if content is not None and not isinstance(content, dict):
+            raise GeminiResponseError("invalid_response")
+        parts = content.get("parts", []) if content else []
+        if not isinstance(parts, list):
+            raise GeminiResponseError("invalid_response")
+        for part in parts:
+            if not isinstance(part, dict):
+                raise GeminiResponseError("invalid_response")
+            if part.get("thought"):
+                continue
+            if set(part) - {"text", "thoughtSignature"} or not isinstance(part.get("text", ""), str):
+                raise GeminiResponseError("invalid_response")
+            if part.get("text", "").strip() not in ("", '""', "''"):
+                raise GeminiResponseError("invalid_response")
+        return STTResult("", "no_speech", finish)
+    content = candidate.get("content")
+    if not isinstance(content, dict) or not isinstance(content.get("parts"), list):
+        raise GeminiResponseError("invalid_response")
+    text_parts = []
+    for part in content["parts"]:
+        if not isinstance(part, dict):
+            raise GeminiResponseError("invalid_response")
+        if part.get("thought"):
+            continue
+        if "text" not in part or not isinstance(part["text"], str):
+            raise GeminiResponseError("invalid_response")
+        text_parts.append(part["text"])
+    if not text_parts:
+        raise GeminiResponseError("invalid_response")
+    text = " ".join(" ".join(text_parts).split()).strip()
+    if text in ("", '""', "''"):
+        return STTResult("", "no_speech", finish)
+    return STTResult(text, "speech", finish)
+
+
+async def gemini_stt_request(pcm_bytes: bytes, sr: int, pre_sec: float, core_sec: float, post_sec: float, prev_ctx: str) -> STTResult:
     wav_buf = io.BytesIO()
     with wave.open(wav_buf, "wb") as wf:
         wf.setnchannels(1)
@@ -356,71 +461,112 @@ def _gemini_stt_request_sync(pcm_bytes: bytes, sr: int, pre_sec: float, core_sec
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_STT_MODEL}:generateContent"
     payload = {
         "contents": [{"parts": [{"text": prompt}, {"inline_data": {"mime_type": "audio/wav", "data": b64_wav}}]}],
-        "generationConfig": {"temperature": 0.0},
+        "generationConfig": {"thinkingConfig": {"thinkingLevel": GEMINI_THINKING_LEVEL}},
     }
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}, method="POST"
-    )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        result = json.loads(resp.read().decode("utf-8"))
-    candidates = result.get("candidates") or []
-    if not candidates:
-        return ""
-    parts = candidates[0].get("content", {}).get("parts") or []
-    return " ".join(" ".join(p.get("text", "") for p in parts).split()).strip()
+    async with http_session.post(url, json=payload, headers={"x-goog-api-key": GEMINI_API_KEY},
+                                 allow_redirects=False) as response:
+        if not 200 <= response.status < 300:
+            raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
+        try:
+            data = await response.json(content_type=None)
+        except (ValueError, UnicodeError):
+            raise GeminiResponseError("invalid_response") from None
+    try:
+        return parse_gemini_response(data)
+    except GeminiResponseError:
+        # Record schema metadata only, never audio, transcript text, or credentials.
+        candidates = data.get("candidates") if isinstance(data, dict) else None
+        first = candidates[0] if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict) else {}
+        content = first.get("content")
+        parts = content.get("parts") if isinstance(content, dict) else None
+        usage = data.get("usageMetadata") if isinstance(data, dict) else None
+        logger.warning("Rejected Gemini output metadata: %s", json.dumps({
+            "kind": "response_shape", "finish_reason": first.get("finishReason"),
+            "candidate_count": len(candidates) if isinstance(candidates, list) else None,
+            "part_fields": [sorted(part) for part in parts if isinstance(part, dict)] if isinstance(parts, list) else None,
+            "reply_tokens": usage.get("candidatesTokenCount") if isinstance(usage, dict) else None,
+            "prompt_tokens": usage.get("promptTokenCount") if isinstance(usage, dict) else None,
+            "thought_tokens": usage.get("thoughtsTokenCount") if isinstance(usage, dict) else None,
+            "total_tokens": usage.get("totalTokenCount") if isinstance(usage, dict) else None,
+        }))
+        raise
 
 
 
-async def enqueue_stt_window(full_pcm, sr, pre_s, core_s, post_s, reset_context_after=False, session_id=None):
-    """Backpressure: keep the window owned by its producer until a queue slot exists."""
+async def enqueue_stt_window(full_pcm, sr, pre_s, core_s, post_s, reset_context_after=False,
+                             session_id=None, audio_start_at=None, received_at=None, sample_offset=None):
+    """Prefer fresh windows during overload; preserve all pending work during shutdown."""
     if session_id is None:
         session_id = current_session.session_id if current_session else _next_session_id
-    await stt_queue.put(AudioWindow(full_pcm, sr, pre_s, core_s, post_s, reset_context_after, session_id))
+    window = AudioWindow(full_pcm, sr, pre_s, core_s, post_s, reset_context_after,
+                         session_id, audio_start_at, received_at, sample_offset)
+    if stopping:
+        await stt_queue.put(window)
+        return
+    if stt_queue.full():
+        dropped = stt_queue.get_nowait()
+        stt_queue.task_done()
+        if dropped is not None and dropped.pcm:
+            metrics["windows_dropped"] += 1
+            metrics["windows_evicted"] += 1
+            logger.warning("STT backlog full: evicted oldest window (%.2fs core)", dropped.core_sec)
+    stt_queue.put_nowait(window)
 
 
 def _transient_error(error):
-    if isinstance(error, urllib.error.HTTPError):
-        return error.code in (408, 429) or 500 <= error.code < 600
-    return isinstance(error, (TimeoutError, socket.timeout, urllib.error.URLError, ConnectionError))
+    if isinstance(error, GeminiResponseError):
+        return error.retryable
+    if isinstance(error, aiohttp.ClientResponseError):
+        return error.status in (408, 429) or 500 <= error.status < 600
+    if isinstance(error, (aiohttp.ClientSSLError, aiohttp.InvalidURL)):
+        return False
+    return isinstance(error, (TimeoutError, aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, ConnectionError))
 
 
 def _error_label(error):
-    if isinstance(error, urllib.error.HTTPError):
-        return f"Gemini HTTP {error.code}"
+    if isinstance(error, GeminiResponseError):
+        return f"Gemini response: {error.kind}"
+    if isinstance(error, aiohttp.ClientResponseError):
+        return f"Gemini HTTP {error.status}"
     return type(error).__name__  # Avoid leaking request URLs or credentials into telemetry.
 
 
 async def stt_consumer_worker():
     """One ordered consumer, one initial attempt plus at most three transient retries."""
-    last_transcript_tail, context_session = "", None
+    last_transcript_tail, context_session, next_sample = "", None, None
     while True:
         window = await stt_queue.get()
         try:
             if window is None:
                 return
-            if window.session_id != context_session:
+            if window.session_id != context_session or (window.sample_offset is not None and next_sample is not None and window.sample_offset != next_sample):
                 last_transcript_tail, context_session = "", window.session_id
                 flush_daily_paragraph()
+            next_sample = (window.sample_offset + round(window.core_sec * window.sample_rate)
+                           if window.sample_offset is not None else None)
             pre_b = int(window.pre_sec * BYTES_PER_SECOND)
             core_b = int(window.core_sec * BYTES_PER_SECOND)
             core = window.pcm[pre_b:pre_b + core_b]
             if core and pcm16_rms(core) >= RMS_SILENCE_THRESHOLD:
                 metrics["stt_in_flight"] = True
-                text = None
+                result = None
                 for attempt in range(len(RETRY_DELAYS) + 1):
                     try:
-                        text = await asyncio.to_thread(
-                            _gemini_stt_request_sync, window.pcm, window.sample_rate,
+                        result = await gemini_stt_request(window.pcm, window.sample_rate,
                             window.pre_sec, window.core_sec, window.post_sec, last_transcript_tail)
                         metrics["last_stt_success_at"] = time.monotonic()
                         metrics["windows_processed"] += 1
                         metrics["last_error"] = None
+                        metrics["last_outcome"] = result.outcome
+                        if result.outcome == "no_speech":
+                            metrics["windows_no_speech"] += 1
                         break
                     except Exception as error:
                         metrics["last_error"] = _error_label(error)
                         retryable = _transient_error(error)
-                        if isinstance(error, urllib.error.HTTPError) and error.fp is not None:
-                            error.close()
+                        if isinstance(error, GeminiResponseError):
+                            metrics[f"windows_{error.kind}"] += 1
+                            metrics["last_outcome"] = error.kind
                         if not retryable or attempt == len(RETRY_DELAYS):
                             metrics["windows_dropped"] += 1
                             last_transcript_tail = ""
@@ -429,10 +575,14 @@ async def stt_consumer_worker():
                         metrics["windows_retried"] += 1
                         logger.warning("%s; retry %d/3 in %.1fs", metrics["last_error"], attempt + 1, RETRY_DELAYS[attempt])
                         await asyncio.sleep(RETRY_DELAYS[attempt])
-                if text and text.lower() not in ("none", "silence", "[silence]"):
-                    cleaned = dedupe_boundary_overlap(last_transcript_tail, text)
+                if result and result.outcome == "speech":
+                    cleaned = dedupe_boundary_overlap(last_transcript_tail, result.text)
                     if cleaned:
-                        record_transcript_line(cleaned)
+                        record_transcript_line(cleaned, audio_start_at=window.audio_start_at,
+                                               received_at=window.received_at, session_id=window.session_id,
+                                               sample_offset=window.sample_offset)
+                        metrics["last_transcript_at"] = time.monotonic()
+                        metrics["transcripts_emitted"] += 1
                         last_transcript_tail = " ".join((last_transcript_tail + " " + cleaned).split()[-24:])
             elif core:
                 metrics["windows_skipped"] += 1
@@ -462,20 +612,8 @@ def ingest_raw_pcm(raw, sr=SAMPLE_RATE):
         raise web.HTTPBadRequest(text="Expected 16000 Hz mono PCM16 with complete two-byte samples")
     if not raw:
         return
-    if buffered_audio_bytes() + len(raw) > MAX_BUFFER_BYTES:
-        metrics["packets_rejected"] += 1
-        raise web.HTTPServiceUnavailable(text="Audio backlog is full; try again later", headers={"Retry-After": "5"})
-    now = time.monotonic()
-    if current_session is None or current_session.closed or now - current_session.last_packet_at > IDLE_FLUSH_SEC:
-        if current_session:
-            current_session.closed = True
-        _next_session_id += 1
-        current_session = AudioSession(_next_session_id, now)
-        audio_sessions.append(current_session)
-        audio_pcm_buffer, audio_pre_tail = current_session.pcm, current_session.pre_tail
-    current_session.last_packet_at = now
-    current_session.pcm.extend(raw)
-    metrics["last_packet_at"] = now
+    now, received_at = time.monotonic(), time.time()
+    # Retain every valid live packet before applying the pending-transcription limit.
     audio_ring.append((now, SAMPLE_RATE, raw))
     audio_ring_bytes += len(raw)
     max_ring_bytes = BYTES_PER_SECOND * RING_BUFFER_SECONDS
@@ -485,6 +623,39 @@ def ingest_raw_pcm(raw, sr=SAMPLE_RATE):
         audio_ring_bytes -= remove
         if remove < len(old):
             audio_ring.appendleft((stamp, old_sr, old[remove:]))
+    if current_session is None or current_session.closed or now - current_session.last_packet_at > IDLE_FLUSH_SEC:
+        if current_session:
+            current_session.closed = True
+        _next_session_id += 1
+        current_session = AudioSession(_next_session_id, now, first_received_at=received_at,
+                                       last_received_at=received_at,
+                                       audio_start_at=received_at - len(raw) / BYTES_PER_SECOND)
+        audio_sessions.append(current_session)
+        audio_pcm_buffer, audio_pre_tail = current_session.pcm, current_session.pre_tail
+    current_session.last_packet_at = now
+    current_session.last_received_at = received_at
+    current_session.received_samples += len(raw) // 2
+    current_session.receipts.append((current_session.received_samples, received_at))
+    current_session.pcm.extend(raw)
+    metrics["last_packet_at"] = now
+    excess = buffered_audio_bytes() - MAX_BUFFER_BYTES
+    if excess > 0:
+        for session in audio_sessions:
+            remove = min(excess, len(session.pcm))
+            if not remove:
+                continue
+            del session.pcm[:remove]
+            session.consumed_samples += remove // 2
+            session.pre_tail.clear()
+            while session.receipts and session.receipts[0][0] <= session.consumed_samples:
+                session.receipts.popleft()
+            metrics["buffer_bytes_evicted"] += remove
+            metrics["windows_dropped"] += 1
+            excess -= remove
+            if not excess:
+                break
+        logger.warning("Raw backlog full: evicted oldest PCM; total evicted bytes=%d",
+                       metrics["buffer_bytes_evicted"])
     broadcast(raw)
 
 
@@ -499,10 +670,22 @@ async def _slice_one(session, final=False):
     core = bytes(session.pcm[:core_cut])
     end = min(core_cut + post_b, len(session.pcm)) & ~1
     full = bytes(session.pre_tail) + bytes(session.pcm[:end])
+    audio_start_at = (session.audio_start_at + session.consumed_samples / SAMPLE_RATE
+                      if session.audio_start_at is not None else None)
+    end_sample = session.consumed_samples + end // 2
+    received_at = next((stamp for sample, stamp in session.receipts if sample >= end_sample),
+                       session.last_received_at)
+    if audio_start_at is not None and received_at is not None:
+        # Backfilled/bursty uploads must not imply that audio was captured after it arrived.
+        audio_start_at = min(audio_start_at, received_at - end / bps)
     await enqueue_stt_window(full, SAMPLE_RATE, len(session.pre_tail) / bps,
-                             len(core) / bps, (end - core_cut) / bps, final, session.session_id)
+                             len(core) / bps, (end - core_cut) / bps, final, session.session_id,
+                             audio_start_at, received_at, session.consumed_samples)
     # No await between successful queue admission and committing the consumed prefix.
     del session.pcm[:core_cut]
+    session.consumed_samples += core_cut // 2
+    while session.receipts and session.receipts[0][0] <= session.consumed_samples:
+        session.receipts.popleft()
     session.pre_tail[:] = b"" if final or pre_b == 0 else core[-pre_b:]
 
 
@@ -571,27 +754,32 @@ def build_health_dict():
         "status": "ok" if GEMINI_API_KEY and workers_alive and not stopping and not overloaded and not metrics["last_error"] else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
         "gemini_key_configured": bool(GEMINI_API_KEY), "model": GEMINI_STT_MODEL,
+        "thinking_level": GEMINI_THINKING_LEVEL,
         "python_version": platform.python_version(), "openssl_version": ssl.OPENSSL_VERSION,
         "workers_alive": workers_alive, "stopping": stopping,
         "uptime_sec": round(now - metrics["started_at"], 1),
         "last_packet_age_sec": round(now - metrics["last_packet_at"], 1) if metrics["last_packet_at"] is not None else None,
         "last_stt_success_age_sec": round(now - metrics["last_stt_success_at"], 1) if metrics["last_stt_success_at"] is not None else None,
+        "last_transcript_age_sec": round(now - metrics["last_transcript_at"], 1) if metrics["last_transcript_at"] is not None else None,
         "queue_depth": stt_queue.qsize() if stt_queue is not None else 0,
         "queue_capacity": 24, "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
         "ring_buffer_sec": round(audio_ring_bytes / BYTES_PER_SECOND, 1),
         **{key: metrics[key] for key in ("windows_processed", "windows_retried", "windows_dropped",
-                                        "windows_skipped", "packets_rejected", "stt_in_flight", "last_error")},
+                                        "windows_skipped", "windows_evicted", "buffer_bytes_evicted", "packets_rejected", "stt_in_flight", "last_error",
+                                        "last_outcome", "transcripts_emitted", "windows_no_speech", "windows_blocked",
+                                        "windows_truncated", "windows_invalid_response")},
     }
 
 
 async def handle_health(request):
-    return web.json_response(build_health_dict())
+    health = build_health_dict()
+    return web.json_response(health, status=200 if health["status"] == "ok" else 503)
 
 
 async def handle_omi(request):
     if request.method in ("GET", "HEAD"):
         # Omi validation fields remain stable; local /health reports degraded status separately.
-        return web.json_response({**build_health_dict(), "status": "ok", "is_setup_completed": True, "message": ""})
+        return web.json_response({"status": "ok", "is_setup_completed": True, "message": ""})
     if request.content_type != "application/octet-stream":
         raise web.HTTPUnsupportedMediaType(text="Use application/octet-stream raw PCM16")
     try:
@@ -636,11 +824,14 @@ async def handle_listen_ws(request):
 
 
 async def on_startup(app):
-    global stt_queue, stopping, daily_notes
+    global stt_queue, stopping, daily_notes, http_session
     if not GEMINI_API_KEY:
         raise ValueError("Gemini API key is required")
     stt_queue = asyncio.Queue(maxsize=24)
     daily_notes = DailyNotes(LOG_DIR)
+    http_session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=25, connect=10, sock_read=20),
+        connector=aiohttp.TCPConnector(limit=10, limit_per_host=4), cookie_jar=aiohttp.DummyCookieJar())
     stopping = False
     metrics["started_at"] = time.monotonic()
     for name, factory in (("slicer_task", window_slicer_worker), ("stt_worker_task", stt_consumer_worker),
@@ -656,33 +847,40 @@ async def on_shutdown(app):
 
 
 async def on_cleanup(app):
-    global stopping
+    global stopping, http_session
     stopping = True
     logger.info("Shutdown: draining accepted audio and pending STT windows")
     for name in ("slicer_task", "research_task"):
         app[name].cancel()
     await asyncio.gather(app["slicer_task"], app["research_task"], return_exceptions=True)
-    worker = app["stt_worker_task"]
-    if worker.done():
-        await worker  # Surface a worker failure rather than hanging forever on queue.join().
-        raise RuntimeError("STT worker stopped before shutdown drain")
-    await flush_remaining_buffer()
-    await stt_queue.join()
-    await stt_queue.put(None)
-    await worker
-    flush_daily_paragraph()
-    if rolling_research_buffer:
-        schedule_webhook(HERMES_RESEARCH_WEBHOOK, json.dumps({"text": "\n".join(rolling_research_buffer),
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}).encode())
-        rolling_research_buffer.clear()
-    if webhook_tasks:
-        await asyncio.gather(*list(webhook_tasks), return_exceptions=True)
-    background_tasks.clear()
-    logger.info("Shutdown drain complete")
+    try:
+        worker = app["stt_worker_task"]
+        if worker.done():
+            await worker  # Surface a worker failure rather than hanging forever on queue.join().
+            raise RuntimeError("STT worker stopped before shutdown drain")
+        await flush_remaining_buffer()
+        await stt_queue.join()
+        await stt_queue.put(None)
+        await worker
+        flush_daily_paragraph()
+        if rolling_research_buffer:
+            schedule_webhook(HERMES_RESEARCH_WEBHOOK, json.dumps({"text": "\n".join(rolling_research_buffer),
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}).encode())
+            rolling_research_buffer.clear()
+        if webhook_tasks:
+            await asyncio.gather(*list(webhook_tasks), return_exceptions=True)
+        logger.info("Shutdown drain complete")
+    finally:
+        if http_session is not None:
+            await http_session.close()
+            http_session = None
+        background_tasks.clear()
 
 
 def create_app(start_workers=True):
-    app = web.Application(client_max_size=MAX_BUFFER_BYTES)
+    # Request admission is separate from the smaller pending-transcription budget.
+    # aiohttp rejects bodies >= this limit; allow exactly one ring's worth of PCM.
+    app = web.Application(client_max_size=BYTES_PER_SECOND * RING_BUFFER_SECONDS + 1)
     app.router.add_get("/omi", handle_omi)
     app.router.add_post("/omi", handle_omi)
     app.router.add_get("/listen", handle_listen)
@@ -760,7 +958,7 @@ async def handle_audio_last(request: web.Request) -> web.Response:
 LISTEN_HTML = """<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>Omi Live Stream</title>
 <style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#f8fafc;padding:24px;max-width:900px;margin:0 auto}button{background:#3b82f6;color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer}#log{margin-top:16px;background:#1e293b;padding:16px;border-radius:8px;height:70vh;overflow-y:auto;white-space:pre-wrap}</style>
-</head><body><h2>Omi Live Stream (16kHz PCM16 + Dynamic 1s+5s+1s STT)</h2>
+</head><body><h2>Omi Live Stream (16kHz PCM16 + Dynamic STT windows)</h2>
 <button id="btn">Start Listening</button> <span id="status">Disconnected</span><div id="log"></div>
 <script>
 let ctx,nextTime=0;const btn=document.getElementById('btn'),status=document.getElementById('status'),log=document.getElementById('log');
