@@ -4,5 +4,3 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
-schedules/
-omi_live_research.md
