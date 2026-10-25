@@ -91,6 +91,7 @@ class Row:
     style: str = "text"
     soft_from: int | None = None
     suffix: str = ""
+    timestamp: str = ""
 
 
 @dataclass
@@ -110,6 +111,7 @@ class Viewer:
     focus: bool = False
     diagnostics: bool = False
     mouse_enabled: bool = True
+    holding: bool = False
     pipeline: dict = field(default_factory=dict)
     replaying: bool = False
     replay_supported: bool = False
@@ -184,7 +186,7 @@ class Viewer:
             if isinstance(duration, (int, float)) and not isinstance(duration, bool) and 0 < duration < 86400:
                 text = f"{duration:.1f} seconds unavailable."
         stamp = clean(event.get("timestamp", ""))
-        stamp = stamp[11:16] if len(stamp) >= 19 else datetime.now().strftime("%H:%M")
+        stamp = stamp[11:19] if len(stamp) >= 19 else datetime.now().strftime("%H:%M:%S")
         source = event.get("audio_start_at")
         source = source if isinstance(source, (int, float)) and not isinstance(source, bool) and math.isfinite(source) else None
         if source is None:
@@ -250,6 +252,7 @@ class Viewer:
 
     def live(self):
         self.following, self.anchor, self.unread, self.match = True, None, 0, None
+        self.holding = False
         self.last_unread_key = None
         self.revision += 1
 
@@ -267,25 +270,36 @@ def rows_for(viewer, width):
     rows, now = [], time.monotonic()
     focused = viewer.match[0] if viewer.match else (viewer.anchor[0] if not viewer.following and viewer.anchor else
               next((c.key for c in reversed(viewer.captions) if c.kind == "transcript"), None))
+    draft_inlined = False
     for caption in viewer.captions:
-        if viewer.show_times and caption.show_stamp:
-            rows.append(Row(caption.key, -1, caption.timestamp, "muted"))
         offset, text = 0, caption.text
-        for line in wrap(text, width):
-            offset = text.find(line, offset)
-            muted = caption.kind == "gap" or (viewer.focus and caption.key != focused)
-            soft = caption.soft_from if not muted and now < caption.soft_until else None
-            rows.append(Row(caption.key, offset, line, "muted" if muted else "text", soft))
+        inline_draft = bool(viewer.draft and caption is viewer.captions[-1]
+                            and caption.kind == "transcript" and len(caption.words) < 150)
+        if inline_draft:
+            draft_inlined = True
+            draft_start = len(text) + 1
+            full_text = f"{text} {viewer.draft}"
+        else:
+            draft_start = None
+            full_text = text
+        for line in wrap(full_text, width):
+            offset = full_text.find(line, offset)
+            muted = caption.kind == "gap" or (viewer.focus and caption.key != focused) or (draft_start is not None and offset >= draft_start)
+            soft = caption.soft_from if not muted and draft_start is None and now < caption.soft_until else None
+            if not muted and draft_start is not None and offset + len(line) > draft_start:
+                soft = draft_start
+            stamp = caption.timestamp if viewer.show_times and caption.show_stamp and offset == 0 else ""
+            rows.append(Row(caption.key, offset, line, "muted" if muted else "text", soft, timestamp=stamp))
             offset += len(line)
         if caption is viewer.captions[-1] and viewer.pending(now):
             # Decorate after wrapping: the ellipsis cannot push an existing word to another line.
             if cells(rows[-1].text) + 2 <= width:
                 row = rows[-1]
-                rows[-1] = Row(row.key, row.offset, row.text, row.style, row.soft_from, " …")
+                rows[-1] = Row(row.key, row.offset, row.text, row.style, row.soft_from, " …", row.timestamp)
             else:
-                rows.append(Row(caption.key, len(text), "…", "muted"))
-        rows.append(Row(caption.key, len(text) + 1, ""))
-    if viewer.draft:
+                rows.append(Row(caption.key, len(full_text), "…", "muted"))
+        rows.append(Row(caption.key, len(full_text) + 1, ""))
+    if viewer.draft and not draft_inlined:
         for line in wrap(viewer.draft, width):
             rows.append(Row(-1, 0, line, "muted"))
     return rows
@@ -445,10 +459,13 @@ def put(screen, y, x, text, attr=0):
 
 
 def geometry(height, width):
-    column = min(76, max(1, width - 6))
-    # Leave paper below the live sentence, rather than crowding the footer.
-    available = max(1, min(height - 7, int(height * .73)) - 3) if height >= 18 else max(1, height - 8)
-    return column, max(1, (width - column) // 2), 4, available
+    # Wide windows use 25% / 50% / 25%; compact windows keep a usable line length.
+    column = max(1, width // 2 if width >= 80 else width - 16)
+    top = 1
+    bottom_cushion = 4 if height >= 18 else 2
+    available = max(1, height - top - bottom_cushion)
+    left = (width - column) // 2 if width >= 80 else 13
+    return column, left, top, available
 
 
 def paint(screen, viewer, palette):
@@ -458,9 +475,6 @@ def paint(screen, viewer, palette):
         put(screen, 1, 2, "A little more room, please.", palette["muted"])
     else:
         column, left, top, available = geometry(height, width)
-        put(screen, 1, left, "omi", palette["text"])
-        status = "● " + viewer.status(time.monotonic())
-        put(screen, 1, left + column - cells(status), status, palette["muted"])
         rows = rows_for(viewer, column)
         start = viewport(viewer, rows, available)
         if not viewer.following and viewer.anchor is not None and not any(r.key == viewer.anchor[0] for r in rows):
@@ -481,10 +495,11 @@ def paint(screen, viewer, palette):
                 put(screen, y, left, line, palette["muted"])
         elif viewer.help_open:
             help_lines = ["A quiet place to follow the conversation.", "", "↑ ↓ / j k      Read at your own pace",
-                          "g / End        Return to live", "Space          Hold / resume your place",
+                          "PgUp / PgDn    Scroll a page", "Home           Oldest retained words",
+                          "g / End        Return to live", "Space          Freeze / resume display",
                           "/              Find words", "n / N          Next / previous match",
                           "y              Copy this paragraph", "t              Show / hide times", "f              Focus this passage",
-                          "m              Toggle mouse capture", "d              Connection details",
+                          "m              Wheel / text selection", "d              Connection details",
                           "? / Esc        Close help", "q              Quit"]
             for y, line in enumerate(help_lines[:available], top):
                 put(screen, y, left, line, palette["text"] if y == top else palette["muted"])
@@ -492,6 +507,8 @@ def paint(screen, viewer, palette):
             if not rows:
                 put(screen, top, left, "Your next words will appear here.", palette["muted"])
             for y, row in enumerate(rows[start:start + available], top):
+                if row.timestamp:
+                    put(screen, y, left - 10, row.timestamp, palette["muted"])
                 put(screen, y, left, row.text, palette[row.style])
                 if row.soft_from is not None:
                     start_soft = max(0, row.soft_from - row.offset)
@@ -507,14 +524,25 @@ def paint(screen, viewer, palette):
             footer = "/ " + viewer.query + ("  · no match" if viewer.query and viewer.match is None else "")
         elif time.monotonic() < viewer.toast_until:
             footer = viewer.toast
+        elif viewer.holding:
+            footer = "Held · select text · y copy · Space resume"
         elif not viewer.following:
             footer = f"↓ {viewer.unread} new passages · g to follow" if viewer.unread else "Reading · g to follow"
         if footer:
             footer = fit(footer, column)
             put(screen, height - 2, left if viewer.searching else left + column - cells(footer), footer,
                 palette["accent"] if not viewer.searching and not viewer.following else palette["muted"])
-    screen.noutrefresh()
-    curses.doupdate()
+    sync_tty = sys.stdout.isatty()
+    if sync_tty:
+        sys.stdout.write("\x1b[?2026h")
+        sys.stdout.flush()
+    try:
+        screen.noutrefresh()
+        curses.doupdate()
+    finally:
+        if sync_tty:
+            sys.stdout.write("\x1b[?2026l")
+            sys.stdout.flush()
 
 
 def handle_key(viewer, key, rows, available):
@@ -540,10 +568,15 @@ def handle_key(viewer, key, rows, available):
     elif key in ("g", "G", curses.KEY_END):
         viewer.live()
     elif key == " ":
-        if viewer.following:
-            move(viewer, rows, available, 0)
-        else:
+        if viewer.holding:
             viewer.live()
+        else:
+            move(viewer, rows, available, 0)
+            viewer.holding = True
+    elif key == curses.KEY_HOME:
+        move(viewer, rows, available, -len(rows))
+    elif key in ("\x15", "\x04"):
+        move(viewer, rows, available, max(1, available // 2) * (-1 if key == "\x15" else 1))
     elif key in (curses.KEY_UP, curses.KEY_PPAGE, "k"):
         move(viewer, rows, available, -available if key == curses.KEY_PPAGE else -1)
     elif key in (curses.KEY_DOWN, curses.KEY_NPAGE, "j"):
@@ -558,7 +591,7 @@ def handle_key(viewer, key, rows, available):
         viewer.diagnostics, viewer.help_open = not viewer.diagnostics, False
     elif key == "m":
         viewer.mouse_enabled = not viewer.mouse_enabled
-        viewer.notify("Wheel scrolling" if viewer.mouse_enabled else "Mouse selection")
+        viewer.notify("Wheel mode · m for selection" if viewer.mouse_enabled else "Text selection · Space to hold")
         return "mouse"
     elif key == "y":
         return "copy"
@@ -590,7 +623,6 @@ async def run(screen, args):
             palette[key] = curses.color_pair(index)
         palette["muted"] |= curses.A_DIM
     viewer, rendered = Viewer(), None
-    viewer.notify("? for help")
     loop = asyncio.get_running_loop()
     input_ready = resize_ready = False
     try:
@@ -617,12 +649,14 @@ async def run(screen, args):
             height, width = screen.getmaxyx()
             column, _, _, available = geometry(height, width)
             rows = rows_for(viewer, column)
+            had_input = False
             # Drain curses' own input buffer, which can outlive readiness of the fd.
             for _ in range(128):
                 try:
                     key = screen.get_wch()
                 except curses.error:
                     break
+                had_input = True
                 if key == curses.KEY_MOUSE and with_curses_mouse and viewer.mouse_enabled:
                     try:
                         mouse = curses.getmouse()[4]
@@ -646,7 +680,10 @@ async def run(screen, args):
             now = time.monotonic()
             token = (viewer.revision, (height, width), viewer.status(now), now < viewer.toast_until,
                      transitions(viewer, now), int(now) if viewer.diagnostics else None)
-            if token != rendered:
+            # Holding leaves the actual terminal pixels alone for native selection.
+            # Reception continues; keyboard input and resizing still redraw the view.
+            frozen = viewer.holding and not had_input and rendered is not None and rendered[1] == (height, width)
+            if token != rendered and not frozen:
                 paint(screen, viewer, palette)
                 rendered = token
             timeout = next_transition(viewer, now)

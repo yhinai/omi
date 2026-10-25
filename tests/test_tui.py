@@ -26,7 +26,7 @@ class ReadingTests(unittest.TestCase):
         viewer.add(event("The sentence begins"))
         viewer.add(event("and continues naturally.", source=108))
         self.assertEqual(len(viewer.captions), 1)
-        self.assertEqual(tui.rows_for(viewer, 76)[1].text,
+        self.assertEqual(tui.rows_for(viewer, 76)[0].text,
                          "The sentence begins and continues naturally.")
         self.assertTrue(viewer.show_times)
 
@@ -151,7 +151,9 @@ class ReadingTests(unittest.TestCase):
         viewer.add({"type": "partial", "text": "the revised draft"})
         self.assertEqual(viewer.captions[0].text, "Committed words")
         self.assertEqual(viewer.draft, "the revised draft")
-        self.assertEqual(tui.rows_for(viewer, 76)[-1].style, "muted")
+        row = tui.rows_for(viewer, 76)[0]
+        self.assertEqual(row.text, "Committed words the revised draft")
+        self.assertEqual(row.soft_from, len("Committed words "))
         viewer.add(event("Final words", source=108))
         self.assertEqual(viewer.draft, "")
 
@@ -206,20 +208,64 @@ class Screen:
 
 
 class LayoutTests(unittest.TestCase):
-    def test_page_is_centered_unboxed_and_shortcuts_are_hidden(self):
+    def test_timestamp_shares_first_text_row_and_does_not_repeat_on_wrapped_lines(self):
+        viewer = tui.Viewer(show_times=True)
+        viewer.add(event("Readable words " * 20, timestamp="2026-10-24 22:47:38"))
+        rows = tui.rows_for(viewer, 30)
+        self.assertEqual(rows[0].timestamp, "22:47:38")
+        self.assertTrue(rows[0].text.startswith("Readable words"))
+        self.assertTrue(all(not row.timestamp for row in rows[1:]))
+        before = [(row.key, row.offset, row.text) for row in rows]
+        viewer.show_times = False
+        hidden = tui.rows_for(viewer, 30)
+        self.assertEqual(before, [(row.key, row.offset, row.text) for row in hidden])
+        self.assertTrue(all(not row.timestamp for row in hidden))
+
+    def test_wide_layout_has_half_width_transcript_and_equal_margins(self):
+        for width in (80, 100, 160, 240):
+            column, left, top, available = tui.geometry(40, width)
+            self.assertEqual(column, width // 2)
+            self.assertLessEqual(abs(left - (width - left - column)), 1)
+            self.assertEqual(top + available, 36)
+
+    def test_native_selection_default_and_hold_keep_reception_and_reading_position(self):
+        viewer = tui.Viewer()
+        self.assertTrue(viewer.mouse_enabled)
+        for i in range(30):
+            viewer.add(event(f"Passage {i}", session=i))
+        rows = tui.rows_for(viewer, 50)
+        tui.handle_key(viewer, tui.curses.KEY_HOME, rows, 10)
+        self.assertFalse(viewer.following)
+        self.assertEqual(tui.viewport(viewer, rows, 10), 0)
+        tui.handle_key(viewer, " ", rows, 10)
+        self.assertTrue(viewer.holding)
+        anchor = viewer.anchor
+        viewer.add(event("Still arriving while selecting", session=99))
+        self.assertEqual(viewer.anchor, anchor)
+        self.assertEqual(viewer.captions[-1].text, "Still arriving while selecting")
+        tui.handle_key(viewer, " ", tui.rows_for(viewer, 50), 10)
+        self.assertTrue(viewer.following)
+        self.assertFalse(viewer.holding)
+
+    def test_page_shows_only_transcript_and_time_without_header_or_shortcut_bar(self):
         viewer = tui.Viewer(connected=True)
         viewer.add(event("A calm page of words, with enough room to read."))
         screen = Screen()
         with mock.patch.object(tui.curses, "doupdate"):
             tui.paint(screen, viewer, {"text": 0, "muted": 0, "accent": 0})
-        self.assertIn("omi", screen.text)
+        self.assertNotIn("omi", screen.text)
+        self.assertNotIn("Ready", screen.text)
+        self.assertNotIn("●", screen.text)
         self.assertIn("A calm page of words", screen.text)
         self.assertNotIn("COMPLETED TRANSCRIPTS", screen.text)
         self.assertNotIn("q quit", screen.text)
         self.assertNotIn("▰", screen.text)
         self.assertNotIn("─", screen.text)
-        self.assertEqual(screen.text.count("12:00"), 1)
-        self.assertEqual(screen.lines[5].index("A"), 12)
+        self.assertEqual(screen.text.count("12:00:00"), 1)
+        self.assertEqual(screen.lines[1].index("A"), 25)
+        self.assertEqual("".join(screen.lines[1][15:23]), "12:00:00")
+        self.assertNotIn("↑↓ scroll", screen.text)
+        self.assertNotIn("y copy", screen.text)
 
     def test_narrow_screen_and_help_do_not_draw_out_of_bounds(self):
         for height, width in ((8, 20), (10, 32), (14, 40), (30, 120)):
@@ -315,7 +361,7 @@ class TerminalTests(unittest.TestCase):
             while process.poll() is None and time.monotonic() < deadline:
                 if select.select([master], [], [], .05)[0]:
                     output.extend(os.read(master, 65536))
-                if stage == 0 and b"Connecting" in output:
+                if stage == 0 and b"Your next words" in output:
                     os.write(master, b"?")
                     stage = 1
                 elif stage == 1 and b"Copy this paragraph" in output:
@@ -437,6 +483,8 @@ class PageDetailTests(unittest.TestCase):
         self.assertFalse(viewer.diagnostics)
         self.assertEqual(tui.handle_key(viewer, "m", [], 10), "mouse")
         self.assertFalse(viewer.mouse_enabled)
+        tui.handle_key(viewer, "m", [], 10)
+        self.assertTrue(viewer.mouse_enabled)
 
     def test_caption_url_preserves_other_parameters_and_encodes_opaque_cursor(self):
         url = tui.caption_url("wss://example.test/listen-ws?token=keep&replay=2", "a+b")
@@ -444,10 +492,10 @@ class PageDetailTests(unittest.TestCase):
         query = parse_qs(urlsplit(url).query)
         self.assertEqual(query, {"token": ["keep"], "mode": ["captions"], "replay": ["100"], "after": ["a+b"]})
 
-    def test_reading_horizon_leaves_room_above_the_footer(self):
+    def test_transcript_uses_height_up_to_footer_without_empty_bottom_quarter(self):
         for height in (24, 30, 40):
             _, _, top, available = tui.geometry(height, 100)
-            self.assertGreaterEqual((height - 2) - (top + available), 3)
+            self.assertEqual(top + available, height - 4)
 
     def test_hiding_times_preserves_an_anchor_on_a_timestamp_row(self):
         viewer = tui.Viewer()
