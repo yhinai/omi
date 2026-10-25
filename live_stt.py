@@ -241,6 +241,8 @@ class GeminiLiveSTT:
                     self.covered_samples = max(self.covered_samples,
                         turn.end_sample if turn.end_sample is not None else self.sent_samples)
                     self.turn = None
+                if self.end_sent:
+                    self.flushed.set()
         if content.get("generationComplete") and self.turn is not None and self.turn.finalized:
             self.covered_samples = max(self.covered_samples,
                 self.turn.end_sample if self.turn.end_sample is not None else self.sent_samples)
@@ -282,21 +284,22 @@ class GeminiLiveSTT:
         self.has_vad = False
         self.flush_sample = 0
 
-    async def _end_audio(self, ws, *, wait=False, active=False):
+    async def _end_audio(self, ws, *, wait=False, active=False, quiet_frames=0):
         self.flushed.clear()
         self.end_sent = True
         self.flush_sample = self.sent_samples
         if active and self.connected:
-            silence_b64 = base64.b64encode(b"\x00" * FRAME_BYTES).decode("ascii")
-            for _ in range(3):
+            pad_frames = max(0, 3 - quiet_frames)
+            if pad_frames:
+                silence_b64 = base64.b64encode(b"\x00" * (FRAME_BYTES * pad_frames)).decode("ascii")
                 await asyncio.wait_for(ws.send_json({"realtimeInput": {"audio": {
                     "data": silence_b64, "mimeType": "audio/pcm;rate=16000"}}}), 5)
             await asyncio.wait_for(ws.send_json({"realtimeInput": {"activityEnd": {}}}), 5)
         await asyncio.wait_for(ws.send_json({"realtimeInput": {"audioStreamEnd": True}}), 5)
         if wait and self.connected:
-            has_words = self.turn is not None and self.turn.first_partial
+            has_words = self.turn is not None and self.turn.first_partial and not self.turn.finalized
             try:
-                await asyncio.wait_for(self.flushed.wait(), 2.5 if has_words else 0.35)
+                await asyncio.wait_for(self.flushed.wait(), 2.0 if has_words else 0.25)
             except TimeoutError:
                 pass
 
@@ -357,25 +360,26 @@ class GeminiLiveSTT:
                         old = self.spans.popleft()
                         if old.speech and old.end > self.covered_samples:
                             self.gap("failed", (old.end - max(old.start, self.covered_samples)) / RATE, old)
-                    # Finalize at a sentence/pause boundary (or 8s max when live, 12s in unit mocks) so finals commit every ~4-7s without clipping words.
-                    sentence_done = (self.turn is not None and self.turn.last_text.endswith((".", "?", "!"))
-                                     and since_end >= BPS * 3.5)
-                    pause_done = self.connected and since_end >= BPS * 4.5 and quiet_frames >= 3
+                    # Finalize at a sentence/pause boundary (or 8s max when live, 12s in unit mocks) so finals commit fast without clipping words.
+                    has_words = self.turn is not None and self.turn.first_partial
+                    sentence_done = (has_words and self.turn.last_text.endswith((".", "?", "!"))
+                                     and ((since_end >= BPS * 1.5 and quiet_frames >= 2) or since_end >= BPS * 3.5))
+                    pause_done = self.connected and has_words and ((since_end >= BPS * 1.5 and quiet_frames >= 6) or (since_end >= BPS * 4.0 and quiet_frames >= 3))
                     max_cut = BPS * 8 if self.connected else BPS * 12
                     if (sentence_done or pause_done or since_end >= max_cut) and (activity_open or self.speech_pending):
-                        await self._end_audio(ws, wait=True, active=activity_open)
+                        await self._end_audio(ws, wait=True, active=activity_open, quiet_frames=quiet_frames)
                         activity_open, since_end, quiet_frames = False, 0, 0
                 continue
             if self.stopping or self.rotating:
-                await self._end_audio(ws, active=activity_open)
+                await self._end_audio(ws, active=activity_open, quiet_frames=quiet_frames)
                 return
-            if (activity_open and since_end >= BPS * 3.5 and self.turn is not None
+            if (activity_open and since_end >= BPS * 3.0 and self.turn is not None
                     and self.turn.last_text.endswith((".", "?", "!"))):
-                await self._end_audio(ws, wait=True, active=activity_open)
+                await self._end_audio(ws, wait=True, active=activity_open, quiet_frames=quiet_frames)
                 activity_open, since_end, quiet_frames = False, 0, 0
             if (not idle_ended and self.last_packet_mono is not None
-                    and time.monotonic() - self.last_packet_mono > min(self.idle_flush, 2.0 if activity_open else self.idle_flush)):
-                await self._end_audio(ws, wait=True, active=activity_open)
+                    and time.monotonic() - self.last_packet_mono > min(self.idle_flush, 1.8 if activity_open else self.idle_flush)):
+                await self._end_audio(ws, wait=True, active=activity_open, quiet_frames=quiet_frames)
                 idle_ended, activity_open, since_end, quiet_frames = True, False, 0, 0
             self.wake.clear()
             try:

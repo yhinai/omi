@@ -104,6 +104,10 @@ class Viewer:
     last_status: float = 0
     transcribing: bool = False
     draft: str = ""
+    draft_identity: tuple | None = None
+    draft_session: tuple | None = None
+    draft_revision: int = 0
+    finalized: deque = field(default_factory=lambda: deque(maxlen=200))
     following: bool = True
     anchor: tuple[int, int] | None = None
     unread: int = 0
@@ -112,6 +116,9 @@ class Viewer:
     diagnostics: bool = False
     mouse_enabled: bool = True
     holding: bool = False
+    held_mouse_enabled: bool | None = None
+    sync_output: str = "auto"
+    paint_cache: object = field(default=None, repr=False)
     pipeline: dict = field(default_factory=dict)
     replaying: bool = False
     replay_supported: bool = False
@@ -133,6 +140,9 @@ class Viewer:
         self.revision += 1
         self.wake.set()
 
+    def clear_draft(self):
+        self.draft, self.draft_identity, self.draft_session, self.draft_revision = "", None, None, 0
+
     def add(self, event):
         if not isinstance(event, dict):
             return
@@ -143,6 +153,7 @@ class Viewer:
             self.replaying = event.get("phase") == "start"
             if self.replaying and event.get("reset"):
                 self.last_event_id = None
+                self.clear_draft()
                 self.add({"type": "gap", "text": "Earlier words are outside the available history."})
             self.revision += 1
             return
@@ -163,7 +174,20 @@ class Viewer:
                 self.revision += 1
             return
         if kind == "partial":
-            self.draft = clean(event.get("text", ""))[:8000]
+            identity = ((event.get("stream_id"), event["utterance_id"])
+                        if event.get("utterance_id") is not None else None)
+            text = clean(event.get("text", ""))[:8000]
+            revision = event.get("revision", 0)
+            revision = revision if isinstance(revision, int) and not isinstance(revision, bool) else 0
+            if identity is not None and (identity in self.finalized
+                    or (not text and identity != self.draft_identity)
+                    or (identity == self.draft_identity and text and revision and revision <= self.draft_revision)):
+                return
+            self.draft = text
+            self.draft_identity = identity if text else None
+            self.draft_session = ((event.get("stream_id"), event["session_id"])
+                                  if text and event.get("session_id") is not None else None)
+            self.draft_revision = revision if text else 0
             self.revision += 1
             return
         if kind not in ("transcript", "gap"):
@@ -232,7 +256,12 @@ class Viewer:
                 self.last_unread_key = previous.key
             words = words[take:]
             continuous = False  # Remaining words start the next capped paragraph.
-        self.draft = ""
+        identity = ((event.get("stream_id"), event["utterance_id"])
+                    if event.get("utterance_id") is not None else None)
+        if identity is not None:
+            self.finalized.append(identity)
+        if kind == "gap" or identity is None or self.draft_identity in (None, identity):
+            self.clear_draft()
         self.revision += 1
 
     def pending(self, now):
@@ -253,6 +282,8 @@ class Viewer:
     def live(self):
         self.following, self.anchor, self.unread, self.match = True, None, 0, None
         self.holding = False
+        if self.held_mouse_enabled is not None:
+            self.mouse_enabled, self.held_mouse_enabled = self.held_mouse_enabled, None
         self.last_unread_key = None
         self.revision += 1
 
@@ -274,7 +305,9 @@ def rows_for(viewer, width):
     for caption in viewer.captions:
         offset, text = 0, caption.text
         inline_draft = bool(viewer.draft and caption is viewer.captions[-1]
-                            and caption.kind == "transcript" and len(caption.words) < 150)
+                            and caption.kind == "transcript" and len(caption.words) < 150
+                            and (viewer.draft_session is None or viewer.draft_session == caption.session)
+                            and not (len(caption.words) >= 90 and re.search(r"[.!?][^\w]*$", caption.words[-1])))
         if inline_draft:
             draft_inlined = True
             draft_start = len(text) + 1
@@ -441,7 +474,8 @@ async def receive(viewer, url):
                 pass
             if awaiting_replay and reconnected:
                 viewer.add({"type": "gap", "text": "Connection restored · some words may be missing"})
-            viewer.connected, viewer.transcribing, viewer.draft = False, False, ""
+            viewer.connected, viewer.transcribing = False, False
+            viewer.clear_draft()
             viewer.replaying = False
             viewer.revision += 1
             viewer.wake.set()
@@ -458,23 +492,76 @@ def put(screen, y, x, text, attr=0):
             pass
 
 
-def geometry(height, width):
+def geometry(height, width, following=True):
     # Wide windows use 25% / 50% / 25%; compact windows keep a usable line length.
     column = max(1, width // 2 if width >= 80 else width - 16)
     top = 1
-    bottom_cushion = 4 if height >= 18 else 2
+    bottom_cushion = 4 if following and height >= 18 else 2
     available = max(1, height - top - bottom_cushion)
     left = (width - column) // 2 if width >= 80 else 13
     return column, left, top, available
 
 
+def synchronized_output(mode, env=None):
+    """Be conservative without consuming terminal replies as keyboard input."""
+    env = os.environ if env is None else env
+    if mode != "auto":
+        return mode == "on"
+    if env.get("TMUX") or env.get("STY"):
+        return False  # Multiplexer capability/passthrough depends on its configuration.
+    return env.get("TERM_PROGRAM") in {"ghostty", "WezTerm"} or env.get("TERM") == "xterm-ghostty"
+
+
+class Frame:
+    """Compose a frame, then touch only terminal rows whose content/style changed."""
+    def __init__(self, screen):
+        self.screen = screen
+        self.size = screen.getmaxyx()
+        self.erase()
+
+    def getmaxyx(self):
+        return self.size
+
+    def erase(self):
+        self.rows = [[] for _ in range(self.size[0])]
+
+    def addstr(self, y, x, text, attr=0):
+        self.rows[y].append((x, text, attr))
+
+    def flush(self, viewer):
+        cached = viewer.paint_cache
+        previous = cached[2] if cached and cached[0] is self.screen and cached[1] == self.size else None
+        changed = [y for y, row in enumerate(self.rows) if previous is None or row != previous[y]]
+        if not changed:
+            return
+        sync = sys.stdout.isatty() and synchronized_output(viewer.sync_output)
+        viewer.paint_cache = None  # A failed refresh must be fully redrawn next time.
+        try:
+            if sync:
+                sys.stdout.write("\x1b[?2026h")
+                sys.stdout.flush()
+            for y in changed:
+                self.screen.move(y, 0)
+                self.screen.clrtoeol()
+                for x, text, attr in self.rows[y]:
+                    put(self.screen, y, x, text, attr)
+            self.screen.noutrefresh()
+            curses.doupdate()
+            viewer.paint_cache = (self.screen, self.size, self.rows)
+        finally:
+            if sync:
+                sys.stdout.write("\x1b[?2026l")
+                sys.stdout.flush()
+
+
 def paint(screen, viewer, palette):
+    screen = Frame(screen)
     height, width = screen.getmaxyx()
     screen.erase()
     if height < 10 or width < 32:
         put(screen, 1, 2, "A little more room, please.", palette["muted"])
     else:
-        column, left, top, available = geometry(height, width)
+        column, left, top, available = geometry(height, width, viewer.following and not viewer.holding)
         rows = rows_for(viewer, column)
         start = viewport(viewer, rows, available)
         if not viewer.following and viewer.anchor is not None and not any(r.key == viewer.anchor[0] for r in rows):
@@ -532,17 +619,7 @@ def paint(screen, viewer, palette):
             footer = fit(footer, column)
             put(screen, height - 2, left if viewer.searching else left + column - cells(footer), footer,
                 palette["accent"] if not viewer.searching and not viewer.following else palette["muted"])
-    sync_tty = sys.stdout.isatty()
-    if sync_tty:
-        sys.stdout.write("\x1b[?2026h")
-        sys.stdout.flush()
-    try:
-        screen.noutrefresh()
-        curses.doupdate()
-    finally:
-        if sync_tty:
-            sys.stdout.write("\x1b[?2026l")
-            sys.stdout.flush()
+    screen.flush(viewer)
 
 
 def handle_key(viewer, key, rows, available):
@@ -573,6 +650,8 @@ def handle_key(viewer, key, rows, available):
         else:
             move(viewer, rows, available, 0)
             viewer.holding = True
+            viewer.held_mouse_enabled = viewer.mouse_enabled
+            viewer.mouse_enabled = False
     elif key == curses.KEY_HOME:
         move(viewer, rows, available, -len(rows))
     elif key in ("\x15", "\x04"):
@@ -590,11 +669,14 @@ def handle_key(viewer, key, rows, available):
     elif key == "d":
         viewer.diagnostics, viewer.help_open = not viewer.diagnostics, False
     elif key == "m":
+        viewer.held_mouse_enabled = None  # An explicit choice overrides automatic restoration.
         viewer.mouse_enabled = not viewer.mouse_enabled
         viewer.notify("Wheel mode · m for selection" if viewer.mouse_enabled else "Text selection · Space to hold")
         return "mouse"
     elif key == "y":
         return "copy"
+    elif key == "\x0c":
+        viewer.paint_cache = None
     viewer.revision += 1
     return None
 
@@ -605,7 +687,7 @@ async def run(screen, args):
     with_curses_mouse = False
     try:
         curses.curs_set(0)
-        curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        curses.mousemask(curses.ALL_MOUSE_EVENTS if args.mouse == "wheel" else 0)
         with_curses_mouse = True
     except curses.error:
         pass
@@ -622,7 +704,7 @@ async def run(screen, args):
             curses.init_pair(index, color, background)
             palette[key] = curses.color_pair(index)
         palette["muted"] |= curses.A_DIM
-    viewer, rendered = Viewer(), None
+    viewer, rendered = Viewer(mouse_enabled=args.mouse == "wheel", sync_output=args.sync_output), None
     loop = asyncio.get_running_loop()
     input_ready = resize_ready = False
     try:
@@ -647,7 +729,7 @@ async def run(screen, args):
                 if screen.getmaxyx() != (size.lines, size.columns):
                     curses.resizeterm(size.lines, size.columns)
             height, width = screen.getmaxyx()
-            column, _, _, available = geometry(height, width)
+            column, _, _, available = geometry(height, width, viewer.following and not viewer.holding)
             rows = rows_for(viewer, column)
             had_input = False
             # Drain curses' own input buffer, which can outlive readiness of the fd.
@@ -657,6 +739,7 @@ async def run(screen, args):
                 except curses.error:
                     break
                 had_input = True
+                previous_mouse_enabled = viewer.mouse_enabled
                 if key == curses.KEY_MOUSE and with_curses_mouse and viewer.mouse_enabled:
                     try:
                         mouse = curses.getmouse()[4]
@@ -672,8 +755,9 @@ async def run(screen, args):
                         return
                     if action == "copy":
                         await copy_paragraph(viewer, copy_text(viewer, rows, available))
-                    if action == "mouse":
-                        curses.mousemask(curses.ALL_MOUSE_EVENTS if viewer.mouse_enabled else 0)
+                if with_curses_mouse and viewer.mouse_enabled != previous_mouse_enabled:
+                    curses.mousemask(curses.ALL_MOUSE_EVENTS if viewer.mouse_enabled else 0)
+                column, _, _, available = geometry(height, width, viewer.following and not viewer.holding)
                 rows = rows_for(viewer, column)
             else:
                 viewer.wake.set()
@@ -707,6 +791,10 @@ def main():
         sys.exit("Run this viewer with ~/omi/.venv/bin/python3.15.")
     parser = argparse.ArgumentParser(description=__doc__, epilog="Press ? in the viewer for controls.")
     parser.add_argument("--url", default="ws://127.0.0.1:8787/listen-ws", help="Omi monitor WebSocket URL")
+    parser.add_argument("--mouse", choices=("wheel", "select"), default="wheel",
+                        help="Startup mouse mode (default: wheel); Space releases the mouse for copying")
+    parser.add_argument("--sync-output", choices=("auto", "on", "off"), default="auto",
+                        help="Synchronized terminal updates (default: auto); use off for incompatible terminals")
     parser.add_argument("--instant", action="store_true", help=argparse.SUPPRESS)  # Backward-compatible; always instant now.
     args = parser.parse_args()
     if urlsplit(args.url).scheme not in ("ws", "wss") or not urlsplit(args.url).hostname:

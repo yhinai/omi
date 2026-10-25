@@ -4,9 +4,10 @@
 ~/omi/tui.sh
 ```
 
-A centered, unboxed page of live writing, up to 76 terminal cells wide. Body text
-inherits your terminal's foreground, background, and font. Space below the live
-sentence keeps it away from the bottom edge and the occasional footer notice.
+A centered, unboxed page of live writing. Wide windows use 25% left margin,
+50% transcript, and 25% right margin; compact windows use most of their width.
+The transcript uses the available height down to the two-row footer area. Body
+text inherits your terminal's foreground, background, and font.
 Finalized words appear immediately; none are hidden by a word-reveal timer.
 
 ## The developing thought
@@ -25,22 +26,26 @@ an editable draft, but the current recognizer still returns completed windows.
 Related chunks from one bridge session join into paragraphs. Sentence-ending
 punctuation is preferred once a paragraph reaches about 90 words; a hard 150-word
 cap keeps long unpunctuated speech manageable. The hard cap can split a sentence.
-Session boundaries and gaps always separate passages. Muted times appear at the
+Session boundaries and gaps always separate passages. Muted `HH:MM:SS` times sit in a left gutter on the same row as the first
+line of a passage, without taking a separate text row. Times appear at the
 first passage, a new session, after interruptions, or a paragraph starting at least
 three minutes after the last timestamp. `t` hides or restores those editorial times.
 Missing audio appears as a separate note such as `2.4 seconds unavailable.`
 
 ## Reading controls
 
-A brief `? for help` hint appears at startup; there is no permanent shortcut bar.
+The normal view shows only transcript text and timestamps, without a title,
+connection status, or shortcut bar. Press `?` for help or `d` for connection details.
 
 | Key | Action |
 | --- | --- |
 | `?` / Esc | Show / dismiss help or details |
 | ↑ / ↓ / `k` / `j` / Page Up / Page Down | Read the conversation |
 | Mouse wheel / trackpad | Scroll when supported by the terminal |
-| `m` | Toggle mouse capture; turn it off for the terminal's own text selection |
-| Space | Hold / resume your reading position; reception continues |
+| `m` | Toggle wheel capture; native terminal text selection is the default |
+| Space | Freeze / resume the display for selection; reception continues |
+| Home | Go to the oldest retained text |
+| Ctrl+U / Ctrl+D | Scroll half a page up / down |
 | `g` / End | Follow the newest words |
 | `/` | Search retained text; Enter keeps highlights, Esc clears them |
 | `n` / `N` | Next / previous search match |
@@ -52,8 +57,11 @@ A brief `? for help` hint appears at startup; there is no permanent shortcut bar
 
 Copy uses local macOS `/usr/bin/pbcopy` only when invoked, excludes interface text,
 and briefly confirms `Copied`. Blue is reserved for search and returning to live.
-Mouse selection and wheel behavior depend on terminal support; `m` lets you switch
-between application scrolling and terminal-native selection. Clipboard behavior
+Mouse selection and wheel behavior depend on terminal support. Mouse capture is
+off by default: drag to select and use your terminal’s normal Copy command. Press
+Space first to freeze the display so new captions do not erase a selection; press
+Space or `g` to resume live text. `m` enables application wheel scrolling; press it
+again to return to native selection. Keyboard scrolling works in both modes. Clipboard behavior
 over SSH is not extended with OSC 52 in this update.
 
 Scrolling anchors the viewport to a paragraph and character position. Incoming

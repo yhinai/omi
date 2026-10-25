@@ -191,6 +191,15 @@ class Screen:
 
     def erase(self):
         self.lines = [[" "] * self.width for _ in range(self.height)]
+        self.cleared = []
+
+    def move(self, y, x):
+        self.cursor = (y, x)
+
+    def clrtoeol(self):
+        y, x = self.cursor
+        self.lines[y][x:] = [" "] * (self.width - x)
+        self.cleared.append(y)
 
     def getmaxyx(self):
         return self.height, self.width
@@ -207,7 +216,98 @@ class Screen:
         return "\n".join("".join(line).rstrip() for line in self.lines)
 
 
+class StreamOrderingTests(unittest.TestCase):
+    def test_earlier_final_or_clear_cannot_erase_newer_draft(self):
+        viewer = tui.Viewer()
+        viewer.add({"type": "partial", "text": "Next thought", "stream_id": "s",
+                    "session_id": 1, "utterance_id": "new", "revision": 1})
+        viewer.add(event("Earlier final.", stream_id="s", utterance_id="old"))
+        viewer.add({"type": "partial", "text": "", "stream_id": "s", "utterance_id": "old"})
+        self.assertEqual(viewer.draft, "Next thought")
+        viewer.add(event("Next thought finalized.", source=108, stream_id="s", utterance_id="new"))
+        self.assertEqual(viewer.draft, "")
+        viewer.add({"type": "partial", "text": "Late obsolete words", "stream_id": "s",
+                    "utterance_id": "new", "revision": 99})
+        self.assertEqual(viewer.draft, "")
+
+    def test_partial_revisions_do_not_regress_and_new_session_stays_separate(self):
+        viewer = tui.Viewer()
+        viewer.add(event("Earlier conversation", stream_id="old"))
+        draft = {"type": "partial", "stream_id": "new", "session_id": 1, "utterance_id": "u"}
+        viewer.add({**draft, "text": "Current words", "revision": 2})
+        viewer.add({**draft, "text": "Old words", "revision": 1})
+        self.assertEqual(viewer.draft, "Current words")
+        rows = tui.rows_for(viewer, 80)
+        self.assertEqual(rows[0].text, "Earlier conversation")
+        self.assertEqual(rows[-1].text, "Current words")
+        self.assertEqual(viewer.captions[0].text, "Earlier conversation")
+
+    def test_draft_starts_new_paragraph_after_sentence_at_paragraph_limit(self):
+        viewer = tui.Viewer()
+        viewer.add(event("word " * 89 + "end."))
+        viewer.add({"type": "partial", "text": "New paragraph"})
+        self.assertEqual(tui.rows_for(viewer, 100)[-1].text, "New paragraph")
+
+
 class LayoutTests(unittest.TestCase):
+    def test_history_reclaims_live_cushion_and_space_releases_then_restores_mouse(self):
+        self.assertEqual(tui.geometry(30, 100, False)[3] - tui.geometry(30, 100, True)[3], 2)
+        viewer = tui.Viewer(mouse_enabled=True)
+        viewer.add(event("Words to select"))
+        tui.handle_key(viewer, " ", tui.rows_for(viewer, 50), 20)
+        self.assertTrue(viewer.holding)
+        self.assertFalse(viewer.mouse_enabled)
+        tui.handle_key(viewer, "g", tui.rows_for(viewer, 50), 20)
+        self.assertFalse(viewer.holding)
+        self.assertTrue(viewer.mouse_enabled)
+
+    def test_repeated_frames_do_not_write_and_only_draft_row_changes(self):
+        viewer = tui.Viewer(show_times=False)
+        viewer.add(event("An earlier paragraph.", session=1))
+        viewer.add(event("Current words", session=2))
+        viewer.add({"type": "partial", "text": "first draft"})
+        screen = Screen()
+        with mock.patch.object(tui.curses, "doupdate") as update:
+            tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
+            screen.cleared.clear()
+            tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
+            self.assertEqual(update.call_count, 1)
+            self.assertFalse(screen.cleared)
+            viewer.add({"type": "partial", "text": "revised draft"})
+            tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
+            self.assertEqual(screen.cleared, [3])
+            self.assertEqual(update.call_count, 2)
+            self.assertIn("An earlier paragraph.", screen.text)
+            self.assertIn("Current words revised draft", screen.text)
+            self.assertNotIn("first draft", screen.text)
+
+    def test_sync_output_resets_after_refresh_failure_and_has_plain_fallback(self):
+        import io
+        viewer = tui.Viewer(sync_output="on")
+        screen = Screen()
+        output = io.StringIO()
+        with mock.patch.object(tui.sys, "stdout", output), \
+             mock.patch.object(output, "isatty", return_value=True), \
+             mock.patch.object(tui.curses, "doupdate", side_effect=tui.curses.error("refresh failed")):
+            with self.assertRaises(tui.curses.error):
+                tui.paint(screen, viewer, {"text": 0, "muted": 0, "accent": 0})
+        self.assertEqual(output.getvalue(), "\x1b[?2026h\x1b[?2026l")
+        self.assertIsNone(viewer.paint_cache)
+        output = io.StringIO()
+        viewer.sync_output = "off"
+        with mock.patch.object(tui.sys, "stdout", output), \
+             mock.patch.object(output, "isatty", return_value=True), \
+             mock.patch.object(tui.curses, "doupdate"):
+            tui.paint(screen, viewer, {"text": 0, "muted": 0, "accent": 0})
+        self.assertEqual(output.getvalue(), "")
+        self.assertIn("Your next words", screen.text)
+
+    def test_sync_auto_uses_conservative_terminal_defaults(self):
+        self.assertTrue(tui.synchronized_output("auto", {"TERM_PROGRAM": "ghostty"}))
+        self.assertTrue(tui.synchronized_output("auto", {"TERM_PROGRAM": "WezTerm"}))
+        self.assertFalse(tui.synchronized_output("auto", {"TERM_PROGRAM": "Apple_Terminal"}))
+        self.assertFalse(tui.synchronized_output("auto", {"TERM_PROGRAM": "ghostty", "TMUX": "session"}))
+        self.assertTrue(tui.synchronized_output("on", {"TMUX": "session"}))
     def test_timestamp_shares_first_text_row_and_does_not_repeat_on_wrapped_lines(self):
         viewer = tui.Viewer(show_times=True)
         viewer.add(event("Readable words " * 20, timestamp="2026-10-24 22:47:38"))

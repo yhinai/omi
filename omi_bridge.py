@@ -311,6 +311,8 @@ def publish_caption(event):
 
 def publish_partial(event):
     """Coalesce disposable hypotheses; never send them to logs, replay or notes."""
+    if not event.get("text") and state.partial_caption is None:
+        return
     event = {**event, "stream_id": state.stream_id}
     if (not event.get("text") and state.partial_caption is not None
             and event.get("utterance_id") != state.partial_caption.get("utterance_id")):
@@ -426,7 +428,7 @@ class DailyNotes:
         self.words = []
 
     def add(self, timestamp, text):
-        dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+        dt = datetime.fromisoformat(timestamp)
         day = timestamp[:10]
         path = os.path.join(self.directory, f"{day}.md")
         if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -477,13 +479,15 @@ def output_failed(target, error):
 
 def write_event(event):
     """JSONL is authoritative; projections are independent, synchronous best effort."""
+    encoded = json.dumps(event, ensure_ascii=False)
     try:
-        event_logger.info(json.dumps(event, ensure_ascii=False))
+        event_logger.info(encoded)
     except Exception as error:
         output_failed("jsonl", error)
         return False
     state.recent_events.append(dict(event))
     publish_caption(event)
+    broadcast(encoded)
     timestamp, text = event["timestamp"], event["text"]
     errors_before = state.metrics["output_errors"]
     try:
@@ -503,7 +507,6 @@ def write_event(event):
             state.daily_notes.close_paragraph()
     if errors_before == state.metrics["output_errors"]:
         state.metrics["last_output_error"] = None
-    broadcast(json.dumps(event))
     return True
 
 
