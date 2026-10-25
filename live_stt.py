@@ -172,12 +172,12 @@ class GeminiLiveSTT:
                 self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=time.monotonic())
         return self.turn
 
-    def _expire_closing_turn(self, *, expired=True):
+    def _expire_closing_turn(self):
         if self.closing_turn is None:
             return
         ct = self.closing_turn
         end_bound = ct.end_sample or ct.closed_sample or self.flush_sample or self.sent_samples
-        if not ct.finalized and (expired or ct.first_partial):
+        if not ct.finalized and ct.first_partial:
             duration = max(0, end_bound - max(self.covered_samples, ct.span.start)) / RATE
             self.gap("failed", duration, ct.span)
             self.on_partial({"type": "partial", "utterance_id": ct.identity, "text": ""})
@@ -300,7 +300,7 @@ class GeminiLiveSTT:
                     self.flushed.set()
         if content.get("generationComplete"):
             if self.closing_turn is not None:
-                self._expire_closing_turn(expired=False)
+                self._expire_closing_turn()
                 self.flushed.set()
             else:
                 if self.turn is not None and self.turn.finalized:
@@ -347,6 +347,8 @@ class GeminiLiveSTT:
         self.flush_requested = False
 
     async def _end_audio(self, ws, *, wait=False, active=False, quiet_samples=0):
+        if self.connected and not active and self.end_sent:
+            return
         self.flushed.clear()
         self.end_sent = True
         self.flush_sample = self.sent_samples
