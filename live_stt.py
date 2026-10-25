@@ -173,12 +173,12 @@ class GeminiLiveSTT:
         return self.turn
 
     def _retire_ambient_spans(self, now):
-        """When server VAD is active and no turn is open, frames older than 3s without ACTIVITY_START are ambient noise."""
+        """When server VAD or explicit live framing is active and no turn is open, frames older than 3s are ambient noise."""
         if self.closing_turn is not None and self.closing_turn.last_activity_mono and now - self.closing_turn.last_activity_mono > 5.0:
             end_bound = self.closing_turn.end_sample or self.closing_turn.closed_sample or self.flush_sample or self.sent_samples
             self.covered_samples = max(self.covered_samples, end_bound)
             self.closing_turn = None
-        if not self.has_vad or self.turn is not None or self.closing_turn is not None:
+        if (not self.has_vad and not self.connected) or self.turn is not None or self.closing_turn is not None:
             return
         cutoff_sample = self.sent_samples - RATE * 3
         for span in self.spans:
@@ -403,6 +403,7 @@ class GeminiLiveSTT:
                     try:
                         self.end_sent = False
                         if self.connected and not activity_open and span.speech and rms >= max(self.rms_threshold, 220):
+                            self.covered_samples = max(self.covered_samples, span.start)
                             if self.turn is None:
                                 self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=time.monotonic())
                             await asyncio.wait_for(ws.send_json({"realtimeInput": {"activityStart": {}}}), 5)
@@ -434,8 +435,10 @@ class GeminiLiveSTT:
                                      and since_end >= BPS * 3.5)
                     pause_done = (self.connected and has_words
                                   and since_end >= BPS * 3.5 and quiet_samples >= int(RATE * 0.4))
+                    empty_done = (self.connected and not has_words
+                                  and since_end >= BPS * 2.5 and quiet_samples >= int(RATE * 1.0))
                     max_cut = BPS * 8 if self.connected else BPS * 12
-                    if (sentence_done or pause_done or since_end >= max_cut) and (activity_open or self.speech_pending):
+                    if (sentence_done or pause_done or empty_done or since_end >= max_cut) and (activity_open or self.speech_pending):
                         await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
                         activity_open, since_end, quiet_samples = False, 0, 0
                 continue
