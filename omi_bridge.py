@@ -57,6 +57,7 @@ GEMINI_THINKING_LEVEL = "low"
 PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC = 1.0, 8.0, 1.0
 IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD = 8.0, 80.0
 RING_BUFFER_SECONDS = 300
+HOST = "0.0.0.0"
 PORT, HEALTH_PORT = 8787, 8788
 logger = logging.getLogger("omi_bridge")
 transcript_logger = logging.getLogger("omi_transcript")
@@ -100,8 +101,9 @@ def configure(env=None):
     global STT_MODE, GEMINI_LIVE_MODEL
     global WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC
     global GEMINI_API_KEY, GEMINI_STT_MODEL, GEMINI_THINKING_LEVEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
-    global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, PORT, HEALTH_PORT
+    global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, HOST, PORT, HEALTH_PORT
     env = _load_dotenv() if env is None else env
+    HOST = (env.get("OMI_HOST") or "0.0.0.0").strip()
     GEMINI_API_KEY = (env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip()
     if not GEMINI_API_KEY or GEMINI_API_KEY.lower() in ("your_gemini_api_key_here", "your_api_key_here"):
         raise ValueError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in ~/omi/.env or the environment")
@@ -226,6 +228,7 @@ class BridgeState:
     daily_notes: object = None
     live_listeners: dict = field(default_factory=dict)
     caption_listeners: dict = field(default_factory=dict)
+    stream_clients: dict = field(default_factory=dict)
     recent_events: deque = field(default_factory=lambda: deque(maxlen=200))
     stream_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     background_tasks: dict = field(default_factory=dict)
@@ -488,6 +491,13 @@ def write_event(event):
     state.recent_events.append(dict(event))
     publish_caption(event)
     broadcast(encoded)
+    if event.get("type") == "transcript" and event.get("text"):
+        reply = json.dumps({"text": event["text"]}, ensure_ascii=False)
+        for ws_client, q in list(state.stream_clients.items()):
+            try:
+                q.put_nowait(reply)
+            except asyncio.QueueFull:
+                pass
     timestamp, text = event["timestamp"], event["text"]
     errors_before = state.metrics["output_errors"]
     try:
@@ -1058,7 +1068,64 @@ async def handle_health(request):
     return web.json_response(health, status=200 if health["status"] == "ok" else 503)
 
 
+async def handle_omi_ws(request):
+    """Direct phone-to-bridge WebSocket PCM16 streaming adapter (Omi Custom Live STT compatible)."""
+    if state.stopping:
+        raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
+    try:
+        sr = int(request.query.get("sample_rate", "16000"))
+    except ValueError:
+        raise web.HTTPBadRequest(text="sample_rate must be 16000")
+    if sr != SAMPLE_RATE:
+        raise web.HTTPBadRequest(text="sample_rate must be 16000")
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=BYTES_PER_SECOND * RING_BUFFER_SECONDS + 1)
+    await ws.prepare(request)
+    queue = asyncio.Queue(maxsize=32)
+    state.stream_clients[ws] = queue
+
+    async def sender():
+        try:
+            while True:
+                msg = await queue.get()
+                if msg is None:
+                    return
+                await asyncio.wait_for(ws.send_str(msg), timeout=5)
+        except (OSError, asyncio.TimeoutError):
+            pass
+
+    task = asyncio.create_task(sender())
+    try:
+        async for message in ws:
+            if message.type == aiohttp.WSMsgType.BINARY:
+                raw = message.data
+                if raw.startswith(b"RIFF") or len(raw) % 2:
+                    await ws.close(code=1003, message=b"Expected raw 16000 Hz mono PCM16")
+                    break
+                ingest_raw_pcm(raw, sr)
+            elif message.type == aiohttp.WSMsgType.TEXT:
+                try:
+                    ctrl = json.loads(message.data)
+                except ValueError:
+                    continue
+                if isinstance(ctrl, dict) and ctrl.get("type") == "CloseStream":
+                    if state.live_stt is not None:
+                        state.live_stt.request_flush()
+                    elif state.stt_queue is not None:
+                        await flush_remaining_buffer()
+                    break
+            elif message.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                break
+    finally:
+        state.stream_clients.pop(ws, None)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await ws.close()
+    return ws
+
+
 async def handle_omi(request):
+    if request.method == "GET" and request.headers.get("Upgrade", "").lower() == "websocket":
+        return await handle_omi_ws(request)
     if request.method in ("GET", "HEAD"):
         # Omi validation fields remain stable; local /health reports degraded status separately.
         return web.json_response({"status": "ok", "is_setup_completed": True, "message": ""})
@@ -1185,7 +1252,7 @@ async def on_startup(app):
 
 async def on_shutdown(app):
     state.stopping = True
-    await asyncio.gather(*(ws.close() for ws in list(state.live_listeners) + list(state.caption_listeners)), return_exceptions=True)
+    await asyncio.gather(*(ws.close() for ws in list(state.live_listeners) + list(state.caption_listeners) + list(state.stream_clients)), return_exceptions=True)
 
 
 async def on_cleanup(app):
@@ -1226,6 +1293,7 @@ def create_app(start_workers=True):
     app = web.Application(client_max_size=BYTES_PER_SECOND * RING_BUFFER_SECONDS + 1)
     app.router.add_get("/omi", handle_omi)
     app.router.add_post("/omi", handle_omi)
+    app.router.add_get("/omi/ws", handle_omi_ws)
     app.router.add_get("/listen-ws", handle_listen_ws)
     app.router.add_get("/audio/last", handle_audio_last)
     if start_workers:
@@ -1250,10 +1318,10 @@ async def serve():
     health_runner = web.AppRunner(create_health_app(), access_log=None)
     try:
         await runner.setup()
-        await web.TCPSite(runner, "127.0.0.1", PORT).start()
+        await web.TCPSite(runner, HOST, PORT).start()
         await health_runner.setup()
         await web.TCPSite(health_runner, "127.0.0.1", HEALTH_PORT).start()
-        logger.info("Listening on 127.0.0.1:%d; local health on 127.0.0.1:%d", PORT, HEALTH_PORT)
+        logger.info("Listening on %s:%d; local health on 127.0.0.1:%d", HOST, PORT, HEALTH_PORT)
         await finished.wait()
     finally:
         await health_runner.cleanup()

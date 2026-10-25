@@ -780,6 +780,21 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         response = await client.post("/omi", data=SPEECH, headers={"Content-Type": "application/octet-stream"})
         self.assertEqual(response.status, 200)
 
+    async def test_direct_phone_websocket_adapter_ingests_pcm_and_returns_transcripts(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        for bad_url in ("/omi/ws?sample_rate=44100", "/omi/ws?sample_rate=bad"):
+            resp = await client.get(bad_url)
+            self.assertEqual(resp.status, 400)
+        async with client.ws_connect("/omi") as ws:
+            await ws.send_str(json.dumps({"type": "KeepAlive"}))
+            await ws.send_bytes(SPEECH)
+            with mock.patch.object(bridge, "event_logger"), mock.patch.object(bridge, "transcript_logger"):
+                bridge.record_transcript_line("Direct phone transcript.")
+            msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+            self.assertEqual(msg, {"text": "Direct phone transcript."})
+            await ws.send_str(json.dumps({"type": "CloseStream"}))
+        self.assertEqual(bridge.state.audio_ring[-1][2], SPEECH)
+
 
 class TimestampTests(unittest.TestCase):
     def test_audio_time_controls_midnight_notes_and_timing_metadata_is_retained(self):

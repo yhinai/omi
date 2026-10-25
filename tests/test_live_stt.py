@@ -166,6 +166,58 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream.covered_samples, 48000)
         stream.on_gap.assert_not_called()
 
+    async def test_quiet_duration_measured_in_samples_and_injected_silence_accounted_in_offsets(self):
+        stream = self.make()
+        stream.connected = True
+        stream.spans.append(live.Span(0, 16000, 1000, 100, 999.0, 0, 1, True))
+        stream.sent_samples = 16000
+        stream.turn = live.Turn("u1", stream.spans[0], first_partial=True, last_activity_mono=100)
+        ws = SimpleNamespace(send_json=mock.AsyncMock())
+        # Pass 960 quiet samples (60ms, e.g. two 30ms sub-frames); _end_audio must pad 4800 - 960 = 3840 samples (240ms).
+        await stream._end_audio(ws, wait=False, active=True, quiet_samples=960)
+        self.assertEqual(stream.injected_samples, 3840)
+        audio_calls = [c.args[0]["realtimeInput"]["audio"] for c in ws.send_json.call_args_list if "audio" in c.args[0]["realtimeInput"]]
+        self.assertEqual(len(audio_calls), 1)
+        self.assertEqual(len(live.base64.b64decode(audio_calls[0]["data"])), 3840 * 2)
+        # Provider audioOffset of 1.240s (16000 real + 3840 injected) maps back to real sample 16000.
+        stream.spans.append(live.Span(16000, 32000, 1002, 102, 1001.0, 16000, 1, True))
+        stream.sent_samples = 32000
+        stream.handle_message({"voiceActivity": {"type": "ACTIVITY_END", "audioOffset": "1.240s"}})
+        self.assertEqual(stream.turn.end_sample, 16000)
+        stream.handle_message({"serverContent": {"inputTranscription": {"text": "First turn."}}})
+        stream.handle_message({"serverContent": {"generationComplete": True}})
+        self.assertEqual(stream.covered_samples, 16000)
+        stream.handle_message({"voiceActivity": {"type": "ACTIVITY_START", "audioOffset": "1.240s"}})
+        self.assertEqual(stream.turn.span.sample_offset, 16000)
+
+    def test_delayed_provider_events_from_closing_turn_do_not_corrupt_next_turn(self):
+        stream = self.make()
+        s1 = live.Span(0, 16000, 1000, 100, 999.0, 0, 1, True)
+        s2 = live.Span(16000, 32000, 1005, 105, 1004.0, 16000, 1, True)
+        stream.spans.extend([s1, s2])
+        stream.sent_samples = 32000
+        stream.has_vad = True
+        # Turn 1 timed out waiting for flush and moved to closing_turn while Turn 2 opened.
+        stream.closing_turn = live.Turn("turn-1", s1, first_partial=True, closed_sample=16000)
+        stream.turn = live.Turn("turn-2", s2, first_partial=True)
+        # Delayed final, ACTIVITY_END, and generationComplete for Turn 1 arrive while Turn 2 is active.
+        stream.handle_message({"serverContent": {"inputTranscription": {"text": "Delayed turn one."}}})
+        stream.handle_message({"voiceActivity": {"type": "ACTIVITY_END", "audioOffset": "1.0s"}})
+        stream.handle_message({"serverContent": {"generationComplete": True}})
+        self.assertEqual(stream.on_final.call_count, 1)
+        self.assertEqual(stream.on_final.call_args.args[0], "Delayed turn one.")
+        self.assertEqual(stream.on_final.call_args.kwargs["utterance_id"], "turn-1")
+        self.assertIsNone(stream.closing_turn)
+        self.assertEqual(stream.covered_samples, 16000)
+        # Turn 2 remains intact and can now receive partials and finalize.
+        self.assertIsNotNone(stream.turn)
+        self.assertEqual(stream.turn.identity, "turn-2")
+        stream.handle_message({"serverContent": {"inputTranscription": {"text": "Active turn two."}}})
+        stream.handle_message({"voiceActivity": {"type": "ACTIVITY_END", "audioOffset": "2.0s"}})
+        self.assertEqual(stream.on_final.call_count, 2)
+        self.assertEqual(stream.on_final.call_args.kwargs["utterance_id"], "turn-2")
+        stream.on_gap.assert_not_called()
+
     async def test_connection_loss_reconnects_with_fresh_audio_and_records_unfinalized_gap(self):
         ready, first, final, disconnected = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
         connections = []

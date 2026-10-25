@@ -46,6 +46,7 @@ class Turn:
     end_sample: int | None = None
     last_activity_mono: float = 0.0
     last_text: str = ""
+    closed_sample: int | None = None
 
 
 def _sanitize_error_detail(value):
@@ -84,23 +85,31 @@ class GeminiLiveSTT:
         self.total_input_samples = self.session_id = self.sent_samples = self.covered_samples = 0
         self.last_packet_mono = None
         self.connected = self.stopping = self.rotating = self.end_sent = False
-        self.ws = self.task = self.turn = None
+        self.ws = self.task = self.turn = self.closing_turn = None
         self.reconnects = self.partial_updates = self.final_count = 0
         self.has_vad = False
         self.flush_sample = 0
+        self.injected_samples = 0
+        self.flush_requested = False
+
+    def request_flush(self):
+        self.flush_requested = True
+        self.wake.set()
 
     @property
     def pending_age(self):
         starts = [self.queue[0].received_mono] if self.queue else []
         starts += [span.received_mono for span in self.spans
                    if span.end > self.covered_samples and span.speech]
-        if self.turn is not None and not self.turn.finalized:
-            starts.append(self.turn.span.received_mono)
+        for active in (self.closing_turn, self.turn):
+            if active is not None and not active.finalized:
+                starts.append(active.span.received_mono)
         return max(0, time.monotonic() - min(starts)) if starts else None
 
     @property
     def speech_pending(self):
-        return self.turn is not None or any(s.speech and s.end > self.covered_samples for s in self.spans)
+        return (self.turn is not None or self.closing_turn is not None
+                or any(s.speech and s.end > self.covered_samples for s in self.spans))
 
     def gap(self, reason, seconds, item):
         if seconds > 0:
@@ -155,7 +164,7 @@ class GeminiLiveSTT:
 
     def _retire_ambient_spans(self, now):
         """When server VAD is active and no turn is open, frames older than 3s without ACTIVITY_START are ambient noise."""
-        if not self.has_vad or self.turn is not None:
+        if not self.has_vad or self.turn is not None or self.closing_turn is not None:
             return
         cutoff_sample = self.sent_samples - RATE * 3
         for span in self.spans:
@@ -180,27 +189,42 @@ class GeminiLiveSTT:
             offset = activity.get("audioOffset", "")
             try:
                 seconds = float(str(offset).removesuffix("s"))
-                offset = round(seconds * RATE) if math.isfinite(seconds) and seconds >= 0 else None
+                raw_offset = round(seconds * RATE) if math.isfinite(seconds) and seconds >= 0 else None
+                offset = max(0, raw_offset - self.injected_samples) if raw_offset is not None else None
             except (ValueError, OverflowError):
                 offset = None
             if activity.get("type") == "ACTIVITY_START":
                 span = self._span_at(offset)
                 if span is not None:
-                    # Frames before ACTIVITY_START contained no speech according to server VAD.
-                    self.covered_samples = max(self.covered_samples, span.start)
-                    self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=now)
+                    if self.turn is not None and not self.turn.finalized and self.turn.closed_sample is None:
+                        if span.start >= self.turn.span.start:
+                            self.covered_samples = max(self.covered_samples, self.turn.span.start)
+                            self.turn.last_activity_mono = now
+                    else:
+                        # Frames before ACTIVITY_START contained no speech according to server VAD.
+                        self.covered_samples = max(self.covered_samples, span.start)
+                        self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=now)
             elif activity.get("type") == "ACTIVITY_END":
                 end = min(offset, self.sent_samples) if offset is not None else self.sent_samples
                 # Coverage bookkeeping uses whole sent frames; a VAD boundary can fall
                 # inside their trailing silence. Do not leave that frame pending forever.
                 end = next((span.end for span in self.spans if span.start < end <= span.end), end)
-                if self.turn is not None:
-                    self.turn.end_sample = end
-                    self.turn.last_activity_mono = now
-                    # Some servers send VAD end before the finalized text. Preserve its receipt baseline.
-                    if self.turn.finalized:
+                if self.closing_turn is not None and (self.turn is None or end <= (self.closing_turn.closed_sample or end)):
+                    self.closing_turn.end_sample = end
+                    self.closing_turn.last_activity_mono = now
+                    if self.closing_turn.finalized:
                         self.covered_samples = max(self.covered_samples, end)
-                        self.turn = None
+                        self.closing_turn = None
+                elif self.turn is not None:
+                    if self.turn.closed_sample is None and end <= self.turn.span.start:
+                        self.covered_samples = max(self.covered_samples, end)
+                    else:
+                        self.turn.end_sample = end
+                        self.turn.last_activity_mono = now
+                        # Some servers send VAD end before the finalized text. Preserve its receipt baseline.
+                        if self.turn.finalized:
+                            self.covered_samples = max(self.covered_samples, end)
+                            self.turn = None
                 else:
                     self.covered_samples = max(self.covered_samples, end)
         content = data.get("serverContent", {})
@@ -223,7 +247,7 @@ class GeminiLiveSTT:
                                  "session_id": turn.span.session_id, "text": interim["text"][:16000]})
         final = content.get("inputTranscription")
         if isinstance(final, dict) and isinstance(final.get("text"), str) and final["text"].strip():
-            turn = self._turn()
+            turn = self.closing_turn if (self.closing_turn is not None and not self.closing_turn.finalized) else self._turn()
             if turn is not None and not turn.finalized:
                 turn.last_activity_mono = now
                 if len(final["text"]) > 32000:
@@ -237,63 +261,83 @@ class GeminiLiveSTT:
                 turn.finalized = True
                 self.final_count += 1
                 self.on_partial({"type": "partial", "utterance_id": turn.identity, "text": ""})
-                if turn.end_sample is not None or not self.has_vad:
+                if turn is self.closing_turn:
+                    if turn.end_sample is not None or not self.has_vad:
+                        self.covered_samples = max(self.covered_samples,
+                            turn.end_sample if turn.end_sample is not None else (turn.closed_sample or self.sent_samples))
+                        self.closing_turn = None
+                elif turn.end_sample is not None or not self.has_vad:
                     self.covered_samples = max(self.covered_samples,
                         turn.end_sample if turn.end_sample is not None else self.sent_samples)
                     self.turn = None
+        if content.get("generationComplete"):
+            if self.closing_turn is not None:
+                ct = self.closing_turn
+                end_bound = ct.end_sample or ct.closed_sample or self.flush_sample or self.sent_samples
+                if not ct.finalized and ct.first_partial:
+                    duration = max(0, end_bound - max(self.covered_samples, ct.span.start)) / RATE
+                    self.gap("failed", duration, ct.span)
+                    self.on_partial({"type": "partial", "utterance_id": ct.identity, "text": ""})
+                self.covered_samples = max(self.covered_samples, end_bound)
+                self.closing_turn = None
+                self.flushed.set()
+            else:
+                if self.turn is not None and self.turn.finalized:
+                    self.covered_samples = max(self.covered_samples,
+                        self.turn.end_sample if self.turn.end_sample is not None else self.sent_samples)
+                    self.turn = None
+                if self.turn is not None and not self.turn.finalized and self.turn.end_sample is not None:
+                    # A completed segment can legitimately contain no intelligible speech.
+                    if self.turn.first_partial:
+                        duration = max(0, self.turn.end_sample - max(self.covered_samples, self.turn.span.start)) / RATE
+                        self.gap("failed", duration, self.turn.span)
+                    self.covered_samples = max(self.covered_samples, self.turn.end_sample)
+                    self.on_partial({"type": "partial", "utterance_id": self.turn.identity, "text": ""})
+                    self.turn = None
                 if self.end_sent:
-                    self.flushed.set()
-        if content.get("generationComplete") and self.turn is not None and self.turn.finalized:
-            self.covered_samples = max(self.covered_samples,
-                self.turn.end_sample if self.turn.end_sample is not None else self.sent_samples)
-            self.turn = None
-        if content.get("generationComplete") and self.turn is not None and not self.turn.finalized and self.turn.end_sample is not None:
-            # A completed segment can legitimately contain no intelligible speech.
-            if self.turn.first_partial:
-                duration = max(0, self.turn.end_sample - max(self.covered_samples, self.turn.span.start)) / RATE
-                self.gap("failed", duration, self.turn.span)
-            self.covered_samples = max(self.covered_samples, self.turn.end_sample)
-            self.on_partial({"type": "partial", "utterance_id": self.turn.identity, "text": ""})
-            self.turn = None
-        if content.get("generationComplete") and self.end_sent:
-            if self.turn is not None and not self.turn.finalized:
-                # Never promote an unfinished hypothesis just because an audio segment ended.
-                if self.turn.first_partial:
-                    spans = [s for s in self.spans if s.end > self.covered_samples and s.speech]
-                    if spans:
-                        self.gap("failed", sum(s.end-max(s.start,self.covered_samples) for s in spans)/RATE, spans[0])
-                self.on_partial({"type": "partial", "utterance_id": self.turn.identity, "text": ""})
-            self.turn = None
-            self.covered_samples = max(self.covered_samples, self.flush_sample)
-            self.flushed.set()
-        elif content.get("generationComplete"):
-            self.flushed.set()
+                    if self.turn is not None and not self.turn.finalized:
+                        # Never promote an unfinished hypothesis just because an audio segment ended.
+                        if self.turn.first_partial:
+                            spans = [s for s in self.spans if s.end > self.covered_samples and s.speech]
+                            if spans:
+                                self.gap("failed", sum(s.end-max(s.start,self.covered_samples) for s in spans)/RATE, spans[0])
+                        self.on_partial({"type": "partial", "utterance_id": self.turn.identity, "text": ""})
+                    self.turn = None
+                    self.covered_samples = max(self.covered_samples, self.flush_sample)
+                self.flushed.set()
         # Keep bounded receipt metadata for late VAD/final offsets, even after coverage is finalized.
 
     def _connection_gap(self):
         self._retire_ambient_spans(time.monotonic())
         candidates = [s for s in self.spans if s.end > self.covered_samples and s.speech]
-        if candidates and (self.turn is None or not self.turn.finalized):
+        unfinalized = (self.closing_turn is not None and not self.closing_turn.finalized) or (self.turn is None or not self.turn.finalized)
+        if candidates and unfinalized:
             self.gap("failed", sum(s.end - max(s.start, self.covered_samples) for s in candidates) / RATE,
                      candidates[0])
-        if self.turn is not None:
-            self.on_partial({"type": "partial", "utterance_id": self.turn.identity, "text": ""})
+        for active in (self.closing_turn, self.turn):
+            if active is not None:
+                self.on_partial({"type": "partial", "utterance_id": active.identity, "text": ""})
         self.spans.clear()
-        self.turn = None
+        self.turn = self.closing_turn = None
         self.sent_samples = self.covered_samples = 0
         self.has_vad = False
         self.flush_sample = 0
+        self.injected_samples = 0
+        self.flush_requested = False
 
-    async def _end_audio(self, ws, *, wait=False, active=False, quiet_frames=0):
+    async def _end_audio(self, ws, *, wait=False, active=False, quiet_samples=0):
         self.flushed.clear()
         self.end_sent = True
         self.flush_sample = self.sent_samples
+        if self.turn is not None:
+            self.turn.closed_sample = self.sent_samples
         if active and self.connected:
-            pad_frames = max(0, 3 - quiet_frames)
-            if pad_frames:
-                silence_b64 = base64.b64encode(b"\x00" * (FRAME_BYTES * pad_frames)).decode("ascii")
+            pad_samples = max(0, int(RATE * 0.3) - quiet_samples)
+            if pad_samples:
+                silence_b64 = base64.b64encode(b"\x00" * (pad_samples * 2)).decode("ascii")
                 await asyncio.wait_for(ws.send_json({"realtimeInput": {"audio": {
                     "data": silence_b64, "mimeType": "audio/pcm;rate=16000"}}}), 5)
+                self.injected_samples += pad_samples
             await asyncio.wait_for(ws.send_json({"realtimeInput": {"activityEnd": {}}}), 5)
         await asyncio.wait_for(ws.send_json({"realtimeInput": {"audioStreamEnd": True}}), 5)
         if wait and self.connected:
@@ -302,15 +346,18 @@ class GeminiLiveSTT:
                 await asyncio.wait_for(self.flushed.wait(), 2.0 if has_words else 0.25)
             except TimeoutError:
                 pass
+            if self.turn is not None and self.turn.closed_sample is not None:
+                self.closing_turn = self.turn
+                self.turn = None
 
     async def _send(self, ws):
-        idle_ended, since_end, prior_session, activity_open, quiet_frames = False, 0, None, False, 0
+        idle_ended, since_end, prior_session, activity_open, quiet_samples = False, 0, None, False, 0
         while True:
             self._retire_ambient_spans(time.monotonic())
             if self.turn is not None and not self.turn.finalized and self.turn.last_activity_mono and time.monotonic() - self.turn.last_activity_mono > 15:
-                await self._end_audio(ws, wait=True, active=activity_open)
-                activity_open, since_end, quiet_frames = False, 0, 0
-                if self.turn is not None and not self.turn.finalized:
+                await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
+                activity_open, since_end, quiet_samples = False, 0, 0
+                if (self.turn is not None and not self.turn.finalized) or (self.closing_turn is not None and not self.closing_turn.finalized):
                     raise TimeoutError("Gemini Live turn stalled after 15s")
             if self.queue:
                 packet = self.queue.popleft()
@@ -319,8 +366,8 @@ class GeminiLiveSTT:
                     self.gap("stale", len(packet.pcm) / BPS, packet)
                     continue
                 if prior_session is not None and packet.session_id != prior_session:
-                    await self._end_audio(ws, wait=True, active=activity_open)
-                    activity_open, since_end, quiet_frames = False, 0, 0
+                    await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
+                    activity_open, since_end, quiet_samples = False, 0, 0
                 prior_session = packet.session_id
                 idle_ended = False
                 for pos in range(0, len(packet.pcm), FRAME_BYTES):
@@ -353,9 +400,9 @@ class GeminiLiveSTT:
                     self._retire_ambient_spans(time.monotonic())
                     if activity_open or self.speech_pending:
                         since_end += len(frame)
-                        quiet_frames = quiet_frames + 1 if rms < 320 else 0
+                        quiet_samples = quiet_samples + n if rms < 320 else 0
                     else:
-                        since_end, quiet_frames = 0, 0
+                        since_end, quiet_samples = 0, 0
                     if len(self.spans) > 2048:
                         old = self.spans.popleft()
                         if old.speech and old.end > self.covered_samples:
@@ -363,24 +410,30 @@ class GeminiLiveSTT:
                     # Finalize at a sentence/pause boundary (or 8s max when live, 12s in unit mocks) so finals commit fast without clipping words.
                     has_words = self.turn is not None and self.turn.first_partial
                     sentence_done = (has_words and self.turn.last_text.endswith((".", "?", "!"))
-                                     and ((since_end >= BPS * 1.5 and quiet_frames >= 2) or since_end >= BPS * 3.5))
-                    pause_done = self.connected and has_words and ((since_end >= BPS * 1.5 and quiet_frames >= 6) or (since_end >= BPS * 4.0 and quiet_frames >= 3))
+                                     and since_end >= BPS * 3.5)
+                    pause_done = (self.connected and has_words
+                                  and since_end >= BPS * 3.5 and quiet_samples >= int(RATE * 0.4))
                     max_cut = BPS * 8 if self.connected else BPS * 12
                     if (sentence_done or pause_done or since_end >= max_cut) and (activity_open or self.speech_pending):
-                        await self._end_audio(ws, wait=True, active=activity_open, quiet_frames=quiet_frames)
-                        activity_open, since_end, quiet_frames = False, 0, 0
+                        await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
+                        activity_open, since_end, quiet_samples = False, 0, 0
                 continue
+            if self.flush_requested:
+                self.flush_requested = False
+                if activity_open or self.speech_pending:
+                    await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
+                    idle_ended, activity_open, since_end, quiet_samples = True, False, 0, 0
             if self.stopping or self.rotating:
-                await self._end_audio(ws, active=activity_open, quiet_frames=quiet_frames)
+                await self._end_audio(ws, active=activity_open, quiet_samples=quiet_samples)
                 return
             if (activity_open and since_end >= BPS * 3.0 and self.turn is not None
                     and self.turn.last_text.endswith((".", "?", "!"))):
-                await self._end_audio(ws, wait=True, active=activity_open, quiet_frames=quiet_frames)
-                activity_open, since_end, quiet_frames = False, 0, 0
+                await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
+                activity_open, since_end, quiet_samples = False, 0, 0
             if (not idle_ended and self.last_packet_mono is not None
                     and time.monotonic() - self.last_packet_mono > min(self.idle_flush, 1.8 if activity_open else self.idle_flush)):
-                await self._end_audio(ws, wait=True, active=activity_open, quiet_frames=quiet_frames)
-                idle_ended, activity_open, since_end, quiet_frames = True, False, 0, 0
+                await self._end_audio(ws, wait=True, active=activity_open, quiet_samples=quiet_samples)
+                idle_ended, activity_open, since_end, quiet_samples = True, False, 0, 0
             self.wake.clear()
             try:
                 await asyncio.wait_for(self.wake.wait(), .04)
