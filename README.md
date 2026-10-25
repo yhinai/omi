@@ -7,11 +7,11 @@ Omi Audio Bytes (1-second uploads)
         ↓
 Tailscale Funnel → POST /omi on 127.0.0.1:8787
         ↓
-Dynamic [1s pre + ~8s core + 1s post] windows
+Bounded live-audio queue → persistent Gemini transcription WebSocket
         ↓
-Queue of 24 windows → one sequential Gemini worker
+Instant partial captions (temporary) → finalized speech
         ↓
-Transcript log + daily paragraphs + Hermes webhooks
+Transcript log + daily paragraphs + Hermes webhooks + daily edition
 ```
 
 ## Setup
@@ -38,11 +38,27 @@ Expose the ingestion service:
 tailscale funnel --bg --https=443 http://127.0.0.1:8787
 ```
 
-In the Omi app, leave **Custom Backend URL** blank. Enable **Developer Settings → Webhooks → Audio Bytes**, set the URL to `https://<your-host>.ts.net/omi`, and set the interval to **1 second**. The bridge batches transcription independently of upload frequency.
+In the Omi app, leave **Custom Backend URL** blank. Enable **Developer Settings → Webhooks → Audio Bytes**, set the URL to `https://<your-host>.ts.net/omi`, and set the interval to **1 second**. Live mode forwards arriving audio immediately; it does not wait for an eight-second window.
 
 The ingestion endpoint accepts `Content-Type: application/octet-stream`, `sample_rate=16000` (or omitted), and complete two-byte samples. Incoming WebSocket audio, transcript JSON, and WAV uploads are unsupported. The browser monitor still uses an outgoing WebSocket.
 
 ## Processing and recovery
+
+The default is **`OMI_STT_MODE=live`**, using `OMI_GEMINI_LIVE_MODEL=gemini-3.5-transcribe-live`. The existing Gemini key stays on the bridge host. A persistent authenticated WebSocket forwards each received upload immediately as up-to-100 ms PCM frames; it does not deliberately wait between frames that have already arrived. One-second phone uploads remain the upstream input cadence. No additional SDK or dependency is needed.
+
+- **Real partials:** `interimInputTranscription` replaces an ephemeral current hypothesis immediately. Final `inputTranscription` creates a normal persisted transcript with a stable `utterance_id`, `is_final: true` and `transcription_mode: "live"`. Partial captions never enter transcript files, daily notes, replay history, Hermes research, or the magazine. Partial updates are coalesced into one replaceable slot per viewer so they cannot displace saved captions.
+- **Bounded freshness:** unsent audio is limited to ten seconds and 256 packet records, favoring newer audio during overload. Stale unsent packets older than `OMI_MAX_WINDOW_AGE_SEC=45` are skipped during live operation. Every valid packet still enters the independent five-minute playback ring first. `/health` reports queued packets, queued bytes, capacity in seconds, connection state, reconnect count, and partial update count. In live mode, `core_window_sec` is zero and the old batch queue capacity is `null`.
+- **Finalization:** server VAD uses 400 ms silence detection. More than eight seconds without uploads sends `audioStreamEnd`; a continuously voiced segment is also prompted to finalize after approximately 30 seconds of received audio. Neither rule delays forwarding or partial captions. The model's final text is saved; an unfinished partial is never promoted to a final transcript.
+- **Reconnects:** closed sockets and server `GoAway` notices reconnect with bounded backoff. Only unsent audio retries; uncertain already-sent speech is marked with a gap rather than replayed and potentially duplicated. There is no claim of lossless connection recovery or session resumption. Receipt/VAD metadata is bounded independently of retained audio, and source times remain estimates.
+- **Shutdown:** accepted queued audio is sent before ending the stream, with a bounded wait for final text. Live worker shutdown is capped at 20 seconds; any known undelivered queued audio is reported as a gap. Files and Hermes delivery keep their separate error reporting. All RAM-only limitations still apply on crashes or forced termination.
+- **Latency:** `latency.receipt_to_first_partial_sec` measures first eligible audio receipt → first nonempty hypothesis for an utterance. `latency.receipt_to_final_sec` measures that same baseline → final recognition and output attempt. `receipt_to_transcript_sec` additionally requires successful authoritative persistence. Final latency includes the utterance's speaking duration and VAD pause; compare first-partial latency when assessing live responsiveness. These exclude phone/device buffering and network time before bridge receipt.
+
+See [Google's live transcription protocol](https://ai.google.dev/gemini-api/docs/live-api/live-transcribe). The model may revise partial words; only finalized text is intended for durable reading. Actual streaming access is verified by setup completion, and the local health endpoint becomes degraded if the provider connection is unavailable.
+
+<details>
+<summary>Optional batch compatibility mode (`OMI_STT_MODE=batch`)</summary>
+
+The older eight-second `gemini-3.8-flash` path remains available for rollback and offline regressions. Its model, thinking, window, silence-gate and processing-deadline settings apply only in batch mode. Only one transcription path runs at a time.
 
 - **Bounded processing:** one consumer handles at most 24 queued windows plus one in-flight request. Before processing, live windows waiting more than `OMI_MAX_WINDOW_AGE_SEC=45` seconds are skipped; the count cap remains a separate memory bound. Queue age starts at slicing/enqueue time, not physical capture time, and the currently running request can add latency. During live overload, a new window evicts the oldest queued window; incoming unsliced PCM is capped at 30 seconds by trimming the oldest pending samples. Valid live uploads return HTTP `200` under backlog pressure. Individual HTTP uploads are limited to 300 seconds of PCM (9.6 MB), independently of the pending buffer; larger requests return HTTP `413`. This favors fresh speech but deliberately loses older transcription audio. `windows_evicted` and `buffer_bytes_evicted` report the two loss types; `windows_dropped` also counts failed requests and buffer-trimming events (not a precise duration). Every valid live packet enters the separate playback ring first, where it remains until normal ring expiry. Shutdown drains pending work without eviction or age-based skipping; the per-window processing deadline still applies.
 - **Gemini thinking:** `OMI_GEMINI_THINKING_LEVEL=low` is the default for latency-sensitive transcription. `medium` and `high` are available for more reasoning and may increase latency and token use; `minimal` is unsupported. Requests explicitly set `temperature: 0.0` and `maxOutputTokens: 160` as requested. The current API accepted these settings in a real speech test, although [Google's Gemini 3.8 migration guidance](https://ai.google.dev/gemini-api/docs/generate-content/whats-new-gemini-3.8) calls temperature deprecated. Neither setting guarantees factual transcription; token-capped, incomplete responses remain errors rather than accepted partial text. Low thinking does not guarantee that processing will keep pace with live audio.
@@ -51,6 +67,9 @@ The ingestion endpoint accepts `Content-Type: application/octet-stream`, `sample
 - **Session endings:** after more than eight seconds without audio, any remaining complete PCM16 samples are flushed, including tails shorter than one second. Audio overlap and transcript context reset between sessions.
 - **Graceful shutdown:** `SIGINT` and `SIGTERM` stop ingress, flush remaining audio, and drain the STT queue before exit. A restart may take several minutes during an API outage; the launcher waits instead of forcing termination. Audio is held in RAM, so a crash, power loss, or forced kill can still lose pending work.
 - **Speech windows:** the default eight-second core reduces request frequency by about 38% compared with five seconds, at the cost of added transcription latency. Sustained API slowness can still cause overload. Low-energy cuts and boundary deduplication reduce clipping and repetition, but remain heuristics. RMS below the configured threshold skips the API call. With one-second uploads, the bridge still needs roughly nine seconds of audio before the first transcription request, followed by API latency.
+
+
+</details>
 
 ## Commands and status
 
@@ -77,11 +96,11 @@ Local health also reports latency without changing any timeout or queue-age sett
 
 | Field | Meaning |
 | --- | --- |
-| `latency.receipt_to_transcript_sec` | First packet containing the window's core audio received by the bridge → successful authoritative transcript write and completion of secondary output attempts. Includes buffering, queue wait, retries/backoff, and output time. |
-| `latency.gemini_request_duration_sec` | One Gemini attempt, including audio encoding, HTTP response, and parsing. Includes failed/timed-out attempts; excludes queue wait and retry backoff. |
+| `latency.receipt_to_transcript_sec` | First packet containing the utterance's voiced audio (or the batch window's core audio) received by the bridge → successful authoritative transcript write and completion of secondary output attempts. Includes buffering, queue wait, retries/backoff, and output time. |
+| `latency.gemini_request_duration_sec` | One batch-mode Gemini attempt, including audio encoding, HTTP response, and parsing; empty in live mode. Includes failed/timed-out attempts; excludes queue wait and retry backoff. |
 | `oldest_pending_audio_age_sec` | Time since receipt of the oldest remaining core audio, across unsliced buffers, queued windows, and the currently processed window (including retry backoff). Excludes processed overlap and playback history. `null` means no pending audio. |
 
-Both latency summaries contain `last`, `p50`, `p95`, and `samples`, using a bounded rolling history of the last 128 observations per metric since process start. Percentiles use nearest rank; before any observations, values are `null` and `samples` is zero. Receipt latency samples require a newly persisted, nonempty transcript; silence, gaps, duplicate-only results, and failed JSONL writes do not add samples. These measurements use monotonic receipt times and are unaffected by wall-clock adjustments. They do not include wearable/phone buffering or network delay before bridge receipt, so they are not physical capture-to-transcript latency. The 45-second stale-window policy still measures queue age from enqueue time.
+All latency summaries contain `last`, `p50`, `p95`, and `samples`, using a bounded rolling history of the last 128 observations per metric since process start. Percentiles use nearest rank; before any observations, values are `null` and `samples` is zero. Receipt latency samples require a newly persisted, nonempty transcript; silence, gaps, batch duplicate-only results, and failed JSONL writes do not add samples. These measurements use monotonic receipt times and are unaffected by wall-clock adjustments. They do not include wearable/phone buffering or network delay before bridge receipt, so they are not physical capture-to-transcript latency. The optional batch stale-window policy measures age from enqueue time; live mode measures stale unsent packets from receipt time.
 
 ## Audio, transcripts, and Hermes
 
@@ -109,7 +128,11 @@ The existing Funnel configuration exposes the monitor and audio-download routes 
 
 For terminal captions, run `~/omi/tui.sh`; see [terminal viewer instructions](TUI.md) for controls and display timing.
 
+For a quiet light-only browser reader and a source-linked daily magazine, open **http://127.0.0.1:8788/focus**. See [Focus and daily editions](FOCUS.md) for controls, generation, image sources, and privacy.
+
 ## Verification
+
+For an isolated end-to-end streaming check using real Gemini, run `.venv/bin/python3.15 scripts/live_smoke_test.py`. It synthesizes a known phrase, starts a temporary local bridge, sends one-second uploads, and verifies partial captions plus final-only persistence. It uses temporary logs and does not touch the running wearable stream; normal API charges apply.
 
 ```bash
 cd ~/omi
@@ -128,6 +151,6 @@ For an **opt-in integration check using real Gemini**, turn Omi off, let pending
 .venv/bin/python3.15 scripts/smoke_test.py --wav /absolute/path/speech.wav --expect "blue lantern seven"
 ```
 
-The default check uses macOS `say`/`afconvert` to generate “The bridge test is working. Blue lantern seven.” It sends five-second PCM uploads, waits at least eight seconds for the idle tail, and allows up to 120 seconds for the expected phrase to appear in **newly appended** transcript text. It also requires a new successful Gemini window. Normal Gemini API charges apply; this check makes real requests and writes its test speech to the usual transcript/daily files. It prints no unrelated transcript text. `--health-url` and `--transcript-log` select the bridge's local status endpoint and log; run this command on the bridge host. Concurrent audio or pending work causes refusal unless `--allow-active` explicitly permits mixing.
+The default check uses macOS `say`/`afconvert` to generate “The bridge test is working. Blue lantern seven.” It sends one-second PCM uploads, waits at least eight seconds for the idle tail, and allows up to 120 seconds for the expected phrase to appear in **newly appended** transcript text. It also requires a new successful Gemini window. Normal Gemini API charges apply; this check makes real requests and writes its test speech to the usual transcript/daily files. It prints no unrelated transcript text. `--health-url` and `--transcript-log` select the bridge's local status endpoint and log; run this command on the bridge host. Concurrent audio or pending work causes refusal unless `--allow-active` explicitly permits mixing.
 
 This controlled injection verifies the selected HTTP ingress, bridge, Gemini, and transcript output. To verify the **physical wearable → BLE → phone → Funnel** path, enable the Omi Audio Bytes webhook, note the current end of the transcript, and speak a distinct phrase into the wearable. Leave it on for at least 15 seconds after finishing so the phone uploads can deliver the phrase, then confirm a new transcript entry. Power Omi off and confirm its final received tail appears after the idle flush. The bridge can flush received audio; it cannot recover audio still buffered upstream when the device disconnects. A controlled injection alone does not verify those physical/device hops.

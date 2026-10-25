@@ -9,3 +9,4 @@ omi_live_research.md
 __pycache__/
 *.pyc
 .DS_Store
+node_modules/

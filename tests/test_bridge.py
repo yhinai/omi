@@ -831,7 +831,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         for target, name, value in ((b, "state", b.BridgeState()),
-                                     (b, "GEMINI_API_KEY", "offline-key"), (b, "LOG_DIR", temp.name)):
+                                     (b, "GEMINI_API_KEY", "offline-key"), (b, "LOG_DIR", temp.name), (b, "STT_MODE", "batch")):
             active = patch.object(target, name, value)
             active.start()
             self.addCleanup(active.stop)
@@ -1432,6 +1432,133 @@ class LatencyTests(unittest.IsolatedAsyncioTestCase):
             bridge.record_latency("gemini_request_duration_sec", i)
         summary = bridge.build_health_dict()["latency"]["gemini_request_duration_sec"]
         self.assertEqual(summary, {"samples": 128, "last": 199, "p50": 135, "p95": 193})
+
+
+class CaptionFeedTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.runtime = bridge.BridgeState(stt_queue=asyncio.Queue(maxsize=24))
+        for patcher in (mock.patch.object(bridge, "state", self.runtime),
+                        mock.patch.object(bridge, "event_logger"),
+                        mock.patch.object(bridge, "transcript_logger")):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.client = TestClient(TestServer(bridge.create_app(start_workers=False)))
+        await self.client.start_server()
+        self.addAsyncCleanup(self.client.close)
+
+    def seed(self, count):
+        for i in range(count):
+            self.runtime.recent_events.append({"type": "transcript", "event_id": f"e{i}",
+                "text": f"Caption {i}", "timestamp": "2026-10-24 12:00:00"})
+
+    async def replay(self, ws):
+        start = await ws.receive_json(timeout=2)
+        events = [await ws.receive_json(timeout=2) for _ in range(start["count"])]
+        end = await ws.receive_json(timeout=2)
+        self.assertEqual((start["type"], start["phase"], end["phase"]), ("replay", "start", "end"))
+        return start, events
+
+    async def test_startup_replay_can_exceed_live_queue_capacity_without_binary_audio(self):
+        self.seed(130)
+        async with self.client.ws_connect("/listen-ws?mode=captions&replay=100") as ws:
+            start, events = await self.replay(ws)
+            self.assertFalse(start["reset"])
+            self.assertEqual([e["event_id"] for e in events], [f"e{i}" for i in range(30, 130)])
+            status = await ws.receive_json(timeout=2)
+            self.assertEqual(status["type"], "status")
+            bridge.ingest_raw_pcm(b"\x01\x01" * 160)
+            bridge.record_transcript_line("Fresh caption")
+            fresh = await ws.receive_json(timeout=2)
+            self.assertEqual(fresh["text"], "Fresh caption")
+            self.assertEqual(fresh["stream_id"], self.runtime.stream_id)
+            self.assertEqual(len(self.runtime.recent_events), 131)
+            self.assertFalse(self.runtime.live_listeners)
+
+    async def test_resume_cursor_recovers_all_retained_events_after_it(self):
+        self.seed(10)
+        async with self.client.ws_connect("/listen-ws?mode=captions&replay=1&after=e6") as ws:
+            start, events = await self.replay(ws)
+            self.assertFalse(start["reset"])
+            self.assertEqual([e["event_id"] for e in events], ["e7", "e8", "e9"])
+
+    async def test_expired_cursor_explicitly_resets_and_bounds_replay(self):
+        self.seed(10)
+        async with self.client.ws_connect("/listen-ws?mode=captions&replay=3&after=expired") as ws:
+            start, events = await self.replay(ws)
+            self.assertTrue(start["reset"])
+            self.assertEqual([e["event_id"] for e in events], ["e7", "e8", "e9"])
+
+    async def test_new_live_event_follows_replay_without_a_subscription_hole(self):
+        self.seed(20)
+        async with self.client.ws_connect("/listen-ws?mode=captions&replay=20") as ws:
+            bridge.record_transcript_line("Arrived during replay")
+            _, events = await self.replay(ws)
+            self.assertEqual(len(events), 20)
+            messages = [await ws.receive_json(timeout=2), await ws.receive_json(timeout=2)]
+            self.assertEqual(sum(e.get("text") == "Arrived during replay" for e in messages), 1)
+
+    async def test_caption_backpressure_closes_for_replay_instead_of_losing_old_captions_silently(self):
+        listener = bridge.CaptionListener()
+        self.runtime.caption_listeners["test"] = listener
+        for i in range(64):
+            bridge.publish_caption({"type": "transcript", "event_id": str(i)})
+        bridge.publish_caption({"type": "transcript", "event_id": "overflow"})
+        self.assertTrue(listener.closed)
+        self.assertEqual(listener.queue.qsize(), 64)
+        self.assertEqual(listener.queue.get_nowait()["event_id"], "0")
+        self.assertTrue(listener.ready.is_set())
+        self.runtime.caption_listeners.clear()
+
+    async def test_status_does_not_consume_reliable_caption_queue_capacity(self):
+        listener = bridge.CaptionListener()
+        self.runtime.caption_listeners["test"] = listener
+        for _ in range(64):
+            listener.queue.put_nowait({"type": "transcript"})
+        sleeping = asyncio.Event()
+        async def pause(*args):
+            sleeping.set()
+            await asyncio.Event().wait()
+        with mock.patch.object(bridge.asyncio, "sleep", side_effect=pause):
+            worker = asyncio.create_task(bridge.caption_status_worker())
+            try:
+                await asyncio.wait_for(sleeping.wait(), 1)
+                self.assertEqual(listener.status["type"], "status")
+                self.assertEqual(listener.queue.qsize(), 64)
+                self.assertFalse(listener.closed)
+            finally:
+                worker.cancel()
+                await asyncio.gather(worker, return_exceptions=True)
+        self.runtime.caption_listeners.clear()
+
+    async def test_invalid_caption_parameters_fail_before_websocket_upgrade(self):
+        for query in ("mode=unknown", "mode=captions&replay=-1", "mode=captions&replay=201", "mode=captions&replay=bad"):
+            response = await self.client.get("/listen-ws?" + query)
+            self.assertEqual(response.status, 400)
+
+    async def test_jsonl_failure_does_not_publish_or_cache_an_uncommitted_event(self):
+        bridge.event_logger.info.side_effect = OSError("full")
+        listener = bridge.CaptionListener()
+        self.runtime.caption_listeners["test"] = listener
+        self.assertFalse(bridge.record_transcript_line("not saved"))
+        self.assertFalse(self.runtime.recent_events)
+        self.assertTrue(listener.queue.empty())
+        self.runtime.caption_listeners.clear()
+
+    async def test_seed_reads_rotation_in_order_skips_malformed_lines_and_preserves_ids(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(bridge, "LOG_DIR", directory):
+            path = Path(directory, "omi_transcript_events.jsonl")
+            older = [{"type": "transcript", "event_id": f"e{i}", "text": str(i)} for i in range(50)]
+            newer = [{"type": "transcript", "event_id": f"e{i}", "text": str(i)} for i in range(50, 230)]
+            path.with_name(path.name + ".1").write_text("\n".join(json.dumps(e) for e in older) + "\n")
+            path.write_text("\n".join(json.dumps(e) for e in newer) + '\n{"broken"\n')
+            bridge.seed_recent_events()
+            self.assertEqual([e["event_id"] for e in self.runtime.recent_events], [f"e{i}" for i in range(30, 230)])
+            path.write_text(json.dumps({"text": "Legacy transcript"}) + "\n")
+            bridge.seed_recent_events()
+            identity = self.runtime.recent_events[-1]["event_id"]
+            bridge.seed_recent_events()
+            self.assertEqual(self.runtime.recent_events[-1]["event_id"], identity)
+            self.assertTrue(identity.startswith("legacy-"))
 
 
 if __name__ == "__main__":

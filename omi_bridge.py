@@ -7,6 +7,7 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 import io
+import hashlib
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -50,6 +51,8 @@ RETRY_DELAYS = (1.0, 2.0, 4.0)
 WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC = 20.0, 45.0
 GEMINI_API_KEY = ""
 GEMINI_STT_MODEL = "gemini-3.8-flash"
+STT_MODE = "live"
+GEMINI_LIVE_MODEL = "gemini-3.5-transcribe-live"
 GEMINI_THINKING_LEVEL = "low"
 PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC = 1.0, 8.0, 1.0
 IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD = 8.0, 80.0
@@ -98,6 +101,7 @@ def _load_dotenv(local_path=None, fallback_path=None, environ=None):
 
 
 def configure(env=None):
+    global STT_MODE, GEMINI_LIVE_MODEL
     global WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC
     global GEMINI_API_KEY, GEMINI_STT_MODEL, GEMINI_THINKING_LEVEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
     global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, PORT, HEALTH_PORT
@@ -107,6 +111,10 @@ def configure(env=None):
     if not GEMINI_API_KEY or GEMINI_API_KEY.lower() in ("your_gemini_api_key_here", "your_api_key_here"):
         raise ValueError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in ~/omi/.env or the environment")
     GEMINI_STT_MODEL = env.get("OMI_GEMINI_STT_MODEL", "gemini-3.8-flash").strip()
+    STT_MODE = env.get("OMI_STT_MODE", "live").strip().lower()
+    GEMINI_LIVE_MODEL = env.get("OMI_GEMINI_LIVE_MODEL", "gemini-3.5-transcribe-live").strip()
+    if STT_MODE not in ("batch", "live") or not re.fullmatch(r"[A-Za-z0-9._-]+", GEMINI_LIVE_MODEL):
+        raise ValueError("Use OMI_STT_MODE=live or batch and a valid Live model ID")
     if not re.fullmatch(r"[A-Za-z0-9._-]+", GEMINI_STT_MODEL):
         raise ValueError("OMI_GEMINI_STT_MODEL must be a model ID")
     GEMINI_THINKING_LEVEL = env.get("OMI_GEMINI_THINKING_LEVEL", "low").strip().lower()
@@ -229,6 +237,9 @@ class BridgeState:
     rolling_research_buffer: deque = field(default_factory=lambda: deque(maxlen=1000))
     last_research_time: float = field(default_factory=lambda: time.monotonic())
     live_listeners: dict = field(default_factory=dict)
+    caption_listeners: dict = field(default_factory=dict)
+    recent_events: deque = field(default_factory=lambda: deque(maxlen=200))
+    stream_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     background_tasks: dict = field(default_factory=dict)
     http_session: aiohttp.ClientSession | None = None
     stopping: bool = False
@@ -236,8 +247,11 @@ class BridgeState:
     pending_webhooks: deque = field(default_factory=deque)
     pending_windows: dict = field(default_factory=dict)
     active_window: AudioWindow | None = None
+    live_stt: object = None
+    partial_caption: dict | None = None
     latency_samples: dict = field(default_factory=lambda: {
-        name: deque(maxlen=128) for name in ("receipt_to_transcript_sec", "gemini_request_duration_sec")})
+        name: deque(maxlen=128) for name in ("receipt_to_transcript_sec", "gemini_request_duration_sec",
+                                           "receipt_to_first_partial_sec", "receipt_to_final_sec")})
 
 
 state = BridgeState()
@@ -257,6 +271,9 @@ def latency_summary(samples):
 
 
 def oldest_pending_audio_age(now):
+    if state.live_stt is not None:
+        age = state.live_stt.pending_age
+        return round(age, 3) if age is not None else None
     # Receipt marks survive partial slicing/trimming; playback history is not pending work.
     starts = [session.receipts[0][2] for session in state.audio_sessions
               if session.pcm and session.receipts]
@@ -337,6 +354,137 @@ def broadcast(message):
             queue.put_nowait(None)
 
 
+@dataclass
+class CaptionListener:
+    queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=64))
+    ready: asyncio.Event = field(default_factory=asyncio.Event)
+    status: dict | None = None
+    partial: dict | None = None
+    closed: bool = False
+
+
+def publish_caption(event):
+    identity = event.get("utterance_id")
+    clear = event.get("type") == "gap" or (state.partial_caption is not None
+        and identity == state.partial_caption.get("utterance_id"))
+    if clear:
+        state.partial_caption = None
+    for listener in list(state.caption_listeners.values()):
+        if clear:
+            listener.partial = None
+        try:
+            listener.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            listener.closed = True  # Reconnect can replay retained events.
+        listener.ready.set()
+
+
+def publish_partial(event):
+    """Coalesce disposable hypotheses; never send them to logs, replay, notes or Hermes."""
+    event = {**event, "stream_id": state.stream_id}
+    if (not event.get("text") and state.partial_caption is not None
+            and event.get("utterance_id") != state.partial_caption.get("utterance_id")):
+        return
+    state.partial_caption = event if event.get("text") else None
+    for listener in list(state.caption_listeners.values()):
+        listener.partial = event
+        listener.ready.set()
+    broadcast(json.dumps(event))
+
+
+def record_live_final(text, **timing):
+    state.metrics["last_stt_success_at"] = time.monotonic()
+    state.metrics["windows_processed"] += 1
+    state.metrics["last_error"] = None
+    state.metrics["last_outcome"] = "speech"
+    saved = record_transcript_line(text, **timing)
+    if saved is not False:
+        state.metrics["last_transcript_at"] = time.monotonic()
+        state.metrics["transcripts_emitted"] += 1
+    return saved
+
+
+def record_live_gap(reason, seconds, **timing):
+    state.metrics["windows_dropped"] += 1
+    if reason == "queue_evicted":
+        state.metrics["windows_evicted"] += 1
+    record_gap(reason, seconds, **timing)
+
+
+def live_connection_changed(connected, error):
+    state.metrics["last_error"] = None if connected else "Gemini Live: " + str(error)
+    logger.info("Gemini Live %s", "connected" if connected else "reconnecting (" + str(error) + ")")
+
+
+def current_stt_in_flight():
+    return state.live_stt.speech_pending if state.live_stt is not None else state.metrics["stt_in_flight"]
+
+
+def caption_status():
+    now = time.monotonic()
+    packet = state.metrics["last_packet_at"]
+    age = max(0, now - packet) if packet is not None else None
+    session = state.current_session
+    return {"type": "status", "stream_id": state.stream_id,
+            "session_id": state.live_stt.session_id if state.live_stt is not None else session.session_id if session else None,
+            "stt_mode": "live" if state.live_stt is not None else "batch",
+            "stream_connected": state.live_stt.connected if state.live_stt is not None else None,
+            "audio_active": age is not None and age < 3,
+            "last_packet_age_sec": round(age, 1) if age is not None else None,
+            "buffer_sec": round(buffered_audio_bytes() / BYTES_PER_SECOND, 1),
+            "core_window_sec": 0 if state.live_stt is not None else CORE_WINDOW_SEC,
+            "stt_in_flight": current_stt_in_flight(),
+            "queue_depth": len(state.live_stt.queue) if state.live_stt is not None else state.stt_queue.qsize() if state.stt_queue is not None else 0}
+
+
+async def caption_status_worker():
+    previous = None
+    while True:
+        status = caption_status()
+        signature = tuple((k, v) for k, v in status.items() if k != "last_packet_age_sec")
+        busy = status["stt_in_flight"] or status["buffer_sec"] or status["queue_depth"]
+        if signature != previous or busy:
+            for listener in state.caption_listeners.values():
+                listener.status = status  # Replace ephemeral status; never displace a caption.
+                listener.ready.set()
+            previous = signature
+        await asyncio.sleep(1)
+
+
+def seed_recent_events():
+    """Bounded startup reads, including rotation backups; malformed lines are skipped."""
+    events, seen = [], set()
+    for suffix in ("", ".1", ".2", ".3"):
+        try:
+            with open(os.path.join(LOG_DIR, "omi_transcript_events.jsonl") + suffix, "rb") as stream:
+                size = stream.seek(0, os.SEEK_END)
+                stream.seek(max(0, size - 1024 * 1024))
+                if stream.tell():
+                    stream.readline()
+                lines = stream.read().splitlines()
+        except OSError:
+            continue
+        for line in reversed(lines):
+            try:
+                event = json.loads(line)
+            except (ValueError, UnicodeError):
+                continue
+            if not isinstance(event, dict) or event.get("type", "transcript") not in ("transcript", "gap") or not isinstance(event.get("text"), str):
+                continue
+            event.setdefault("type", "transcript")
+            identity = event.get("event_id")
+            if not isinstance(identity, str) or not identity:
+                event["event_id"] = identity = "legacy-" + hashlib.sha256(line).hexdigest()
+            if identity not in seen:
+                events.append(event)
+                seen.add(identity)
+            if len(events) == 200:
+                break
+        if len(events) == 200:
+            break
+    state.recent_events = deque(reversed(events), maxlen=200)
+
+
 class DailyNotes:
     """A paragraph projection; persist each update so restart does not lose a partial paragraph."""
 
@@ -404,6 +552,8 @@ def write_event(event):
     except Exception as error:
         output_failed("jsonl", error)
         return False
+    state.recent_events.append(dict(event))
+    publish_caption(event)
     timestamp, text = event["timestamp"], event["text"]
     errors_before = state.metrics["output_errors"]
     try:
@@ -428,14 +578,17 @@ def write_event(event):
 
 
 def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=None,
-               session_id=None, sample_offset=None):
+               session_id=None, sample_offset=None, utterance_id=None):
     processed_at = time.time() if processed_at is None else processed_at
     source_at = audio_start_at if audio_start_at is not None else processed_at
-    return {"event_id": uuid.uuid4().hex, "type": kind,
+    event = {"event_id": uuid.uuid4().hex, "stream_id": state.stream_id, "type": kind,
             "timestamp": datetime.fromtimestamp(source_at).strftime("%Y-%m-%d %H:%M:%S"),
             "text": text, "audio_start_at": audio_start_at, "received_at": received_at,
             "processed_at": processed_at, "session_id": session_id, "sample_offset": sample_offset,
             "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time"}
+    if utterance_id is not None:
+        event.update(utterance_id=utterance_id, is_final=True, transcription_mode="live")
+    return event
 
 
 def record_gap(reason, seconds, *, session_id=None, sample_offset=None, audio_start_at=None,
@@ -787,6 +940,8 @@ async def stt_consumer_worker():
 
 
 def buffered_audio_bytes():
+    if state.live_stt is not None:
+        return state.live_stt.pending_bytes
     return sum(len(session.pcm) for session in state.audio_sessions)
 
 
@@ -808,6 +963,11 @@ def ingest_raw_pcm(raw, sr=SAMPLE_RATE):
         state.audio_ring_bytes -= remove
         if remove < len(old):
             state.audio_ring.appendleft((stamp, old_sr, old[remove:]))
+    state.metrics["last_packet_at"] = now
+    if state.live_stt is not None:
+        state.live_stt.feed(raw, received_at, now)
+        broadcast(raw)
+        return
     if state.current_session is None or state.current_session.closed or now - state.current_session.last_packet_at > IDLE_FLUSH_SEC:
         if state.current_session:
             state.current_session.closed = True
@@ -935,13 +1095,20 @@ async def research_worker():
 def build_health_dict():
     now = time.monotonic()
     workers_alive = bool(state.background_tasks) and all(not task.done() for task in state.background_tasks.values())
-    overloaded = state.stt_queue is not None and state.stt_queue.full()
+    overloaded = (state.live_stt.pending_bytes >= BYTES_PER_SECOND * 10 or len(state.live_stt.queue) >= 256
+                  if state.live_stt is not None else state.stt_queue is not None and state.stt_queue.full())
     return {
-        "status": "ok" if GEMINI_API_KEY and workers_alive and not state.stopping and not overloaded and not state.metrics["last_error"] and not state.metrics["last_output_error"] else "degraded",
+        "status": "ok" if GEMINI_API_KEY and workers_alive and not state.stopping and not overloaded and not state.metrics["last_error"] and not state.metrics["last_output_error"] and (state.live_stt is None or state.live_stt.connected) else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
-        "gemini_key_configured": bool(GEMINI_API_KEY), "model": GEMINI_STT_MODEL,
+        "gemini_key_configured": bool(GEMINI_API_KEY),
+        "stt_mode": "live" if state.live_stt is not None else "batch",
+        "model": GEMINI_LIVE_MODEL if state.live_stt is not None else GEMINI_STT_MODEL,
+        "stream_connected": state.live_stt.connected if state.live_stt is not None else None,
+        "stream_reconnects": state.live_stt.reconnects if state.live_stt is not None else 0,
+        "partial_updates": state.live_stt.partial_updates if state.live_stt is not None else 0,
+        "stt_in_flight": current_stt_in_flight(),
         "thinking_level": GEMINI_THINKING_LEVEL,
-        "core_window_sec": CORE_WINDOW_SEC, "window_deadline_sec": WINDOW_DEADLINE_SEC,
+        "core_window_sec": 0 if state.live_stt is not None else CORE_WINDOW_SEC, "window_deadline_sec": WINDOW_DEADLINE_SEC,
         "max_window_age_sec": MAX_WINDOW_AGE_SEC,
         "latency": {name: latency_summary(samples) for name, samples in state.latency_samples.items()},
         "oldest_pending_audio_age_sec": oldest_pending_audio_age(now),
@@ -954,11 +1121,13 @@ def build_health_dict():
         "last_packet_age_sec": round(now - state.metrics["last_packet_at"], 1) if state.metrics["last_packet_at"] is not None else None,
         "last_stt_success_age_sec": round(now - state.metrics["last_stt_success_at"], 1) if state.metrics["last_stt_success_at"] is not None else None,
         "last_transcript_age_sec": round(now - state.metrics["last_transcript_at"], 1) if state.metrics["last_transcript_at"] is not None else None,
-        "queue_depth": state.stt_queue.qsize() if state.stt_queue is not None else 0,
-        "queue_capacity": 24, "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
+        "queue_depth": len(state.live_stt.queue) if state.live_stt is not None else state.stt_queue.qsize() if state.stt_queue is not None else 0,
+        "queue_capacity": None if state.live_stt is not None else 24,
+        "queue_capacity_audio_sec": 10 if state.live_stt is not None else None,
+        "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
         "ring_buffer_sec": round(state.audio_ring_bytes / BYTES_PER_SECOND, 1),
         **{key: state.metrics[key] for key in ("windows_processed", "windows_retried", "windows_dropped",
-                                        "windows_skipped", "windows_evicted", "buffer_bytes_evicted", "packets_rejected", "stt_in_flight", "last_error",
+                                        "windows_skipped", "windows_evicted", "buffer_bytes_evicted", "packets_rejected", "last_error",
                                         "last_outcome", "transcripts_emitted", "windows_no_speech", "windows_blocked",
                                         "windows_truncated", "windows_invalid_response")},
     }
@@ -987,19 +1156,70 @@ async def handle_omi(request):
 
 
 async def handle_listen_ws(request):
+    mode = request.query.get("mode", "audio")
+    if mode not in ("audio", "captions"):
+        raise web.HTTPBadRequest(text="mode must be audio or captions")
+    try:
+        count = int(request.query.get("replay", "100" if mode == "captions" else "0"))
+    except ValueError:
+        raise web.HTTPBadRequest(text="replay must be an integer from 0 to 200")
+    if not 0 <= count <= 200:
+        raise web.HTTPBadRequest(text="replay must be an integer from 0 to 200")
+    after = request.query.get("after")
+    if after is not None and len(after) > 128:
+        raise web.HTTPBadRequest(text="Invalid replay cursor")
     ws = web.WebSocketResponse(heartbeat=20)
     await ws.prepare(request)
-    queue = asyncio.Queue(maxsize=8)
-    state.live_listeners[ws] = queue
+    caption_mode = mode == "captions"
+    listener = CaptionListener() if caption_mode else None
+    queue = None if caption_mode else asyncio.Queue(maxsize=8)
+    # Snapshot and subscribe without an await: no hole between replay and live delivery.
+    replay, reset = [], False
+    if caption_mode:
+        history = list(state.recent_events)
+        if after:
+            index = next((i for i, event in enumerate(history) if event.get("event_id") == after), None)
+            reset = index is None
+            replay = history[index + 1:] if index is not None else (history[-count:] if count else [])
+        elif count:
+            replay = history[-count:]
+        listener.partial = dict(state.partial_caption) if state.partial_caption else None
+        state.caption_listeners[ws] = listener
+    else:
+        state.live_listeners[ws] = queue
+
+    async def send_json(event):
+        await asyncio.wait_for(ws.send_json(event), timeout=5)
 
     async def sender():
         try:
+            if caption_mode:
+                await send_json({"type": "replay", "phase": "start", "reset": reset, "count": len(replay)})
+                for event in replay:
+                    await send_json(event)
+                await send_json({"type": "replay", "phase": "end"})
+                listener.status = caption_status()
+                listener.ready.set()
             while True:
-                message = await queue.get()
-                if message is None:
-                    return
-                send = ws.send_bytes if isinstance(message, bytes) else ws.send_str
-                await asyncio.wait_for(send(message), timeout=5)
+                if caption_mode:
+                    await listener.ready.wait()
+                    listener.ready.clear()
+                    if listener.closed:
+                        return
+                    while not listener.queue.empty():
+                        await send_json(listener.queue.get_nowait())
+                    partial, listener.partial = listener.partial, None
+                    if partial is not None:
+                        await send_json(partial)
+                    status, listener.status = listener.status, None
+                    if status is not None:
+                        await send_json(status)
+                else:
+                    message = await queue.get()
+                    if message is None:
+                        return
+                    send = ws.send_bytes if isinstance(message, bytes) else ws.send_str
+                    await asyncio.wait_for(send(message), timeout=5)
         except (OSError, asyncio.TimeoutError):
             pass
         finally:
@@ -1011,6 +1231,7 @@ async def handle_listen_ws(request):
             pass
     finally:
         state.live_listeners.pop(ws, None)
+        state.caption_listeners.pop(ws, None)
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     return ws
@@ -1020,38 +1241,53 @@ async def on_startup(app):
     if not GEMINI_API_KEY:
         raise ValueError("Gemini API key is required")
     state.stt_queue = asyncio.Queue(maxsize=24)
+    seed_recent_events()
     state.daily_notes = DailyNotes(LOG_DIR)
     state.http_session = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10),
         connector=aiohttp.TCPConnector(limit=10, limit_per_host=4), cookie_jar=aiohttp.DummyCookieJar())
     state.stopping = False
     state.metrics["started_at"] = time.monotonic()
-    for name, factory in (("slicer_task", window_slicer_worker), ("stt_worker_task", stt_consumer_worker),
-                          ("research_task", research_worker)):
+    factories = [("research_task", research_worker), ("caption_status_task", caption_status_worker)]
+    if STT_MODE == "live":
+        from live_stt import GeminiLiveSTT
+        state.live_stt = GeminiLiveSTT(session=state.http_session, api_key=GEMINI_API_KEY,
+            model=GEMINI_LIVE_MODEL, on_partial=publish_partial, on_final=record_live_final,
+            on_gap=record_live_gap, on_latency=record_latency, on_connection=live_connection_changed,
+            max_age=MAX_WINDOW_AGE_SEC, idle_flush=IDLE_FLUSH_SEC, rms_threshold=RMS_SILENCE_THRESHOLD)
+        factories.append(("live_stt_task", state.live_stt.run))
+    else:
+        factories += [("slicer_task", window_slicer_worker), ("stt_worker_task", stt_consumer_worker)]
+    for name, factory in factories:
         app[name] = asyncio.create_task(factory())
         state.background_tasks[name] = app[name]
 
 
 async def on_shutdown(app):
     state.stopping = True
-    await asyncio.gather(*(ws.close() for ws in list(state.live_listeners)), return_exceptions=True)
+    await asyncio.gather(*(ws.close() for ws in list(state.live_listeners) + list(state.caption_listeners)), return_exceptions=True)
 
 
 async def on_cleanup(app):
     state.stopping = True
     logger.info("Shutdown: draining accepted audio and pending STT windows")
-    for name in ("slicer_task", "research_task"):
-        app[name].cancel()
-    await asyncio.gather(app["slicer_task"], app["research_task"], return_exceptions=True)
+    stop_tasks = [app[name] for name in ("slicer_task", "research_task", "caption_status_task") if name in app]
+    for task in stop_tasks:
+        task.cancel()
+    await asyncio.gather(*stop_tasks, return_exceptions=True)
     try:
-        worker = app["stt_worker_task"]
-        if worker.done():
-            await worker  # Surface a worker failure rather than hanging forever on queue.join().
-            raise RuntimeError("STT worker stopped before shutdown drain")
-        await flush_remaining_buffer()
-        await state.stt_queue.join()
-        await state.stt_queue.put(None)
-        await worker
+        if state.live_stt is not None:
+            await state.live_stt.close()
+            await app["live_stt_task"]
+        else:
+            worker = app["stt_worker_task"]
+            if worker.done():
+                await worker  # Surface a worker failure rather than hanging forever on queue.join().
+                raise RuntimeError("STT worker stopped before shutdown drain")
+            await flush_remaining_buffer()
+            await state.stt_queue.join()
+            await state.stt_queue.put(None)
+            await worker
         flush_daily_paragraph()
         queue_research_batch()
         # RAM retries cannot survive process exit. Bound best-effort shutdown delivery.
@@ -1069,6 +1305,9 @@ async def on_cleanup(app):
     finally:
         if state.http_session is not None:
             await state.http_session.close()
+            if state.live_stt is not None:
+                # aiohttp TLS transports finish closing after ClientSession.close().
+                await asyncio.sleep(.25)
             state.http_session = None
         state.background_tasks.clear()
 
@@ -1090,8 +1329,10 @@ def create_app(start_workers=True):
 
 
 def create_health_app():
-    app = web.Application()
+    app = web.Application(client_max_size=4096)
     app.router.add_get("/health", handle_health)
+    from edition_server import install
+    install(app, BASE_DIR)
     return app
 
 
