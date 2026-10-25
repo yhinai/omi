@@ -344,23 +344,30 @@ class GeminiLiveSTT:
                         old = self.spans.popleft()
                         if old.speech and old.end > self.covered_samples:
                             self.gap("failed", (old.end - max(old.start, self.covered_samples)) / RATE, old)
-                    # Finalize a continuous utterance around 3.5-4.5s when live (or 10-12s in unit mocks) so finals stay under 5s.
-                    low_cut = BPS * 3.5 if self.connected else BPS * 10
-                    max_cut = BPS * 4.5 if self.connected else BPS * 12
-                    if ((since_end > low_cut and rms < 500) or since_end >= max_cut) and (activity_open or self.speech_pending):
-                        await self._end_audio(ws, wait=True, active=activity_open)
-                        activity_open, since_end = False, 0
+                    # Finalize continuous speech at the lowest-energy micro-pause between 2.0s and 3.0s when live (10-12s in unit mocks).
+                    low_cut = BPS * 2.0 if self.connected else BPS * 10
+                    max_cut = BPS * 3.0 if self.connected else BPS * 12
+                    if since_end > low_cut and (activity_open or self.speech_pending):
+                        rem_rms = []
+                        for rpos in range(pos + FRAME_BYTES, min(len(packet.pcm), pos + int(max_cut - since_end) + FRAME_BYTES), FRAME_BYTES):
+                            rf = packet.pcm[rpos:rpos+FRAME_BYTES]
+                            if len(rf) >= 2:
+                                rem_rms.append(math.sqrt(sum(s[0] ** 2 for s in struct.iter_unpack("<h", rf)) / (len(rf) // 2)))
+                        is_local_min = rms < 550 and (not rem_rms or rms <= min(rem_rms) * 1.15)
+                        if is_local_min or since_end >= max_cut:
+                            await self._end_audio(ws, wait=True, active=activity_open)
+                            activity_open, since_end = False, 0
                 continue
             if self.stopping or self.rotating:
                 await self._end_audio(ws, active=activity_open)
                 return
             if (not idle_ended and self.last_packet_mono is not None
-                    and time.monotonic() - self.last_packet_mono > min(self.idle_flush, 1.2 if activity_open else self.idle_flush)):
+                    and time.monotonic() - self.last_packet_mono > min(self.idle_flush, 0.55 if activity_open else self.idle_flush)):
                 await self._end_audio(ws, wait=True, active=activity_open)
                 idle_ended, activity_open, since_end = True, False, 0
             self.wake.clear()
             try:
-                await asyncio.wait_for(self.wake.wait(), .2)
+                await asyncio.wait_for(self.wake.wait(), .04)
             except TimeoutError:
                 pass
 
