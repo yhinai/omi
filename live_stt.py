@@ -174,6 +174,10 @@ class GeminiLiveSTT:
 
     def _retire_ambient_spans(self, now):
         """When server VAD is active and no turn is open, frames older than 3s without ACTIVITY_START are ambient noise."""
+        if self.closing_turn is not None and self.closing_turn.last_activity_mono and now - self.closing_turn.last_activity_mono > 5.0:
+            end_bound = self.closing_turn.end_sample or self.closing_turn.closed_sample or self.flush_sample or self.sent_samples
+            self.covered_samples = max(self.covered_samples, end_bound)
+            self.closing_turn = None
         if not self.has_vad or self.turn is not None or self.closing_turn is not None:
             return
         cutoff_sample = self.sent_samples - RATE * 3
@@ -360,7 +364,11 @@ class GeminiLiveSTT:
             except TimeoutError:
                 pass
             if self.turn is not None and self.turn.closed_sample is not None:
-                self.closing_turn = self.turn
+                if self.turn.first_partial and not self.turn.finalized:
+                    self.closing_turn = self.turn
+                else:
+                    self.covered_samples = max(self.covered_samples,
+                        self.turn.end_sample or self.turn.closed_sample or self.flush_sample)
                 self.turn = None
 
     async def _send(self, ws):
