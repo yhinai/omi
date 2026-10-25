@@ -312,6 +312,8 @@ def rows_for(viewer, width):
               next((c.key for c in reversed(viewer.captions) if c.kind == "transcript"), None))
     draft_inlined = False
     for caption in viewer.captions:
+        if caption.kind == "gap":
+            continue
         offset, text = 0, caption.text
         inline_draft = bool(viewer.draft and caption is viewer.captions[-1]
                             and caption.kind == "transcript" and len(caption.words) < 150

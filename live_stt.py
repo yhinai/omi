@@ -135,9 +135,15 @@ class GeminiLiveSTT:
         if self.last_packet_mono is None or received_mono - self.last_packet_mono > self.idle_flush:
             self.session_id += 1
         self.last_packet_mono = received_mono
-        packet = Packet(raw, received_at, received_mono, self.total_input_samples, self.session_id)
+        if (self.queue and self.queue[-1].session_id == self.session_id
+                and len(self.queue[-1].pcm) + len(raw) <= FRAME_BYTES):
+            tail = self.queue[-1]
+            tail.pcm = tail.pcm + raw
+            tail.received_at = received_at
+        else:
+            packet = Packet(raw, received_at, received_mono, self.total_input_samples, self.session_id)
+            self.queue.append(packet)
         self.total_input_samples += len(raw) // 2
-        self.queue.append(packet)
         self.pending_bytes += len(raw)
         self._bound_queue()
         self.wake.set()
@@ -388,8 +394,17 @@ class GeminiLiveSTT:
                 if (self.turn is not None and not self.turn.finalized) or (self.closing_turn is not None and not self.closing_turn.finalized):
                     raise TimeoutError("Gemini Live turn stalled after 15s")
             if self.queue:
+                if (self.connected and len(self.queue) == 1 and len(self.queue[0].pcm) < FRAME_BYTES
+                        and not self.stopping and not self.flush_requested):
+                    await asyncio.sleep(0.04)
                 packet = self.queue.popleft()
                 self.pending_bytes -= len(packet.pcm)
+                while (self.queue and self.queue[0].session_id == packet.session_id
+                       and len(packet.pcm) + len(self.queue[0].pcm) <= FRAME_BYTES):
+                    nxt = self.queue.popleft()
+                    self.pending_bytes -= len(nxt.pcm)
+                    packet.pcm = packet.pcm + nxt.pcm
+                    packet.received_at = nxt.received_at
                 if not self.stopping and time.monotonic() - packet.received_mono > self.max_age:
                     self.gap("stale", len(packet.pcm) / BPS, packet)
                     continue
