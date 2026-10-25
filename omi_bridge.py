@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 import io
 import hashlib
+import hmac
 import json
 import logging
 from logging.handlers import RotatingFileHandler
@@ -59,6 +60,8 @@ IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD = 8.0, 80.0
 RING_BUFFER_SECONDS = 300
 HOST = "0.0.0.0"
 PORT, HEALTH_PORT = 8787, 8788
+STREAM_TOKEN = ""
+DISABLE_WEBHOOK = False
 logger = logging.getLogger("omi_bridge")
 transcript_logger = logging.getLogger("omi_transcript")
 event_logger = logging.getLogger("omi_transcript_events")
@@ -102,8 +105,11 @@ def configure(env=None):
     global WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC
     global GEMINI_API_KEY, GEMINI_STT_MODEL, GEMINI_THINKING_LEVEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
     global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, HOST, PORT, HEALTH_PORT
+    global STREAM_TOKEN, DISABLE_WEBHOOK
     env = _load_dotenv() if env is None else env
     HOST = (env.get("OMI_HOST") or "0.0.0.0").strip()
+    STREAM_TOKEN = (env.get("OMI_STREAM_TOKEN") or "").strip()
+    DISABLE_WEBHOOK = (env.get("OMI_DISABLE_WEBHOOK") or "").strip().lower() in ("1", "true", "yes")
     GEMINI_API_KEY = (env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip()
     if not GEMINI_API_KEY or GEMINI_API_KEY.lower() in ("your_gemini_api_key_here", "your_api_key_here"):
         raise ValueError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in ~/omi/.env or the environment")
@@ -214,6 +220,8 @@ def new_metrics():
         "lost_audio_sec_queue_evicted": 0.0, "lost_audio_sec_buffer_evicted": 0.0,
         "output_errors": 0, "last_output_error": None,
         "windows_no_speech": 0, "windows_blocked": 0, "windows_truncated": 0, "windows_invalid_response": 0,
+        "audio_source": None, "direct_ws_remote": None, "direct_ws_packets": 0,
+        "webhook_packets_ignored": 0, "last_direct_ws_at": None,
     }
 
 
@@ -492,7 +500,17 @@ def write_event(event):
     publish_caption(event)
     broadcast(encoded)
     if event.get("type") == "transcript" and event.get("text"):
-        reply = json.dumps({"text": event["text"]}, ensure_ascii=False)
+        text_val = event["text"]
+        seg = {"text": text_val, "start": 0.0, "end": 2.0, "speaker": "SPEAKER_0", "speaker_id": 0, "is_user": False}
+        words = [{"word": w, "punctuated_word": w, "start": 0.0, "end": 0.1, "speaker": 0} for w in text_val.split()]
+        reply = json.dumps({
+            "type": "Results",
+            "is_final": True,
+            "speech_final": True,
+            "text": text_val,
+            "segments": [seg],
+            "channel": {"alternatives": [{"transcript": text_val, "words": words}]},
+        }, ensure_ascii=False)
         for ws_client, q in list(state.stream_clients.items()):
             try:
                 q.put_nowait(reply)
@@ -553,7 +571,7 @@ def record_window_gap(reason, window):
 
 
 def record_transcript_line(text, **timing):
-    text = " ".join(text.split()).strip()
+    text = re.sub(r"(?<![A-Z])([.?!])([A-Z])", r"\1 \2", " ".join(text.split()).strip())
     if not text:
         return False
     event = make_event("transcript", text, **timing)
@@ -1056,11 +1074,38 @@ def build_health_dict():
         "queue_capacity_audio_sec": 10 if state.live_stt is not None else None,
         "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
         "ring_buffer_sec": round(state.audio_ring_bytes / BYTES_PER_SECOND, 1),
+        "direct_ws_connected": bool(state.stream_clients),
         **{key: state.metrics[key] for key in ("windows_processed", "windows_retried", "windows_dropped",
                                         "windows_skipped", "windows_evicted", "buffer_bytes_evicted", "packets_rejected", "last_error",
                                         "last_outcome", "transcripts_emitted", "windows_no_speech", "windows_blocked",
-                                        "windows_truncated", "windows_invalid_response")},
+                                        "windows_truncated", "windows_invalid_response",
+                                        "audio_source", "direct_ws_remote", "direct_ws_packets", "webhook_packets_ignored")},
     }
+
+
+def _extract_stream_token(request):
+    auth = request.headers.get("Authorization", "").strip()
+    if auth:
+        parts = auth.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() in ("bearer", "token", "key"):
+            return parts[1].strip()
+        return auth
+    return (request.headers.get("X-Omi-Token") or request.query.get("token") or request.query.get("key") or "").strip()
+
+
+def _verify_stream_auth(request):
+    if not STREAM_TOKEN:
+        return
+    candidate = _extract_stream_token(request)
+    if not candidate or not hmac.compare_digest(candidate, STREAM_TOKEN):
+        raise web.HTTPUnauthorized(text="Valid stream token required")
+
+
+def _client_remote(request):
+    return (request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+            or request.remote
+            or "unknown")
 
 
 async def handle_health(request):
@@ -1072,16 +1117,27 @@ async def handle_omi_ws(request):
     """Direct phone-to-bridge WebSocket PCM16 streaming adapter (Omi Custom Live STT compatible)."""
     if state.stopping:
         raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
+    _verify_stream_auth(request)
+    if state.stream_clients:
+        raise web.HTTPConflict(text="Another direct audio stream is already active")
+    encoding = request.query.get("encoding", "linear16").strip().lower()
+    if encoding not in ("linear16", "pcm16", "pcm", ""):
+        raise web.HTTPBadRequest(text="encoding must be linear16 or pcm16")
     try:
         sr = int(request.query.get("sample_rate", "16000"))
+        channels = int(request.query.get("channels", "1"))
     except ValueError:
-        raise web.HTTPBadRequest(text="sample_rate must be 16000")
-    if sr != SAMPLE_RATE:
-        raise web.HTTPBadRequest(text="sample_rate must be 16000")
+        raise web.HTTPBadRequest(text="sample_rate=16000 and channels=1 required")
+    if sr != SAMPLE_RATE or channels != 1:
+        raise web.HTTPBadRequest(text="sample_rate=16000 and channels=1 required")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=BYTES_PER_SECOND * RING_BUFFER_SECONDS + 1)
     await ws.prepare(request)
     queue = asyncio.Queue(maxsize=32)
     state.stream_clients[ws] = queue
+    remote_ip = _client_remote(request)
+    state.metrics["direct_ws_remote"] = remote_ip
+    state.metrics["audio_source"] = "direct_ws"
+    logger.info("Direct phone WebSocket connected from %s", remote_ip)
 
     async def sender():
         try:
@@ -1101,6 +1157,9 @@ async def handle_omi_ws(request):
                 if raw.startswith(b"RIFF") or len(raw) % 2:
                     await ws.close(code=1003, message=b"Expected raw 16000 Hz mono PCM16")
                     break
+                state.metrics["direct_ws_packets"] += 1
+                state.metrics["last_direct_ws_at"] = time.monotonic()
+                state.metrics["audio_source"] = "direct_ws"
                 ingest_raw_pcm(raw, sr)
             elif message.type == aiohttp.WSMsgType.TEXT:
                 try:
@@ -1117,6 +1176,7 @@ async def handle_omi_ws(request):
                 break
     finally:
         state.stream_clients.pop(ws, None)
+        logger.info("Direct phone WebSocket disconnected from %s", remote_ip)
         try:
             queue.put_nowait(None)
             await asyncio.wait_for(task, timeout=1.0)
@@ -1142,6 +1202,11 @@ async def handle_omi(request):
     raw = await request.read()
     if raw.startswith(b"RIFF"):
         raise web.HTTPUnsupportedMediaType(text="Send raw PCM16, without a WAV header")
+    last_ws = state.metrics.get("last_direct_ws_at")
+    if DISABLE_WEBHOOK or state.stream_clients or (last_ws is not None and time.monotonic() - last_ws < 10.0):
+        state.metrics["webhook_packets_ignored"] += 1
+        return web.json_response({"status": "ok", "is_setup_completed": True, "message": "ignored_duplicate_webhook"})
+    state.metrics["audio_source"] = "webhook_post"
     ingest_raw_pcm(raw, sr)
     return web.json_response({"status": "ok", "is_setup_completed": True, "message": ""})
 
@@ -1298,6 +1363,7 @@ def create_app(start_workers=True):
     app.router.add_get("/omi", handle_omi)
     app.router.add_post("/omi", handle_omi)
     app.router.add_get("/omi/ws", handle_omi_ws)
+    app.router.add_get("/v1/listen", handle_omi_ws)
     app.router.add_get("/listen-ws", handle_listen_ws)
     app.router.add_get("/audio/last", handle_audio_last)
     if start_workers:

@@ -172,13 +172,23 @@ class GeminiLiveSTT:
                 self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=time.monotonic())
         return self.turn
 
+    def _expire_closing_turn(self, *, expired=True):
+        if self.closing_turn is None:
+            return
+        ct = self.closing_turn
+        end_bound = ct.end_sample or ct.closed_sample or self.flush_sample or self.sent_samples
+        if not ct.finalized and (expired or ct.first_partial):
+            duration = max(0, end_bound - max(self.covered_samples, ct.span.start)) / RATE
+            self.gap("failed", duration, ct.span)
+            self.on_partial({"type": "partial", "utterance_id": ct.identity, "text": ""})
+        self.covered_samples = max(self.covered_samples, end_bound)
+        self.closing_turn = None
+
     def _retire_ambient_spans(self, now):
-        """When server VAD or explicit live framing is active and no turn is open, frames older than 3s are ambient noise."""
+        """Retire expired closing turns with a gap; when server VAD is active and no turn is open, retire 3s-old pre-VAD noise."""
         if self.closing_turn is not None and self.closing_turn.last_activity_mono and now - self.closing_turn.last_activity_mono > 5.0:
-            end_bound = self.closing_turn.end_sample or self.closing_turn.closed_sample or self.flush_sample or self.sent_samples
-            self.covered_samples = max(self.covered_samples, end_bound)
-            self.closing_turn = None
-        if (not self.has_vad and not self.connected) or self.turn is not None or self.closing_turn is not None:
+            self._expire_closing_turn()
+        if not self.has_vad or self.turn is not None or self.closing_turn is not None:
             return
         cutoff_sample = self.sent_samples - RATE * 3
         for span in self.spans:
@@ -246,7 +256,8 @@ class GeminiLiveSTT:
             raise ValueError("Malformed Gemini Live content")
         interim = content.get("interimInputTranscription")
         if isinstance(interim, dict) and isinstance(interim.get("text"), str) and interim["text"].strip():
-            turn = self._turn()
+            turn = (self.closing_turn if (self.turn is None and self.closing_turn is not None and not self.closing_turn.finalized)
+                    else self._turn())
             if turn is not None and not turn.finalized:
                 turn.last_activity_mono = now
                 if not turn.first_partial:
@@ -289,14 +300,7 @@ class GeminiLiveSTT:
                     self.flushed.set()
         if content.get("generationComplete"):
             if self.closing_turn is not None:
-                ct = self.closing_turn
-                end_bound = ct.end_sample or ct.closed_sample or self.flush_sample or self.sent_samples
-                if not ct.finalized and ct.first_partial:
-                    duration = max(0, end_bound - max(self.covered_samples, ct.span.start)) / RATE
-                    self.gap("failed", duration, ct.span)
-                    self.on_partial({"type": "partial", "utterance_id": ct.identity, "text": ""})
-                self.covered_samples = max(self.covered_samples, end_bound)
-                self.closing_turn = None
+                self._expire_closing_turn(expired=False)
                 self.flushed.set()
             else:
                 if self.turn is not None and self.turn.finalized:
@@ -360,11 +364,12 @@ class GeminiLiveSTT:
         if wait and self.connected:
             has_words = self.turn is not None and self.turn.first_partial and not self.turn.finalized
             try:
-                await asyncio.wait_for(self.flushed.wait(), 2.0 if has_words else 0.25)
+                await asyncio.wait_for(self.flushed.wait(), 2.0 if has_words else 0.5)
             except TimeoutError:
                 pass
             if self.turn is not None and self.turn.closed_sample is not None:
-                if self.turn.first_partial and not self.turn.finalized:
+                if not self.turn.finalized:
+                    self._expire_closing_turn()
                     self.closing_turn = self.turn
                 else:
                     self.covered_samples = max(self.covered_samples,
@@ -395,27 +400,31 @@ class GeminiLiveSTT:
                     frame = packet.pcm[pos:pos+FRAME_BYTES]
                     n = len(frame) // 2
                     rms = math.sqrt(sum(sample[0] ** 2 for sample in struct.iter_unpack("<h", frame)) / n)
+                    speech_floor = max(self.rms_threshold, 220) if self.connected else self.rms_threshold
                     span = Span(self.sent_samples, self.sent_samples + n, packet.received_at,
                         packet.received_mono, packet.received_at - (len(packet.pcm) - pos) / BPS,
-                        packet.sample_offset + pos // 2, packet.session_id, rms >= self.rms_threshold)
-                    self.spans.append(span)
-                    self.sent_samples += n
+                        packet.sample_offset + pos // 2, packet.session_id, rms >= speech_floor)
+                    frame_sent = False
                     try:
                         self.end_sent = False
-                        if self.connected and not activity_open and span.speech and rms >= max(self.rms_threshold, 220):
+                        if self.connected and not activity_open and span.speech and rms >= speech_floor:
                             self.covered_samples = max(self.covered_samples, span.start)
                             if self.turn is None:
                                 self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=time.monotonic())
                             await asyncio.wait_for(ws.send_json({"realtimeInput": {"activityStart": {}}}), 5)
                             activity_open = True
+                        self.spans.append(span)
+                        self.sent_samples += n
+                        frame_sent = True
                         await asyncio.wait_for(ws.send_json({"realtimeInput": {"audio": {
                             "data": base64.b64encode(frame).decode("ascii"), "mimeType": "audio/pcm;rate=16000"}}}), 5)
                     except BaseException:
-                        # The attempted frame is uncertain; the unsent suffix can safely retry.
-                        remaining = packet.pcm[pos+len(frame):]
+                        # If failed before audio send, retry this frame too; otherwise retry the unsent suffix.
+                        retry_pos = (pos + len(frame)) if frame_sent else pos
+                        remaining = packet.pcm[retry_pos:]
                         if remaining:
                             self.queue.appendleft(Packet(remaining, packet.received_at, packet.received_mono,
-                                                         packet.sample_offset + (pos+len(frame)) // 2, packet.session_id))
+                                                         packet.sample_offset + retry_pos // 2, packet.session_id))
                             self.pending_bytes += len(remaining)
                             self._bound_queue()
                         raise

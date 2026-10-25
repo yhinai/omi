@@ -84,7 +84,6 @@ class Caption:
     show_stamp: bool = False
     soft_from: int = 0
     soft_until: float = 0
-    hidden: bool = False
 
     @property
     def text(self):
@@ -214,12 +213,10 @@ class Viewer:
             self.last_event_id = identity
         for caption in self.captions:
             caption.soft_until = 0
-        hide_gap = False
         if kind == "gap":
             duration = event.get("duration_sec")
             if isinstance(duration, (int, float)) and not isinstance(duration, bool) and 0 < duration < 86400:
                 text = f"{duration:.1f} seconds unavailable."
-                hide_gap = True
         stamp = clean(event.get("timestamp", ""))
         stamp = stamp[11:19] if len(stamp) >= 19 else datetime.now().strftime("%H:%M:%S")
         source = event.get("audio_start_at")
@@ -247,7 +244,7 @@ class Viewer:
                     or (session is not None and previous.session != session)
                     or (source is not None and (self.last_stamp_at is None or source - self.last_stamp_at >= 180))))
                 self.next_key += 1
-                previous = Caption(self.next_key, stamp, [], kind, session, source, meaningful, hidden=hide_gap)
+                previous = Caption(self.next_key, stamp, [], kind, session, source, meaningful)
                 self.captions.append(previous)
                 if meaningful:
                     self.last_stamp_at = source
@@ -315,8 +312,6 @@ def rows_for(viewer, width):
               next((c.key for c in reversed(viewer.captions) if c.kind == "transcript"), None))
     draft_inlined = False
     for caption in viewer.captions:
-        if caption.hidden:
-            continue
         offset, text = 0, caption.text
         inline_draft = bool(viewer.draft and caption is viewer.captions[-1]
                             and caption.kind == "transcript" and len(caption.words) < 150

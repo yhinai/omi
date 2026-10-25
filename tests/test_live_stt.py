@@ -218,6 +218,20 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stream.on_final.call_args.kwargs["utterance_id"], "turn-2")
         stream.on_gap.assert_not_called()
 
+    def test_expired_closing_turn_emits_gap_and_clears_partial_instead_of_silent_discard(self):
+        stream = self.make()
+        s1 = live.Span(0, 32000, 1000, 100.0, 998.0, 0, 1, True)
+        stream.spans.append(s1)
+        stream.sent_samples = 32000
+        stream.closing_turn = live.Turn("unfinished-turn", s1, first_partial=True,
+                                        last_activity_mono=100.0, closed_sample=32000)
+        stream._retire_ambient_spans(106.0)
+        self.assertIsNone(stream.closing_turn)
+        self.assertEqual(stream.covered_samples, 32000)
+        stream.on_gap.assert_called_once()
+        self.assertEqual(stream.on_gap.call_args.args[:2], ("failed", 2.0))
+        stream.on_partial.assert_called_with({"type": "partial", "utterance_id": "unfinished-turn", "text": ""})
+
     async def test_connection_loss_reconnects_with_fresh_audio_and_records_unfinalized_gap(self):
         ready, first, final, disconnected = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
         connections = []

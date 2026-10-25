@@ -782,17 +782,38 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_direct_phone_websocket_adapter_ingests_pcm_and_returns_transcripts(self):
         client = await self.client_for(bridge.create_app(start_workers=False))
-        for bad_url in ("/omi/ws?sample_rate=44100", "/omi/ws?sample_rate=bad"):
+        for bad_url in ("/omi/ws?sample_rate=44100", "/omi/ws?sample_rate=bad",
+                        "/v1/listen?encoding=opus", "/v1/listen?channels=2"):
             resp = await client.get(bad_url)
             self.assertEqual(resp.status, 400)
-        async with client.ws_connect("/omi") as ws:
-            await ws.send_str(json.dumps({"type": "KeepAlive"}))
-            await ws.send_bytes(SPEECH)
-            with mock.patch.object(bridge, "event_logger"), mock.patch.object(bridge, "transcript_logger"):
-                bridge.record_transcript_line("Direct phone transcript.")
-            msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
-            self.assertEqual(msg, {"text": "Direct phone transcript."})
-            await ws.send_str(json.dumps({"type": "CloseStream"}))
+        with mock.patch.object(bridge, "STREAM_TOKEN", "secret-token"):
+            unauth = await client.get("/omi/ws")
+            self.assertEqual(unauth.status, 401)
+            wrong = await client.get("/omi/ws", headers={"Authorization": "Token wrong"})
+            self.assertEqual(wrong.status, 401)
+            async with client.ws_connect("/v1/listen?encoding=linear16&sample_rate=16000&channels=1",
+                                         headers={"Authorization": "Token secret-token",
+                                                  "X-Forwarded-For": "192.168.68.71"}) as ws:
+                conflict = await client.get("/omi/ws", headers={"Authorization": "Bearer secret-token"})
+                self.assertEqual(conflict.status, 409)
+                await ws.send_str(json.dumps({"type": "KeepAlive"}))
+                await ws.send_bytes(SPEECH)
+                # Duplicate webhook POST is suppressed while direct WebSocket is active.
+                dup = await client.post("/omi", data=SPEECH, headers={"Content-Type": "application/octet-stream"})
+                self.assertEqual(dup.status, 200)
+                self.assertEqual((await dup.json())["message"], "ignored_duplicate_webhook")
+                self.assertEqual(bridge.state.metrics["webhook_packets_ignored"], 1)
+                self.assertEqual(bridge.state.metrics["audio_source"], "direct_ws")
+                self.assertEqual(bridge.state.metrics["direct_ws_remote"], "192.168.68.71")
+                with mock.patch.object(bridge, "event_logger"), mock.patch.object(bridge, "transcript_logger"):
+                    bridge.record_transcript_line("Direct phone transcript.Second sentence.")
+                msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
+                self.assertEqual(msg["text"], "Direct phone transcript. Second sentence.")
+                self.assertEqual(msg["segments"][0]["text"], "Direct phone transcript. Second sentence.")
+                self.assertEqual(msg["channel"]["alternatives"][0]["transcript"],
+                                 "Direct phone transcript. Second sentence.")
+                await ws.send_str(json.dumps({"type": "CloseStream"}))
+        self.assertEqual(len(bridge.state.audio_ring), 1)
         self.assertEqual(bridge.state.audio_ring[-1][2], SPEECH)
 
 
