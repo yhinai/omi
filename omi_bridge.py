@@ -1109,7 +1109,7 @@ async def handle_omi_ws(request):
                     continue
                 if isinstance(ctrl, dict) and ctrl.get("type") == "CloseStream":
                     if state.live_stt is not None:
-                        state.live_stt.request_flush()
+                        await state.live_stt.flush_now()
                     elif state.stt_queue is not None:
                         await flush_remaining_buffer()
                     break
@@ -1117,7 +1117,11 @@ async def handle_omi_ws(request):
                 break
     finally:
         state.stream_clients.pop(ws, None)
-        task.cancel()
+        try:
+            queue.put_nowait(None)
+            await asyncio.wait_for(task, timeout=1.0)
+        except (asyncio.QueueFull, asyncio.TimeoutError):
+            task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await ws.close()
     return ws

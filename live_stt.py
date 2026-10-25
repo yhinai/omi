@@ -96,6 +96,16 @@ class GeminiLiveSTT:
         self.flush_requested = True
         self.wake.set()
 
+    async def flush_now(self, timeout=2.5):
+        if not (self.queue or self.speech_pending):
+            return
+        self.flushed.clear()
+        self.request_flush()
+        try:
+            await asyncio.wait_for(self.flushed.wait(), timeout)
+        except TimeoutError:
+            pass
+
     @property
     def pending_age(self):
         starts = [self.queue[0].received_mono] if self.queue else []
@@ -266,10 +276,13 @@ class GeminiLiveSTT:
                         self.covered_samples = max(self.covered_samples,
                             turn.end_sample if turn.end_sample is not None else (turn.closed_sample or self.sent_samples))
                         self.closing_turn = None
+                    self.flushed.set()
                 elif turn.end_sample is not None or not self.has_vad:
                     self.covered_samples = max(self.covered_samples,
                         turn.end_sample if turn.end_sample is not None else self.sent_samples)
                     self.turn = None
+                if self.end_sent:
+                    self.flushed.set()
         if content.get("generationComplete"):
             if self.closing_turn is not None:
                 ct = self.closing_turn
