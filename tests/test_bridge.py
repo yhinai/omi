@@ -816,6 +816,17 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(bridge.state.audio_ring), 1)
         self.assertEqual(bridge.state.audio_ring[-1][2], SPEECH)
 
+    async def test_public_tui_and_live_curl_endpoints(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        sh_resp = await client.get("/tui", headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "mini.tail287a74.ts.net"})
+        self.assertEqual(sh_resp.status, 200)
+        sh_text = await sh_resp.text()
+        self.assertIn("https://mini.tail287a74.ts.net/tui.py", sh_text)
+        py_resp = await client.get("/tui.py", headers={"X-Forwarded-Proto": "https", "X-Forwarded-Host": "mini.tail287a74.ts.net"})
+        self.assertEqual(py_resp.status, 200)
+        py_text = await py_resp.text()
+        self.assertIn('default="wss://mini.tail287a74.ts.net/listen-ws"', py_text)
+
 
 class TimestampTests(unittest.TestCase):
     def test_audio_time_controls_midnight_notes_and_timing_metadata_is_retained(self):

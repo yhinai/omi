@@ -1300,6 +1300,164 @@ async def handle_listen_ws(request):
     return ws
 
 
+def _public_ws_url(request):
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip().lower()
+    host = request.headers.get("X-Forwarded-Host", request.host).split(",")[0].strip()
+    ws_scheme = "wss" if proto in ("https", "wss") or host.endswith((".ts.net", ".trycloudflare.com")) else "ws"
+    return f"{ws_scheme}://{host}/listen-ws"
+
+
+def _public_http_base(request):
+    proto = request.headers.get("X-Forwarded-Proto", request.scheme).split(",")[0].strip().lower()
+    host = request.headers.get("X-Forwarded-Host", request.host).split(",")[0].strip()
+    scheme = "https" if proto in ("https", "wss") or host.endswith((".ts.net", ".trycloudflare.com")) else "http"
+    return f"{scheme}://{host}"
+
+
+async def handle_listen_ndjson(request):
+    """Stdlib-compatible newline-delimited JSON caption stream for remote TUI clients without aiohttp."""
+    try:
+        count = int(request.query.get("replay", "100"))
+    except ValueError:
+        raise web.HTTPBadRequest(text="replay must be an integer from 0 to 200")
+    if not 0 <= count <= 200:
+        raise web.HTTPBadRequest(text="replay must be an integer from 0 to 200")
+    after = request.query.get("after")
+    if after is not None and len(after) > 128:
+        raise web.HTTPBadRequest(text="Invalid replay cursor")
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "application/x-ndjson; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+    })
+    await resp.prepare(request)
+    listener = CaptionListener()
+    history = list(state.recent_events)
+    reset = False
+    if after:
+        index = next((i for i, event in enumerate(history) if event.get("event_id") == after), None)
+        reset = index is None
+        replay = history[index + 1:] if index is not None else (history[-count:] if count else [])
+    elif count:
+        replay = history[-count:]
+    else:
+        replay = []
+    listener.partial = dict(state.partial_caption) if state.partial_caption else None
+    key = object()
+    state.caption_listeners[key] = listener
+
+    async def write_line(obj):
+        await resp.write((json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8"))
+
+    try:
+        await write_line({"type": "replay", "phase": "start", "reset": reset, "count": len(replay)})
+        for event in replay:
+            await write_line(event)
+        await write_line({"type": "replay", "phase": "end"})
+        listener.status = caption_status()
+        listener.ready.set()
+        while not state.stopping:
+            try:
+                await asyncio.wait_for(listener.ready.wait(), timeout=15.0)
+                listener.ready.clear()
+            except TimeoutError:
+                await resp.write(b"\n")
+                continue
+            if listener.closed or state.stopping:
+                break
+            while not listener.queue.empty():
+                await write_line(listener.queue.get_nowait())
+            partial, listener.partial = listener.partial, None
+            if partial is not None:
+                await write_line(partial)
+            status, listener.status = listener.status, None
+            if status is not None:
+                await write_line(status)
+    except (OSError, ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        state.caption_listeners.pop(key, None)
+    return resp
+
+
+async def handle_tui_py(request):
+    """Serve omi_tui.py pre-configured with this server's public WebSocket URL and remote Python compatibility."""
+    tui_path = os.path.join(BASE_DIR, "omi_tui.py")
+    with open(tui_path, encoding="utf-8") as f:
+        code = f.read()
+    ws_url = _public_ws_url(request)
+    code = code.replace('default="ws://127.0.0.1:8787/listen-ws"', f'default={json.dumps(ws_url)}')
+    code = code.replace('if sys.version_info[:2] != (3, 15) and not os.getenv("OMI_REMOTE_TUI"):',
+                        'if sys.version_info < (3, 10):')
+    return web.Response(text=code, content_type="text/x-python", charset="utf-8")
+
+
+async def handle_tui_sh(request):
+    """Serve a POSIX shell one-liner script so `curl -fsSL <url>/tui | sh` opens the interactive TUI anywhere."""
+    base = _public_http_base(request)
+    script = (
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'TMP_TUI="$(mktemp "${TMPDIR:-/tmp}/omi_tui.XXXXXX.py")"\n'
+        "trap 'rm -f \"$TMP_TUI\"' EXIT INT TERM\n"
+        f"curl -fsSL {shlex.quote(base + '/tui.py')} -o \"$TMP_TUI\"\n"
+        "export OMI_REMOTE_TUI=1\n"
+        "if [ -x \"$HOME/omi/.venv/bin/python3.15\" ]; then\n"
+        "  exec \"$HOME/omi/.venv/bin/python3.15\" \"$TMP_TUI\" \"$@\" </dev/tty\n"
+        "fi\n"
+        "exec python3 \"$TMP_TUI\" \"$@\" </dev/tty\n"
+    )
+    return web.Response(text=script, content_type="text/x-shellscript", charset="utf-8")
+
+
+async def handle_live_curl(request):
+    """Pure ANSI terminal stream for `curl -sN <url>/live` with zero Python needed on the client."""
+    resp = web.StreamResponse(status=200, headers={
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-cache, no-transform",
+        "X-Accel-Buffering": "no",
+    })
+    await resp.prepare(request)
+    listener = CaptionListener()
+    history = list(state.recent_events)[-20:]
+    listener.partial = dict(state.partial_caption) if state.partial_caption else None
+    key = object()
+    state.caption_listeners[key] = listener
+    try:
+        await resp.write(b"\x1b[2J\x1b[H\x1b[1momi\x1b[0m  \x1b[32m\xe2\x97\x8f Live\x1b[0m\n\n")
+        for ev in history:
+            if ev.get("type") == "transcript" and ev.get("text"):
+                stamp = str(ev.get("timestamp", ""))[11:19]
+                await resp.write(f"  \x1b[2m{stamp}\x1b[0m  {ev['text']}\n".encode("utf-8"))
+        await resp.write(b"\n")
+        while not state.stopping:
+            try:
+                await asyncio.wait_for(listener.ready.wait(), timeout=15.0)
+                listener.ready.clear()
+            except TimeoutError:
+                await resp.write(b"\x1b[0m")
+                continue
+            if listener.closed or state.stopping:
+                break
+            while not listener.queue.empty():
+                ev = listener.queue.get_nowait()
+                if ev.get("type") == "transcript" and ev.get("text"):
+                    stamp = str(ev.get("timestamp", ""))[11:19]
+                    await resp.write(f"\r\x1b[2K  \x1b[2m{stamp}\x1b[0m  {ev['text']}\n".encode("utf-8"))
+            partial, listener.partial = listener.partial, None
+            if partial is not None:
+                ptext = partial.get("text", "").strip()
+                if ptext:
+                    await resp.write(f"\r\x1b[2K  \x1b[2m\xe2\x80\xa6 {ptext[:100]}\x1b[0m".encode("utf-8"))
+                else:
+                    await resp.write(b"\r\x1b[2K")
+    except (OSError, ConnectionResetError, asyncio.CancelledError):
+        pass
+    finally:
+        state.caption_listeners.pop(key, None)
+    return resp
+
+
 async def on_startup(app):
     if not GEMINI_API_KEY:
         raise ValueError("Gemini API key is required")
@@ -1372,6 +1530,10 @@ def create_app(start_workers=True):
     app.router.add_get("/omi/ws", handle_omi_ws)
     app.router.add_get("/v1/listen", handle_omi_ws)
     app.router.add_get("/listen-ws", handle_listen_ws)
+    app.router.add_get("/listen-ndjson", handle_listen_ndjson)
+    app.router.add_get("/tui.py", handle_tui_py)
+    app.router.add_get("/tui", handle_tui_sh)
+    app.router.add_get("/live", handle_live_curl)
     app.router.add_get("/audio/last", handle_audio_last)
     if start_workers:
         app.on_startup.append(on_startup)

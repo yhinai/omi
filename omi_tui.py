@@ -19,7 +19,11 @@ import time
 import unicodedata
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-import aiohttp
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
+import ssl
 
 
 def clean(text):
@@ -447,7 +451,62 @@ def caption_url(url, after=None):
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
+async def _receive_ndjson_stdlib(viewer, url):
+    parts = urlsplit(caption_url(url, viewer.last_event_id))
+    use_tls = parts.scheme in ("wss", "https")
+    host = parts.hostname or "127.0.0.1"
+    port = parts.port or (443 if use_tls else 80)
+    path = re.sub(r"/listen-ws$", "/listen-ndjson", parts.path or "/listen-ndjson")
+    if parts.query:
+        path = f"{path}?{parts.query}"
+    ctx = ssl.create_default_context() if use_tls else None
+    reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port, ssl=ctx, server_hostname=host if use_tls else None), 10)
+    try:
+        req = f"GET {path} HTTP/1.1\r\nHost: {parts.netloc or host}\r\nAccept: application/x-ndjson\r\nConnection: keep-alive\r\n\r\n"
+        writer.write(req.encode("ascii"))
+        await writer.drain()
+        status_line = await asyncio.wait_for(reader.readline(), 10)
+        if not status_line.startswith(b"HTTP/1.1 200") and not status_line.startswith(b"HTTP/1.0 200"):
+            raise OSError("HTTP status not 200")
+        while True:
+            hdr = await asyncio.wait_for(reader.readline(), 10)
+            if hdr in (b"\r\n", b"\n", b""):
+                break
+        viewer.connected = True
+        viewer.replaying = True
+        viewer.connections += 1
+        viewer.wake.set()
+        while True:
+            line = await asyncio.wait_for(reader.readline(), 45)
+            if not line:
+                break
+            line_s = line.decode("utf-8", errors="ignore").strip()
+            if not line_s or not line_s.startswith("{"):
+                continue
+            try:
+                viewer.add(json.loads(line_s))
+            except (ValueError, TypeError):
+                pass
+    finally:
+        writer.close()
+
+
 async def receive(viewer, url):
+    if aiohttp is None:
+        delay = 1
+        while True:
+            try:
+                await _receive_ndjson_stdlib(viewer, url)
+                delay = 1
+            except (TimeoutError, OSError):
+                pass
+            viewer.connected, viewer.transcribing = False, False
+            viewer.clear_draft()
+            viewer.replaying = False
+            viewer.revision += 1
+            viewer.wake.set()
+            await asyncio.sleep(delay)
+            delay = min(10, delay * 2)
     delay = 1
     timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_connect=5)
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -808,7 +867,7 @@ async def run(screen, args):
 
 
 def main():
-    if sys.version_info[:2] != (3, 15):
+    if sys.version_info[:2] != (3, 15) and not os.getenv("OMI_REMOTE_TUI"):
         sys.exit("Run this viewer with ~/omi/.venv/bin/python3.15.")
     parser = argparse.ArgumentParser(description=__doc__, epilog="Press ? in the viewer for controls.")
     parser.add_argument("--url", default="ws://127.0.0.1:8787/listen-ws", help="Omi monitor WebSocket URL")
