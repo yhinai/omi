@@ -6,8 +6,8 @@
 
 A centered, unboxed page of live writing. Wide windows use 25% left margin,
 50% transcript, and 25% right margin; compact windows use most of their width.
-The transcript uses the available height down to the two-row footer area. Body
-text inherits your terminal's foreground, background, and font.
+Live following leaves a four-line reading cushion; reading history or holding
+the display reclaims that space down to the two-row footer area. Body text inherits your terminal's foreground, background, and font.
 Finalized words appear immediately; none are hidden by a word-reveal timer.
 
 ## The developing thought
@@ -20,8 +20,11 @@ When the caption feed reports buffered audio or an in-flight request for the
 current session, a quiet trailing `…` shows that more work is pending. The ellipsis
 is added after word wrapping, so it cannot move existing words onto another line.
 It disappears when the pipeline settles, its status expires, or the connection
-closes. It never invents words. A future server's real `partial` events can replace
-an editable draft, but the current recognizer still returns completed windows.
+closes. It never invents words. Live `partial` events replace an ephemeral draft
+that flows into the active paragraph in a softer shade. Drafts from a different
+stream/session stay separate. Completed-utterance IDs and revision numbers keep
+late clears, stale revisions, and older final events from erasing newer drafts.
+Only finalized text becomes retained/copyable paragraph history.
 
 Related chunks from one bridge session join into paragraphs. Sentence-ending
 punctuation is preferred once a paragraph reaches about 90 words; a hard 150-word
@@ -42,8 +45,8 @@ connection status, or shortcut bar. Press `?` for help or `d` for connection det
 | `?` / Esc | Show / dismiss help or details |
 | ↑ / ↓ / `k` / `j` / Page Up / Page Down | Read the conversation |
 | Mouse wheel / trackpad | Scroll when supported by the terminal |
-| `m` | Toggle wheel capture; native terminal text selection is the default |
-| Space | Freeze / resume the display for selection; reception continues |
+| `m` | Toggle wheel scrolling / native text selection (wheel is the startup default) |
+| Space | Freeze the display and release the mouse for selection; resume restores its previous mode |
 | Home | Go to the oldest retained text |
 | Ctrl+U / Ctrl+D | Scroll half a page up / down |
 | `g` / End | Follow the newest words |
@@ -53,16 +56,21 @@ connection status, or shortcut bar. Press `?` for help or `d` for connection det
 | `f` | Focus the active/selected passage and dim older paragraphs |
 | `t` | Show / hide editorial times |
 | `d` | Show connection, buffering, queue, and replay details on demand |
+| Ctrl+L | Redraw after external terminal corruption |
 | `q` / Ctrl+C | Quit and restore the terminal |
 
 Copy uses local macOS `/usr/bin/pbcopy` only when invoked, excludes interface text,
 and briefly confirms `Copied`. Blue is reserved for search and returning to live.
-Mouse selection and wheel behavior depend on terminal support. Mouse capture is
-off by default: drag to select and use your terminal’s normal Copy command. Press
-Space first to freeze the display so new captions do not erase a selection; press
-Space or `g` to resume live text. `m` enables application wheel scrolling; press it
-again to return to native selection. Keyboard scrolling works in both modes. Clipboard behavior
-over SSH is not extended with OSC 52 in this update.
+Mouse selection and wheel behavior depend on terminal support. Wheel scrolling
+is enabled at startup. Press Space to freeze the display and temporarily release
+mouse capture, then drag to select and use your terminal’s normal Copy command.
+Space or `g` resumes live text and restores the previous mouse mode. Reception
+continues while held; `y` copies the held paragraph without adding newly received,
+hidden words. `m` makes an explicit mouse-mode choice. Keyboard scrolling works
+in both modes. Clipboard behavior over SSH is not extended with OSC 52.
+
+Use `~/omi/tui.sh --mouse select` to start with native selection instead.
+
 
 Scrolling anchors the viewport to a paragraph and character position. Incoming
 words and resizing preserve the passage rather than its distance from the bottom.
@@ -123,3 +131,20 @@ real pseudo-terminals, without wearable access or Gemini calls:
 cd ~/omi
 .venv/bin/python3.15 -B -m unittest discover -s tests -q
 ```
+
+## Rendering compatibility
+
+The viewer compares composed frames and updates only changed terminal rows. An
+unchanged frame produces no terminal refresh. Partial revisions do not repaint
+unrelated paragraphs. Resizing or Ctrl+L requests a full redraw.
+
+`--sync-output auto` additionally uses DECSET 2026 for recognized Ghostty and
+WezTerm environments, with plain incremental curses output elsewhere. Auto mode
+is conservative under tmux/screen; it does not send capability queries that might
+be mistaken for input. Use `--sync-output on` to enable it explicitly on another
+compatible terminal, or `--sync-output off` if rendering behaves incorrectly.
+Synchronized output is always ended in a `finally` block, including refresh errors.
+
+References: [Ghostty rendering guidance](https://ghostty.org/docs/help/synchronized-output),
+[WezTerm mode support](https://wezterm.org/escape-sequences.html#mode-functions),
+and [Python curses refresh behavior](https://docs.python.org/3/library/curses.html#curses.doupdate).
