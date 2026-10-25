@@ -109,13 +109,12 @@ assert dict(os.environ) == before, 'import changed environment'
 
     def test_configuration_precedence_includes_gemini_key_aliases(self):
         with tempfile.TemporaryDirectory() as directory:
-            local, fallback = Path(directory) / "local.env", Path(directory) / "fallback.env"
+            local = Path(directory) / "local.env"
             local.write_text("GOOGLE_API_KEY=local-key\nOMI_CORE_WINDOW_SEC=6\n")
-            fallback.write_text("GEMINI_API_KEY=fallback-key\nOMI_CORE_WINDOW_SEC=7\n")
-            merged = bridge._load_dotenv(local_path=local, fallback_path=fallback, environ={})
+            merged = bridge._load_dotenv(local_path=local, environ={})
             self.assertEqual(merged["GEMINI_API_KEY"], "local-key")
             self.assertEqual(merged["OMI_CORE_WINDOW_SEC"], "6")
-            merged = bridge._load_dotenv(local_path=local, fallback_path=fallback,
+            merged = bridge._load_dotenv(local_path=local,
                 environ={"GOOGLE_API_KEY": "shell-key", "OMI_CORE_WINDOW_SEC": "5"})
             self.assertEqual(merged["GEMINI_API_KEY"], "shell-key")
             self.assertEqual(merged["OMI_CORE_WINDOW_SEC"], "5")
@@ -647,7 +646,6 @@ class AudioTests(unittest.IsolatedAsyncioTestCase):
 
         await self.enqueue()
         app = {"slicer_task": asyncio.create_task(background()),
-               "research_task": asyncio.create_task(background()),
                "stt_worker_task": asyncio.create_task(bridge.stt_consumer_worker())}
         cleanup = None
         with mock.patch.object(bridge, "gemini_stt_request", side_effect=slow_request):
@@ -734,11 +732,11 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_health_is_separate_and_existing_monitor_routes_remain_available(self):
         client = await self.client_for(bridge.create_app(start_workers=False))
-        for path in ("/health", "/omi/unexpected"):
+        for path in ("/health", "/omi/unexpected", "/listen"):
             with self.subTest(path=path):
                 response = await client.get(path)
                 self.assertEqual(response.status, 404)
-        for path in ("/listen", "/audio/last"):
+        for path in ("/audio/last",):
             response = await client.get(path)
             self.assertEqual(response.status, 200)
         async with client.ws_connect("/listen-ws"):
@@ -796,11 +794,10 @@ class TimestampTests(unittest.TestCase):
             target.addHandler(handler)
         try:
             with tempfile.TemporaryDirectory() as directory:
-                broadcast, webhook = mock.Mock(), mock.Mock()
+                broadcast = mock.Mock()
                 with mock.patch.object(bridge.state, "daily_notes", bridge.DailyNotes(directory)), \
                      mock.patch.multiple(bridge, transcript_logger=transcript, event_logger=events,
-                        WAKE_WORD="trigger", HERMES_RESEARCH_WEBHOOK="",
-                        broadcast=broadcast, schedule_webhook=webhook):
+                        broadcast=broadcast):
                     bridge.record_transcript_line("trigger spoken words", audio_start_at=source,
                                                    received_at=source + 0.5, processed_at=processed,
                                                    session_id=42, sample_offset=80000)
@@ -814,7 +811,6 @@ class TimestampTests(unittest.TestCase):
                 self.assertEqual(event["time_basis"], "estimated_from_receipt")
                 self.assertEqual((event["session_id"], event["sample_offset"]), (42, 80000))
                 self.assertEqual(json.loads(broadcast.call_args.args[0])["audio_start_at"], source)
-                self.assertEqual(json.loads(webhook.call_args.args[1])["processed_at"], processed)
         finally:
             for handler in handlers:
                 handler.close()
@@ -1194,39 +1190,6 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(plain.info.call_args.args[-1], event["text"])
             note = next(Path(directory).glob("*.md")).read_text()
             self.assertIn("[GAP: 0.125s", note)
-
-    async def test_hermes_failed_batch_is_retained_and_reuses_id_on_success(self):
-        session = mock.Mock()
-        session.post.side_effect = [http_context(503), http_context(200)]
-        self.runtime.http_session = session
-        self.assertTrue(bridge.schedule_webhook("http://example.invalid", b'{"text":"batch"}'))
-        batch = self.runtime.pending_webhooks[0]
-        self.assertFalse(await bridge.deliver_next_webhook())
-        self.assertIs(self.runtime.pending_webhooks[0], batch)
-        self.assertFalse(await bridge.deliver_next_webhook())  # Backoff; no HTTP request.
-        self.assertEqual(session.post.call_count, 1)
-        batch.retry_at = 0
-        self.assertTrue(await bridge.deliver_next_webhook())
-        ids = [call.kwargs["headers"]["X-Request-ID"] for call in session.post.call_args_list]
-        self.assertEqual(ids, [batch.batch_id, batch.batch_id])
-        self.assertEqual(self.runtime.metrics["hermes_sent"], 1)
-        self.assertEqual(self.runtime.metrics["hermes_failed"], 1)
-        self.assertFalse(self.runtime.pending_webhooks)
-
-    async def test_full_hermes_buffer_preserves_existing_batches_and_research_text(self):
-        for _ in range(10):
-            self.assertTrue(bridge.schedule_webhook("http://example.invalid", b"batch"))
-        ids = [b.batch_id for b in self.runtime.pending_webhooks]
-        self.assertFalse(bridge.schedule_webhook("http://example.invalid", b"overflow"))
-        self.runtime.rolling_research_buffer.append("research words")
-        bridge.queue_research_batch()
-        self.assertEqual([b.batch_id for b in self.runtime.pending_webhooks], ids)
-        self.assertEqual(list(self.runtime.rolling_research_buffer), ["research words"])
-        self.runtime.pending_webhooks.popleft()
-        bridge.queue_research_batch()
-        self.assertEqual(len(self.runtime.pending_webhooks), 10)
-        self.assertFalse(self.runtime.rolling_research_buffer)
-        self.assertIn("research words", json.loads(self.runtime.pending_webhooks[-1].payload)["text"])
 
     async def test_bridge_state_instances_do_not_share_mutable_buffers(self):
         other = bridge.BridgeState()

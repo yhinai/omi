@@ -506,8 +506,7 @@ class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
         runtime = bridge.BridgeState(stt_queue=asyncio.Queue(maxsize=24))
         runtime.recent_events.append(event("A saved passage.", event_id="saved", stream_id="old"))
         with mock.patch.object(bridge, "state", runtime), \
-             mock.patch.object(bridge, "event_logger"), mock.patch.object(bridge, "transcript_logger"), \
-             mock.patch.object(bridge, "HERMES_RESEARCH_WEBHOOK", ""), mock.patch.object(bridge, "WAKE_WORD", ""):
+             mock.patch.object(bridge, "event_logger"), mock.patch.object(bridge, "transcript_logger"):
             server = TestServer(bridge.create_app(start_workers=False))
             await server.start_server()
             viewer = tui.Viewer()

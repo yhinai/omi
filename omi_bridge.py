@@ -58,9 +58,6 @@ PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC = 1.0, 8.0, 1.0
 IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD = 8.0, 80.0
 RING_BUFFER_SECONDS = 300
 PORT, HEALTH_PORT = 8787, 8788
-HERMES_LIVE_WEBHOOK = "http://127.0.0.1:8644/webhooks/omi-live"
-HERMES_RESEARCH_WEBHOOK = "http://127.0.0.1:8644/webhooks/omi-research"
-WAKE_WORD, RESEARCH_INTERVAL_SEC = "hermes", 90
 logger = logging.getLogger("omi_bridge")
 transcript_logger = logging.getLogger("omi_transcript")
 event_logger = logging.getLogger("omi_transcript_events")
@@ -86,11 +83,10 @@ def _read_env_file(path):
     return values
 
 
-def _load_dotenv(local_path=None, fallback_path=None, environ=None):
-    """Resolve process > project .env > Hermes, including both key aliases."""
+def _load_dotenv(local_path=None, environ=None):
+    """Resolve process > project .env, including both key aliases."""
     sources = [dict(os.environ if environ is None else environ),
-               _read_env_file(local_path or os.path.join(BASE_DIR, ".env")),
-               _read_env_file(fallback_path or os.path.expanduser("~/.hermes/.env"))]
+               _read_env_file(local_path or os.path.join(BASE_DIR, ".env"))]
     values = {}
     for source in reversed(sources):
         values.update(source)
@@ -105,7 +101,6 @@ def configure(env=None):
     global WINDOW_DEADLINE_SEC, MAX_WINDOW_AGE_SEC
     global GEMINI_API_KEY, GEMINI_STT_MODEL, GEMINI_THINKING_LEVEL, PRE_OVERLAP_SEC, CORE_WINDOW_SEC, POST_LOOKAHEAD_SEC
     global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, RING_BUFFER_SECONDS, PORT, HEALTH_PORT
-    global HERMES_LIVE_WEBHOOK, HERMES_RESEARCH_WEBHOOK, WAKE_WORD, RESEARCH_INTERVAL_SEC
     env = _load_dotenv() if env is None else env
     GEMINI_API_KEY = (env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip()
     if not GEMINI_API_KEY or GEMINI_API_KEY.lower() in ("your_gemini_api_key_here", "your_api_key_here"):
@@ -135,12 +130,8 @@ def configure(env=None):
     if not 1 <= CORE_WINDOW_SEC <= 10 or PRE_OVERLAP_SEC > 5 or POST_LOOKAHEAD_SEC > 5 or IDLE_FLUSH_SEC <= 0:
         raise ValueError("Use core 1-10s, overlap/lookahead 0-5s, and a positive idle timeout")
     RING_BUFFER_SECONDS = int(env.get("OMI_RING_BUFFER_SEC", "300"))
-    RESEARCH_INTERVAL_SEC = int(env.get("OMI_RESEARCH_INTERVAL", "90"))
-    if RING_BUFFER_SECONDS < 1 or RESEARCH_INTERVAL_SEC < 1:
-        raise ValueError("Ring buffer and research interval must be positive")
-    HERMES_LIVE_WEBHOOK = env.get("OMI_HERMES_LIVE_WEBHOOK", "http://127.0.0.1:8644/webhooks/omi-live")
-    HERMES_RESEARCH_WEBHOOK = env.get("OMI_HERMES_RESEARCH_WEBHOOK", "http://127.0.0.1:8644/webhooks/omi-research")
-    WAKE_WORD = env.get("OMI_WAKE_WORD", "hermes").strip().lower()
+    if RING_BUFFER_SECONDS < 1:
+        raise ValueError("Ring buffer must be positive")
 
 
 class OutputFileHandler(RotatingFileHandler):
@@ -220,7 +211,6 @@ def new_metrics():
         "lost_audio_sec_failed": 0.0, "lost_audio_sec_stale": 0.0,
         "lost_audio_sec_queue_evicted": 0.0, "lost_audio_sec_buffer_evicted": 0.0,
         "output_errors": 0, "last_output_error": None,
-        "hermes_sent": 0, "hermes_failed": 0, "hermes_dropped": 0, "hermes_research_lines_dropped": 0,
         "windows_no_speech": 0, "windows_blocked": 0, "windows_truncated": 0, "windows_invalid_response": 0,
     }
 
@@ -234,8 +224,6 @@ class BridgeState:
     audio_ring: deque = field(default_factory=deque)
     audio_ring_bytes: int = 0
     daily_notes: object = None
-    rolling_research_buffer: deque = field(default_factory=lambda: deque(maxlen=1000))
-    last_research_time: float = field(default_factory=lambda: time.monotonic())
     live_listeners: dict = field(default_factory=dict)
     caption_listeners: dict = field(default_factory=dict)
     recent_events: deque = field(default_factory=lambda: deque(maxlen=200))
@@ -244,7 +232,6 @@ class BridgeState:
     http_session: aiohttp.ClientSession | None = None
     stopping: bool = False
     metrics: dict = field(default_factory=new_metrics)
-    pending_webhooks: deque = field(default_factory=deque)
     pending_windows: dict = field(default_factory=dict)
     active_window: AudioWindow | None = None
     live_stt: object = None
@@ -285,63 +272,6 @@ def oldest_pending_audio_age(now):
     return round(max(0.0, now - min(starts)), 3) if starts else None
 
 
-@dataclass
-class WebhookBatch:
-    url: str
-    payload: bytes
-    batch_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    attempts: int = 0
-    retry_at: float = 0.0
-
-
-def schedule_webhook(url, payload):
-    if not url:
-        return True
-    if len(state.pending_webhooks) >= 10:
-        state.metrics["hermes_dropped"] += 1
-        logger.warning("Hermes delivery buffer full; batch not admitted")
-        return False
-    state.pending_webhooks.append(WebhookBatch(url, payload))
-    return True
-
-
-async def deliver_next_webhook():
-    if not state.pending_webhooks:
-        return True
-    batch = state.pending_webhooks[0]
-    if time.monotonic() < batch.retry_at:
-        return False
-    try:
-        async with state.http_session.post(batch.url, data=batch.payload, allow_redirects=False,
-                headers={"Content-Type": "application/json", "X-Request-ID": batch.batch_id},
-                timeout=aiohttp.ClientTimeout(total=15)) as response:
-            if not 200 <= response.status < 300:
-                raise aiohttp.ClientResponseError(response.request_info, response.history, status=response.status)
-            await response.read()
-    except (aiohttp.ClientError, TimeoutError, OSError) as error:
-        state.metrics["hermes_failed"] += 1
-        batch.attempts += 1
-        batch.retry_at = time.monotonic() + min(30, 2 ** min(batch.attempts, 5))
-        logger.warning("Hermes delivery retained for retry: %s", type(error).__name__)
-        return False
-    state.pending_webhooks.popleft()
-    state.metrics["hermes_sent"] += 1
-    return True
-
-
-def queue_research_batch():
-    if not state.rolling_research_buffer or not HERMES_RESEARCH_WEBHOOK:
-        return
-    # Leave accumulated text alone while the bounded delivery buffer is full.
-    if len(state.pending_webhooks) >= 10:
-        return
-    payload = json.dumps({"text": "\n".join(state.rolling_research_buffer),
-                          "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}).encode()
-    if schedule_webhook(HERMES_RESEARCH_WEBHOOK, payload):
-        state.rolling_research_buffer.clear()
-        state.last_research_time = time.monotonic()
-
-
 def broadcast(message):
     for ws, queue in list(state.live_listeners.items()):
         try:
@@ -380,7 +310,7 @@ def publish_caption(event):
 
 
 def publish_partial(event):
-    """Coalesce disposable hypotheses; never send them to logs, replay, notes or Hermes."""
+    """Coalesce disposable hypotheses; never send them to logs, replay or notes."""
     event = {**event, "stream_id": state.stream_id}
     if (not event.get("text") and state.partial_caption is not None
             and event.get("utterance_id") != state.partial_caption.get("utterance_id")):
@@ -616,12 +546,6 @@ def record_transcript_line(text, **timing):
     event = make_event("transcript", text, **timing)
     if not write_event(event):
         return False
-    if HERMES_RESEARCH_WEBHOOK:
-        if len(state.rolling_research_buffer) == state.rolling_research_buffer.maxlen:
-            state.metrics["hermes_research_lines_dropped"] += 1
-        state.rolling_research_buffer.append(f"[{event['timestamp']}] {text}")
-    if WAKE_WORD and WAKE_WORD in text.lower():
-        schedule_webhook(HERMES_LIVE_WEBHOOK, json.dumps({"speaker": "user", **event}).encode())
     return True
 
 
@@ -1084,21 +1008,15 @@ async def window_slicer_worker():
                 break
 
 
-async def research_worker():
-    while True:
-        await asyncio.sleep(1)
-        if time.monotonic() - state.last_research_time >= RESEARCH_INTERVAL_SEC:
-            queue_research_batch()
-        await deliver_next_webhook()
-
-
 def build_health_dict():
     now = time.monotonic()
     workers_alive = bool(state.background_tasks) and all(not task.done() for task in state.background_tasks.values())
     overloaded = (state.live_stt.pending_bytes >= BYTES_PER_SECOND * 10 or len(state.live_stt.queue) >= 256
                   if state.live_stt is not None else state.stt_queue is not None and state.stt_queue.full())
+    pending_age = oldest_pending_audio_age(now)
+    stalled = pending_age is not None and pending_age > MAX_WINDOW_AGE_SEC
     return {
-        "status": "ok" if GEMINI_API_KEY and workers_alive and not state.stopping and not overloaded and not state.metrics["last_error"] and not state.metrics["last_output_error"] and (state.live_stt is None or state.live_stt.connected) else "degraded",
+        "status": "ok" if GEMINI_API_KEY and workers_alive and not state.stopping and not overloaded and not stalled and not state.metrics["last_error"] and not state.metrics["last_output_error"] and (state.live_stt is None or state.live_stt.connected) else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
         "gemini_key_configured": bool(GEMINI_API_KEY),
         "stt_mode": "live" if state.live_stt is not None else "batch",
@@ -1111,10 +1029,9 @@ def build_health_dict():
         "core_window_sec": 0 if state.live_stt is not None else CORE_WINDOW_SEC, "window_deadline_sec": WINDOW_DEADLINE_SEC,
         "max_window_age_sec": MAX_WINDOW_AGE_SEC,
         "latency": {name: latency_summary(samples) for name, samples in state.latency_samples.items()},
-        "oldest_pending_audio_age_sec": oldest_pending_audio_age(now),
-        "hermes_pending": len(state.pending_webhooks),
+        "oldest_pending_audio_age_sec": pending_age,
         **{k: round(v, 6) if isinstance(v, float) else v for k, v in state.metrics.items()
-           if k.startswith("lost_audio_sec_") or k in ("output_errors", "last_output_error", "hermes_sent", "hermes_failed", "hermes_dropped", "hermes_research_lines_dropped")},
+           if k.startswith("lost_audio_sec_") or k in ("output_errors", "last_output_error")},
         "python_version": platform.python_version(), "openssl_version": ssl.OPENSSL_VERSION,
         "workers_alive": workers_alive, "stopping": state.stopping,
         "uptime_sec": round(now - state.metrics["started_at"], 1),
@@ -1248,7 +1165,7 @@ async def on_startup(app):
         connector=aiohttp.TCPConnector(limit=10, limit_per_host=4), cookie_jar=aiohttp.DummyCookieJar())
     state.stopping = False
     state.metrics["started_at"] = time.monotonic()
-    factories = [("research_task", research_worker), ("caption_status_task", caption_status_worker)]
+    factories = [("caption_status_task", caption_status_worker)]
     if STT_MODE == "live":
         from live_stt import GeminiLiveSTT
         state.live_stt = GeminiLiveSTT(session=state.http_session, api_key=GEMINI_API_KEY,
@@ -1271,7 +1188,7 @@ async def on_shutdown(app):
 async def on_cleanup(app):
     state.stopping = True
     logger.info("Shutdown: draining accepted audio and pending STT windows")
-    stop_tasks = [app[name] for name in ("slicer_task", "research_task", "caption_status_task") if name in app]
+    stop_tasks = [app[name] for name in ("slicer_task", "caption_status_task") if name in app]
     for task in stop_tasks:
         task.cancel()
     await asyncio.gather(*stop_tasks, return_exceptions=True)
@@ -1289,18 +1206,6 @@ async def on_cleanup(app):
             await state.stt_queue.put(None)
             await worker
         flush_daily_paragraph()
-        queue_research_batch()
-        # RAM retries cannot survive process exit. Bound best-effort shutdown delivery.
-        try:
-            async with asyncio.timeout(20):
-                while state.pending_webhooks:
-                    state.pending_webhooks[0].retry_at = 0
-                    if not await deliver_next_webhook():
-                        break
-        except TimeoutError:
-            logger.warning("Hermes shutdown delivery deadline reached")
-        if state.pending_webhooks or state.rolling_research_buffer:
-            logger.warning("Shutdown with pending Hermes data in RAM")
         logger.info("Shutdown drain complete")
     finally:
         if state.http_session is not None:
@@ -1318,7 +1223,6 @@ def create_app(start_workers=True):
     app = web.Application(client_max_size=BYTES_PER_SECOND * RING_BUFFER_SECONDS + 1)
     app.router.add_get("/omi", handle_omi)
     app.router.add_post("/omi", handle_omi)
-    app.router.add_get("/listen", handle_listen)
     app.router.add_get("/listen-ws", handle_listen_ws)
     app.router.add_get("/audio/last", handle_audio_last)
     if start_workers:
@@ -1331,8 +1235,6 @@ def create_app(start_workers=True):
 def create_health_app():
     app = web.Application(client_max_size=4096)
     app.router.add_get("/health", handle_health)
-    from edition_server import install
-    install(app, BASE_DIR)
     return app
 
 
@@ -1390,33 +1292,6 @@ async def handle_audio_last(request: web.Request) -> web.Response:
         content_type="audio/wav",
         headers={"Content-Disposition": f'inline; filename="omi_last_{seconds}s.wav"'},
     )
-
-
-LISTEN_HTML = """<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Omi Live Stream</title>
-<style>body{font-family:system-ui,sans-serif;background:#0f172a;color:#f8fafc;padding:24px;max-width:900px;margin:0 auto}button{background:#3b82f6;color:#fff;border:none;padding:10px 18px;border-radius:8px;cursor:pointer}#log{margin-top:16px;background:#1e293b;padding:16px;border-radius:8px;height:70vh;overflow-y:auto;white-space:pre-wrap}</style>
-</head><body><h2>Omi Live Stream (16kHz PCM16 + Dynamic STT windows)</h2>
-<button id="btn">Start Listening</button> <span id="status">Disconnected</span><div id="log"></div>
-<script>
-let ctx,nextTime=0;const btn=document.getElementById('btn'),status=document.getElementById('status'),log=document.getElementById('log');
-btn.onclick=()=>{
-  if(!ctx)ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
-  const ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/listen-ws');
-  ws.binaryType='arraybuffer';
-  ws.onopen=()=>{status.textContent='Connected';btn.disabled=true;};
-  ws.onclose=()=>{status.textContent='Disconnected';btn.disabled=false;};
-  ws.onmessage=(e)=>{
-    if(typeof e.data==='string'){const m=JSON.parse(e.data);if(m.type==='transcript'||m.type==='gap'){log.textContent+=`[${m.timestamp}] ${m.text}\n\n`;log.scrollTop=log.scrollHeight;}}
-    else{const i16=new Int16Array(e.data),f32=new Float32Array(i16.length);for(let i=0;i<i16.length;i++)f32[i]=i16[i]/32768.0;const b=ctx.createBuffer(1,f32.length,16000);b.getChannelData(0).set(f32);const s=ctx.createBufferSource();s.buffer=b;s.connect(ctx.destination);if(nextTime<ctx.currentTime)nextTime=ctx.currentTime+0.05;s.start(nextTime);nextTime+=b.duration;}
-  };
-};
-</script></body></html>"""
-
-
-async def handle_listen(request: web.Request) -> web.Response:
-    return web.Response(text=LISTEN_HTML, content_type="text/html")
-
-
 
 
 if __name__ == "__main__":

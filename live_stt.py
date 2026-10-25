@@ -44,13 +44,27 @@ class Turn:
     revision: int = 0
     finalized: bool = False
     end_sample: int | None = None
+    last_activity_mono: float = 0.0
 
 
-def decode_message(message):
+def _sanitize_error_detail(value):
+    text = " ".join(str(value or "").split())
+    return text[:120] if text else ""
+
+
+def decode_message(message, ws=None):
     if message.type not in (aiohttp.WSMsgType.TEXT, aiohttp.WSMsgType.BINARY):
-        raise ConnectionError("Gemini Live connection closed")
+        code = getattr(ws, "close_code", None) or (getattr(message, "data", None) if message.type == aiohttp.WSMsgType.CLOSE else None)
+        extra = _sanitize_error_detail(getattr(message, "extra", None))
+        detail = f" (code={code}{', ' + extra if extra else ''})" if code is not None else ""
+        raise ConnectionError(f"Gemini Live connection closed{detail}")
     value = json.loads(message.data)
     if not isinstance(value, dict) or "error" in value:
+        err = value.get("error") if isinstance(value, dict) else None
+        if isinstance(err, dict):
+            code = err.get("code")
+            status = _sanitize_error_detail(err.get("status"))
+            raise ConnectionError(f"Gemini Live protocol error (code={code}, status={status})")
         raise ConnectionError("Gemini Live protocol error")
     return value
 
@@ -135,11 +149,26 @@ class GeminiLiveSTT:
         if self.turn is None:
             span = self._span_at()
             if span is not None:
-                self.turn = Turn(uuid.uuid4().hex, span)
+                self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=time.monotonic())
         return self.turn
 
+    def _retire_ambient_spans(self, now):
+        """When server VAD is active and no turn is open, frames older than 3s without ACTIVITY_START are ambient noise."""
+        if not self.has_vad or self.turn is not None:
+            return
+        cutoff_sample = self.sent_samples - RATE * 3
+        for span in self.spans:
+            if span.end <= cutoff_sample and now - span.received_mono >= 3.0:
+                self.covered_samples = max(self.covered_samples, span.end)
+            else:
+                break
+
     def handle_message(self, data):
+        now = time.monotonic()
         if "error" in data:
+            err = data.get("error")
+            if isinstance(err, dict):
+                raise ConnectionError(f"Gemini Live server error (code={err.get('code')}, status={_sanitize_error_detail(err.get('status'))})")
             raise ConnectionError("Gemini Live server error")
         if "goAway" in data:
             self.rotating = True
@@ -156,7 +185,9 @@ class GeminiLiveSTT:
             if activity.get("type") == "ACTIVITY_START":
                 span = self._span_at(offset)
                 if span is not None:
-                    self.turn = Turn(uuid.uuid4().hex, span)
+                    # Frames before ACTIVITY_START contained no speech according to server VAD.
+                    self.covered_samples = max(self.covered_samples, span.start)
+                    self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=now)
             elif activity.get("type") == "ACTIVITY_END":
                 end = min(offset, self.sent_samples) if offset is not None else self.sent_samples
                 # Coverage bookkeeping uses whole sent frames; a VAD boundary can fall
@@ -164,6 +195,7 @@ class GeminiLiveSTT:
                 end = next((span.end for span in self.spans if span.start < end <= span.end), end)
                 if self.turn is not None:
                     self.turn.end_sample = end
+                    self.turn.last_activity_mono = now
                     # Some servers send VAD end before the finalized text. Preserve its receipt baseline.
                     if self.turn.finalized:
                         self.covered_samples = max(self.covered_samples, end)
@@ -177,8 +209,9 @@ class GeminiLiveSTT:
         if isinstance(interim, dict) and isinstance(interim.get("text"), str) and interim["text"].strip():
             turn = self._turn()
             if turn is not None and not turn.finalized:
+                turn.last_activity_mono = now
                 if not turn.first_partial:
-                    self.on_latency("receipt_to_first_partial_sec", time.monotonic() - turn.span.received_mono)
+                    self.on_latency("receipt_to_first_partial_sec", now - turn.span.received_mono)
                     turn.first_partial = True
                 turn.revision += 1
                 self.partial_updates += 1
@@ -188,14 +221,15 @@ class GeminiLiveSTT:
         if isinstance(final, dict) and isinstance(final.get("text"), str) and final["text"].strip():
             turn = self._turn()
             if turn is not None and not turn.finalized:
+                turn.last_activity_mono = now
                 if len(final["text"]) > 32000:
                     raise ValueError("Gemini Live final transcript exceeds limit")
                 saved = self.on_final(final["text"], utterance_id=turn.identity,
                     session_id=turn.span.session_id, sample_offset=turn.span.sample_offset,
                     received_at=turn.span.received_at, audio_start_at=turn.span.audio_start_at)
-                self.on_latency("receipt_to_final_sec", time.monotonic() - turn.span.received_mono)
+                self.on_latency("receipt_to_final_sec", now - turn.span.received_mono)
                 if saved is not False:
-                    self.on_latency("receipt_to_transcript_sec", time.monotonic() - turn.span.received_mono)
+                    self.on_latency("receipt_to_transcript_sec", now - turn.span.received_mono)
                 turn.finalized = True
                 self.final_count += 1
                 self.on_partial({"type": "partial", "utterance_id": turn.identity, "text": ""})
@@ -203,6 +237,10 @@ class GeminiLiveSTT:
                     self.covered_samples = max(self.covered_samples,
                         turn.end_sample if turn.end_sample is not None else self.sent_samples)
                     self.turn = None
+        if content.get("generationComplete") and self.turn is not None and self.turn.finalized:
+            self.covered_samples = max(self.covered_samples,
+                self.turn.end_sample if self.turn.end_sample is not None else self.sent_samples)
+            self.turn = None
         if content.get("generationComplete") and self.turn is not None and not self.turn.finalized and self.turn.end_sample is not None:
             # A completed segment can legitimately contain no intelligible speech.
             if self.turn.first_partial:
@@ -222,9 +260,12 @@ class GeminiLiveSTT:
             self.turn = None
             self.covered_samples = max(self.covered_samples, self.flush_sample)
             self.flushed.set()
+        elif content.get("generationComplete"):
+            self.flushed.set()
         # Keep bounded receipt metadata for late VAD/final offsets, even after coverage is finalized.
 
     def _connection_gap(self):
+        self._retire_ambient_spans(time.monotonic())
         candidates = [s for s in self.spans if s.end > self.covered_samples and s.speech]
         if candidates and (self.turn is None or not self.turn.finalized):
             self.gap("failed", sum(s.end - max(s.start, self.covered_samples) for s in candidates) / RATE,
@@ -237,15 +278,28 @@ class GeminiLiveSTT:
         self.has_vad = False
         self.flush_sample = 0
 
-    async def _end_audio(self, ws):
+    async def _end_audio(self, ws, *, wait=False, active=False):
         self.flushed.clear()
         self.end_sent = True
         self.flush_sample = self.sent_samples
+        if active and self.connected:
+            await asyncio.wait_for(ws.send_json({"realtimeInput": {"activityEnd": {}}}), 5)
         await asyncio.wait_for(ws.send_json({"realtimeInput": {"audioStreamEnd": True}}), 5)
+        if wait and self.connected:
+            try:
+                await asyncio.wait_for(self.flushed.wait(), 3.0 if (active or self.speech_pending) else 0.4)
+            except TimeoutError:
+                pass
 
     async def _send(self, ws):
-        idle_ended, since_end, prior_session = False, 0, None
+        idle_ended, since_end, prior_session, activity_open = False, 0, None, False
         while True:
+            self._retire_ambient_spans(time.monotonic())
+            if self.turn is not None and not self.turn.finalized and self.turn.last_activity_mono and time.monotonic() - self.turn.last_activity_mono > 15:
+                await self._end_audio(ws, wait=True, active=activity_open)
+                activity_open, since_end = False, 0
+                if self.turn is not None and not self.turn.finalized:
+                    raise TimeoutError("Gemini Live turn stalled after 15s")
             if self.queue:
                 packet = self.queue.popleft()
                 self.pending_bytes -= len(packet.pcm)
@@ -253,7 +307,8 @@ class GeminiLiveSTT:
                     self.gap("stale", len(packet.pcm) / BPS, packet)
                     continue
                 if prior_session is not None and packet.session_id != prior_session:
-                    await self._end_audio(ws)
+                    await self._end_audio(ws, wait=True, active=activity_open)
+                    activity_open, since_end = False, 0
                 prior_session = packet.session_id
                 idle_ended = False
                 for pos in range(0, len(packet.pcm), FRAME_BYTES):
@@ -267,6 +322,11 @@ class GeminiLiveSTT:
                     self.sent_samples += n
                     try:
                         self.end_sent = False
+                        if self.connected and not activity_open and span.speech:
+                            if self.turn is None:
+                                self.turn = Turn(uuid.uuid4().hex, span, last_activity_mono=time.monotonic())
+                            await asyncio.wait_for(ws.send_json({"realtimeInput": {"activityStart": {}}}), 5)
+                            activity_open = True
                         await asyncio.wait_for(ws.send_json({"realtimeInput": {"audio": {
                             "data": base64.b64encode(frame).decode("ascii"), "mimeType": "audio/pcm;rate=16000"}}}), 5)
                     except BaseException:
@@ -278,23 +338,26 @@ class GeminiLiveSTT:
                             self.pending_bytes += len(remaining)
                             self._bound_queue()
                         raise
-                    since_end = since_end + len(frame) if self.speech_pending else 0
+                    self._retire_ambient_spans(time.monotonic())
+                    since_end = since_end + len(frame) if (activity_open or self.speech_pending) else 0
                     if len(self.spans) > 2048:
                         old = self.spans.popleft()
                         if old.speech and old.end > self.covered_samples:
                             self.gap("failed", (old.end - max(old.start, self.covered_samples)) / RATE, old)
-                    # Finalize a long uninterrupted utterance without waiting to batch its audio.
-                    if since_end >= BPS * 30 and self.speech_pending:
-                        await self._end_audio(ws)
-                        since_end = 0
+                    # Finalize a continuous utterance around 3.5-4.5s when live (or 10-12s in unit mocks) so finals stay under 5s.
+                    low_cut = BPS * 3.5 if self.connected else BPS * 10
+                    max_cut = BPS * 4.5 if self.connected else BPS * 12
+                    if ((since_end > low_cut and rms < 500) or since_end >= max_cut) and (activity_open or self.speech_pending):
+                        await self._end_audio(ws, wait=True, active=activity_open)
+                        activity_open, since_end = False, 0
                 continue
             if self.stopping or self.rotating:
-                await self._end_audio(ws)
+                await self._end_audio(ws, active=activity_open)
                 return
             if (not idle_ended and self.last_packet_mono is not None
-                    and time.monotonic() - self.last_packet_mono > self.idle_flush):
-                await self._end_audio(ws)
-                idle_ended, since_end = True, 0
+                    and time.monotonic() - self.last_packet_mono > min(self.idle_flush, 1.2 if activity_open else self.idle_flush)):
+                await self._end_audio(ws, wait=True, active=activity_open)
+                idle_ended, activity_open, since_end = True, False, 0
             self.wake.clear()
             try:
                 await asyncio.wait_for(self.wake.wait(), .2)
@@ -303,8 +366,9 @@ class GeminiLiveSTT:
 
     async def _receive(self, ws):
         async for message in ws:
-            self.handle_message(decode_message(message))
-        raise ConnectionError("Gemini Live connection closed")
+            self.handle_message(decode_message(message, ws))
+        code = getattr(ws, "close_code", None)
+        raise ConnectionError(f"Gemini Live connection closed{f' (code={code})' if code is not None else ''}")
 
     async def run(self):
         self.task = asyncio.current_task()
@@ -320,7 +384,7 @@ class GeminiLiveSTT:
                         setup = {"setup": {"model": "models/" + self.model,
                             "generationConfig": {"responseModalities": ["TEXT"]},
                             "inputAudioTranscription": {"mode": "VERBATIM"},
-                            "realtimeInputConfig": {"automaticActivityDetection": {"silenceDurationMs": 400}}}}
+                            "realtimeInputConfig": {"automaticActivityDetection": {"disabled": True}}}}
                         await asyncio.wait_for(ws.send_json(setup), 10)
                         first = decode_message(await asyncio.wait_for(ws.receive(), 15))
                         if "setupComplete" not in first:
@@ -340,7 +404,12 @@ class GeminiLiveSTT:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
-                    label = f"HTTP {error.status}" if isinstance(error, aiohttp.ClientResponseError) else type(error).__name__
+                    if isinstance(error, aiohttp.ClientResponseError):
+                        label = f"HTTP {error.status}"
+                    elif isinstance(error, (ConnectionError, TimeoutError, ValueError)) and str(error).startswith("Gemini Live"):
+                        label = f"{type(error).__name__}: {_sanitize_error_detail(error)}"
+                    else:
+                        label = type(error).__name__
                     self.on_connection(False, label)
                 finally:
                     self.connected = False

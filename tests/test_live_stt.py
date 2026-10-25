@@ -149,6 +149,23 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(stream.pending_age)
         self.assertFalse(stream.speech_pending)
 
+    def test_ambient_noise_spans_do_not_stay_pending_or_emit_fake_gaps(self):
+        stream = self.make()
+        # First frame is ambient noise (no VAD start), second frame at 1.0s triggers ACTIVITY_START.
+        stream.spans.append(live.Span(0, 16000, 1000, 100, 999.0, 0, 1, True))
+        stream.spans.append(live.Span(16000, 32000, 1001, 101, 1000.0, 16000, 1, True))
+        stream.sent_samples = 32000
+        stream.handle_message({"voiceActivity": {"type": "ACTIVITY_START", "audioOffset": "1.0s"}})
+        self.assertEqual(stream.covered_samples, 16000)
+        stream.handle_message({"serverContent": {"inputTranscription": {"text": "Hello"}}})
+        stream.handle_message({"voiceActivity": {"type": "ACTIVITY_END", "audioOffset": "2.0s"}})
+        # Subsequent ambient noise frames without ACTIVITY_START retire after 3s.
+        stream.spans.append(live.Span(32000, 48000, 1002, 102, 1001.0, 32000, 1, True))
+        stream.sent_samples = 96000
+        stream._retire_ambient_spans(106.0)
+        self.assertEqual(stream.covered_samples, 48000)
+        stream.on_gap.assert_not_called()
+
     async def test_connection_loss_reconnects_with_fresh_audio_and_records_unfinalized_gap(self):
         ready, first, final, disconnected = asyncio.Event(), asyncio.Event(), asyncio.Event(), asyncio.Event()
         connections = []
@@ -259,16 +276,13 @@ class BridgeLiveTests(unittest.IsolatedAsyncioTestCase):
         self.state.caption_listeners["test"] = listener
         listener.queue.put_nowait({"type": "transcript", "text": "Already final"})
         with mock.patch.object(bridge, "record_transcript_line") as record, \
-             mock.patch.object(bridge, "schedule_webhook") as webhook, \
              mock.patch.object(bridge, "event_logger") as events:
             for revision in range(100):
                 bridge.publish_partial({"type": "partial", "utterance_id": "u1", "revision": revision, "text": str(revision)})
         self.assertEqual(listener.partial["text"], "99")
         self.assertEqual(listener.queue.qsize(), 1)
         self.assertFalse(self.state.recent_events)
-        self.assertFalse(self.state.rolling_research_buffer)
         record.assert_not_called()
-        webhook.assert_not_called()
         events.info.assert_not_called()
 
     def test_old_partial_clear_does_not_erase_a_new_utterance(self):

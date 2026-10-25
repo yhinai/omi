@@ -25,7 +25,6 @@ async def check():
     bridge.require_python315()
     bridge.configure()
     bridge.STT_MODE = "live"
-    bridge.HERMES_RESEARCH_WEBHOOK = bridge.HERMES_LIVE_WEBHOOK = ""
     with tempfile.TemporaryDirectory(prefix="omi-isolated-live-") as root:
         aiff, wav = Path(root) / "speech.aiff", Path(root) / "speech.wav"
         subprocess.run(["/usr/bin/say", "-r", "145", "-o", str(aiff), PHRASE], check=True, capture_output=True)

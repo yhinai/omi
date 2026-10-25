@@ -10,8 +10,8 @@ IDENTITY_FILE="$DIR/logs/omi_bridge.identity"
 CONSOLE_LOG="$DIR/logs/omi_bridge.console.log"
 ACTION="${1:-restart}"
 
-if [ "$#" -gt 1 ] || [[ ! "$ACTION" =~ ^(start|restart|stop|status)$ ]]; then
-  echo "Usage: $0 [start|restart|stop|status] (default: restart)" >&2
+if [ "$#" -gt 1 ] || [[ ! "$ACTION" =~ ^(start|restart|stop|status|clear)$ ]]; then
+  echo "Usage: $0 [start|restart|stop|status|clear] (default: restart)" >&2
   exit 2
 fi
 mkdir -p "$DIR/logs"
@@ -151,8 +151,41 @@ stop_bridge() {
   echo "Omi bridge stopped."
 }
 
+clear_data() {
+  "$CLI_PYTHON" - "$DIR/logs" <<'PY_CLEAR'
+from pathlib import Path
+import re
+import shutil
+import sys
+root = Path(sys.argv[1])
+if root.is_symlink():
+    raise SystemExit("Refusing to clear a symlinked logs directory")
+for path in root.iterdir():
+    # Preserve the held launcher lock and files owned by separate services.
+    owned = (path.name.startswith(("omi_bridge.log", "omi_bridge.console.log",
+                                  "omi_live_transcript.log", "omi_transcript_events.jsonl"))
+             or re.fullmatch(r"\d{4}-\d{2}-\d{2}\.md", path.name)
+             or path.name == "editions"
+             or path.suffix.lower() in {".wav", ".pcm"})
+    if not owned:
+        continue
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+print("Cleared bridge transcripts, daily notes, editions, audio captures, and logs.")
+PY_CLEAR
+}
+
 if [ "$ACTION" = stop ]; then
   stop_bridge
+  exit
+fi
+if [ "$ACTION" = clear ]; then
+  stop_bridge
+  check_ports
+  clear_data
+  echo "Omi bridge is stopped. Start it with: $0 start"
   exit
 fi
 if [ "$ACTION" = status ]; then
