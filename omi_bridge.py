@@ -306,17 +306,19 @@ class CaptionListener:
 
 def publish_caption(event):
     identity = event.get("utterance_id")
-    clear = event.get("type") == "gap" or (state.partial_caption is not None
+    is_gap = event.get("type") == "gap"
+    clear = is_gap or (state.partial_caption is not None
         and identity == state.partial_caption.get("utterance_id"))
     if clear:
         state.partial_caption = None
     for listener in list(state.caption_listeners.values()):
         if clear:
-            listener.partial = None
-        try:
-            listener.queue.put_nowait(event)
-        except asyncio.QueueFull:
-            listener.closed = True  # Reconnect can replay retained events.
+            listener.partial = {"type": "partial", "utterance_id": identity or "", "text": ""} if is_gap else None
+        if not is_gap:
+            try:
+                listener.queue.put_nowait(event)
+            except asyncio.QueueFull:
+                listener.closed = True  # Reconnect can replay retained events.
         listener.ready.set()
 
 
@@ -412,7 +414,7 @@ def seed_recent_events():
                 event = json.loads(line)
             except (ValueError, UnicodeError):
                 continue
-            if not isinstance(event, dict) or event.get("type", "transcript") not in ("transcript", "gap") or not isinstance(event.get("text"), str):
+            if not isinstance(event, dict) or event.get("type", "transcript") != "transcript" or not isinstance(event.get("text"), str):
                 continue
             event.setdefault("type", "transcript")
             identity = event.get("event_id")
@@ -496,7 +498,8 @@ def write_event(event):
     except Exception as error:
         output_failed("jsonl", error)
         return False
-    state.recent_events.append(dict(event))
+    if event.get("type") != "gap":
+        state.recent_events.append(dict(event))
     publish_caption(event)
     broadcast(encoded)
     if event.get("type") == "transcript" and event.get("text"):
