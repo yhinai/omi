@@ -196,6 +196,9 @@ class Screen:
     def move(self, y, x):
         self.cursor = (y, x)
 
+    def clearok(self, flag):
+        pass
+
     def clrtoeol(self):
         y, x = self.cursor
         self.lines[y][x:] = [" "] * (self.width - x)
@@ -260,6 +263,17 @@ class LayoutTests(unittest.TestCase):
         tui.handle_key(viewer, "g", tui.rows_for(viewer, 50), 20)
         self.assertFalse(viewer.holding)
         self.assertTrue(viewer.mouse_enabled)
+
+    def test_copy_while_held_does_not_include_new_hidden_words(self):
+        viewer = tui.Viewer()
+        viewer.add(event("Visible words"))
+        rows = tui.rows_for(viewer, 50)
+        tui.handle_key(viewer, " ", rows, 20)
+        viewer.add(event("arrived after freezing", source=108))
+        self.assertEqual(tui.copy_text(viewer, tui.rows_for(viewer, 50), 20), "Visible words")
+        tui.handle_key(viewer, "g", rows, 20)
+        self.assertEqual(tui.copy_text(viewer, tui.rows_for(viewer, 50), 20),
+                         "Visible words arrived after freezing")
 
     def test_repeated_frames_do_not_write_and_only_draft_row_changes(self):
         viewer = tui.Viewer(show_times=False)

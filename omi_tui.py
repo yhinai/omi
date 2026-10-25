@@ -28,11 +28,15 @@ def clean(text):
 
 
 def cells(text):
+    if text.isascii() and text.isprintable():
+        return len(text)
     return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in "WF" else 1
                for c in text)
 
 
 def fit(text, width):
+    if width >= 0 and text.isascii() and text.isprintable():
+        return text[:width]
     result, used = [], 0
     for char in text:
         size = cells(char)
@@ -48,19 +52,22 @@ def wrap(text, width):
     """Word wrapping with safe splitting of long words and wide Unicode glyphs."""
     if width < 2:
         return [fit(text, width)]
-    lines, line = [], ""
+    lines, line, line_cells = [], "", 0
     for word in text.split():
-        if line and cells(line + " " + word) <= width:
+        w_cells = cells(word)
+        if line and line_cells + 1 + w_cells <= width:
             line += " " + word
+            line_cells += 1 + w_cells
             continue
         if line:
             lines.append(line)
-            line = ""
-        while cells(word) > width:
+            line, line_cells = "", 0
+        while w_cells > width:
             head = fit(word, width)
             lines.append(head)
             word = word[len(head):]
-        line = word
+            w_cells = cells(word)
+        line, line_cells = word, w_cells
     if line:
         lines.append(line)
     return lines or [""]
@@ -117,6 +124,7 @@ class Viewer:
     mouse_enabled: bool = True
     holding: bool = False
     held_mouse_enabled: bool | None = None
+    held_text: dict = field(default_factory=dict, repr=False)
     sync_output: str = "auto"
     paint_cache: object = field(default=None, repr=False)
     pipeline: dict = field(default_factory=dict)
@@ -282,6 +290,7 @@ class Viewer:
     def live(self):
         self.following, self.anchor, self.unread, self.match = True, None, 0, None
         self.holding = False
+        self.held_text.clear()
         if self.held_mouse_enabled is not None:
             self.mouse_enabled, self.held_mouse_enabled = self.held_mouse_enabled, None
         self.last_unread_key = None
@@ -403,6 +412,8 @@ def copy_text(viewer, rows, available):
     if viewer.following:
         return next((c.text for c in reversed(viewer.captions) if c.kind == "transcript"), "")
     key = viewer.match[0] if viewer.match else (rows[viewport(viewer, rows, available)].key if rows else None)
+    if viewer.holding and key in viewer.held_text:
+        return viewer.held_text[key]
     return next((c.text for c in viewer.captions if c.key == key), "")
 
 
@@ -540,6 +551,8 @@ class Frame:
             if sync:
                 sys.stdout.write("\x1b[?2026h")
                 sys.stdout.flush()
+            if previous is None:
+                self.screen.clearok(True)
             for y in changed:
                 self.screen.move(y, 0)
                 self.screen.clrtoeol()
@@ -650,6 +663,7 @@ def handle_key(viewer, key, rows, available):
         else:
             move(viewer, rows, available, 0)
             viewer.holding = True
+            viewer.held_text = {caption.key: caption.text for caption in viewer.captions}
             viewer.held_mouse_enabled = viewer.mouse_enabled
             viewer.mouse_enabled = False
     elif key == curses.KEY_HOME:
@@ -778,6 +792,11 @@ async def run(screen, args):
             except TimeoutError:
                 pass
     finally:
+        if with_curses_mouse:
+            try:
+                curses.mousemask(0)
+            except curses.error:
+                pass
         if input_ready:
             loop.remove_reader(sys.stdin.fileno())
         if resize_ready:
