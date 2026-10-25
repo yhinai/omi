@@ -38,6 +38,9 @@ class ReadingTests(unittest.TestCase):
         viewer.add(event("words after the gap", session=2, source=116))
         self.assertEqual(len(viewer.captions), 4)
         self.assertEqual(viewer.captions[2].text, "2.4 seconds unavailable.")
+        rows = tui.rows_for(viewer, 76)
+        self.assertFalse(any("seconds unavailable" in row.text for row in rows))
+        self.assertTrue(any(row.text == "words after the gap" for row in rows))
         viewer.add(event("word " * 160, session=2, source=124))
         self.assertEqual(len(viewer.captions), 5)
 
