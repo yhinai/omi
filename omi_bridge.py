@@ -1118,8 +1118,13 @@ async def handle_omi_ws(request):
     if state.stopping:
         raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
     _verify_stream_auth(request)
+    remote_ip = _client_remote(request)
     if state.stream_clients:
-        raise web.HTTPConflict(text="Another direct audio stream is already active")
+        if remote_ip != state.metrics.get("direct_ws_remote"):
+            raise web.HTTPConflict(text="Another direct audio stream is already active")
+        for old_ws in list(state.stream_clients):
+            state.stream_clients.pop(old_ws, None)
+            asyncio.create_task(old_ws.close())
     encoding = request.query.get("encoding", "linear16").strip().lower()
     if encoding not in ("linear16", "pcm16", "pcm", ""):
         raise web.HTTPBadRequest(text="encoding must be linear16 or pcm16")
@@ -1134,7 +1139,6 @@ async def handle_omi_ws(request):
     await ws.prepare(request)
     queue = asyncio.Queue(maxsize=32)
     state.stream_clients[ws] = queue
-    remote_ip = _client_remote(request)
     state.metrics["direct_ws_remote"] = remote_ip
     state.metrics["audio_source"] = "direct_ws"
     logger.info("Direct phone WebSocket connected from %s", remote_ip)
