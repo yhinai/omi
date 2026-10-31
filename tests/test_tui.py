@@ -138,7 +138,7 @@ class ReadingTests(unittest.TestCase):
         self.assertEqual(viewer.status(100), "Connecting")
         viewer.connected = True
         self.assertEqual(viewer.status(100), "Ready")
-        viewer.audio(bytes(320))
+        viewer.add({"type": "status", "last_packet_age_sec": 0})
         now = tui.time.monotonic()
         self.assertEqual(viewer.status(now), "Listening")
         viewer.add({"type": "status", "stt_in_flight": True})
@@ -176,14 +176,11 @@ class ReadingTests(unittest.TestCase):
         self.assertFalse(viewer.searching)
         self.assertEqual(tui.handle_key(viewer, "q", [], 10), "quit")
 
-    def test_invalid_events_and_pcm_do_not_damage_viewer(self):
+    def test_invalid_events_do_not_damage_viewer(self):
         viewer = tui.Viewer()
         for value in (None, [], {"type": "unknown", "text": "ignore"}, {"text": ""}):
             viewer.add(value)
-        viewer.audio(b"x")
         self.assertIsNone(viewer.last_audio)
-        viewer.audio(bytes(320))
-        self.assertIsNotNone(viewer.last_audio)
         self.assertFalse(viewer.captions)
 
 
@@ -405,18 +402,18 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
             return ws
 
         app = web.Application()
-        app.router.add_get("/listen-ws", endpoint)
+        app.router.add_get("/listen", endpoint)
         server = TestServer(app)
         await server.start_server()
         viewer = tui.Viewer()
-        task = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen-ws")).replace("http://", "ws://")))
+        task = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen")).replace("http://", "ws://")))
         try:
             async with asyncio.timeout(2):
                 while not viewer.captions:
                     await asyncio.sleep(.01)
             self.assertTrue(viewer.connected)
             self.assertEqual(viewer.captions[-1].text, "Blue lantern seven.")
-            self.assertIsNotNone(viewer.last_audio)
+            self.assertIsNone(viewer.last_audio)
             self.assertEqual(received, [])
         finally:
             task.cancel()
@@ -431,11 +428,11 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
             return ws
 
         app = web.Application()
-        app.router.add_get("/listen-ws", endpoint)
+        app.router.add_get("/listen", endpoint)
         server = TestServer(app)
         await server.start_server()
         viewer = tui.Viewer()
-        task = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen-ws")).replace("http://", "ws://")))
+        task = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen")).replace("http://", "ws://")))
         try:
             async with asyncio.timeout(3):
                 while viewer.connections < 2:
@@ -471,7 +468,7 @@ class TerminalTests(unittest.TestCase):
             fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 25, 100, 0, 0))
             before = termios.tcgetattr(slave)
             process = subprocess.Popen(
-                [sys.executable, "-B", str(Path(tui.__file__).resolve()), "--url", "ws://127.0.0.1:1/listen-ws"],
+                [sys.executable, "-B", str(Path(tui.__file__).resolve()), "--url", "ws://127.0.0.1:1/listen"],
                 stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "TERM": "xterm-256color"})
             output, stage = bytearray(), 0
             deadline = time.monotonic() + 6
@@ -604,10 +601,10 @@ class PageDetailTests(unittest.TestCase):
         self.assertTrue(viewer.mouse_enabled)
 
     def test_caption_url_preserves_other_parameters_and_encodes_opaque_cursor(self):
-        url = tui.caption_url("wss://example.test/listen-ws?token=keep&replay=2", "a+b")
+        url = tui.caption_url("wss://example.test/listen?token=keep&mode=audio&replay=2", "a+b")
         from urllib.parse import parse_qs, urlsplit
         query = parse_qs(urlsplit(url).query)
-        self.assertEqual(query, {"token": ["keep"], "mode": ["captions"], "replay": ["100"], "after": ["a+b"]})
+        self.assertEqual(query, {"token": ["keep"], "replay": ["100"], "after": ["a+b"]})
 
     def test_transcript_uses_height_up_to_footer_without_empty_bottom_quarter(self):
         for height in (24, 30, 40):
@@ -643,11 +640,11 @@ class ReplayConnectionTests(unittest.IsolatedAsyncioTestCase):
                 pass
             return ws
         app = web.Application()
-        app.router.add_get("/listen-ws", endpoint)
+        app.router.add_get("/listen", endpoint)
         server = TestServer(app)
         await server.start_server()
         viewer = tui.Viewer()
-        task = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen-ws")).replace("http://", "ws://")))
+        task = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen")).replace("http://", "ws://")))
         try:
             async with asyncio.timeout(3):
                 while viewer.last_event_id != "1" or viewer.replaying:
@@ -656,7 +653,7 @@ class ReplayConnectionTests(unittest.IsolatedAsyncioTestCase):
                 while viewer.last_event_id != "2" or viewer.replaying:
                     await asyncio.sleep(.01)
             self.assertEqual(requests[1]["after"], "1")
-            self.assertEqual(requests[0]["mode"], "captions")
+            self.assertNotIn("mode", requests[0])
             self.assertFalse(any(c.kind == "gap" for c in viewer.captions))
             self.assertEqual(viewer.captions[-1].text, "Caption 1 Caption 2")
         finally:
@@ -668,14 +665,18 @@ class ReplayConnectionTests(unittest.IsolatedAsyncioTestCase):
 class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_caption_endpoint_replays_then_drives_the_live_ellipsis(self):
         import omi_bridge as bridge
-        runtime = bridge.BridgeState(stt_queue=asyncio.Queue(maxsize=24))
+        runtime = bridge.BridgeState()
+        runtime.live_stt = bridge.GeminiLiveSTT(session=None, api_key="offline", model="test",
+            on_partial=bridge.publish_partial, on_final=bridge.record_live_final,
+            on_gap=bridge.record_live_gap, on_latency=bridge.record_latency,
+            on_connection=bridge.live_connection_changed)
         runtime.recent_events.append(event("A saved passage.", event_id="saved", stream_id="old"))
         with mock.patch.object(bridge, "state", runtime), \
-             mock.patch.object(bridge, "event_logger"), mock.patch.object(bridge, "transcript_logger"):
+             mock.patch.object(bridge, "event_logger"):
             server = TestServer(bridge.create_app(start_workers=False))
             await server.start_server()
             viewer = tui.Viewer()
-            reader = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen-ws")).replace("http://", "ws://")))
+            reader = asyncio.create_task(tui.receive(viewer, str(server.make_url("/listen")).replace("http://", "ws://")))
             status_worker = asyncio.create_task(bridge.caption_status_worker())
             try:
                 async with asyncio.timeout(4):
@@ -690,7 +691,8 @@ class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     rows = tui.rows_for(viewer, 76)
                     self.assertTrue(any(row.suffix == " …" for row in rows))
                     self.assertEqual(viewer.captions[-1].text, "The next thought.")
-                    runtime.current_session.pcm.clear()
+                    runtime.live_stt.queue.clear()
+                    runtime.live_stt.pending_bytes = 0
                     while viewer.pending(tui.time.monotonic()):
                         await asyncio.sleep(.01)
                     self.assertFalse(any(row.suffix for row in tui.rows_for(viewer, 76)))

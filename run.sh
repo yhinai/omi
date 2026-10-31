@@ -224,6 +224,8 @@ check_ports "$CURRENT_PID"
 
 if [ "$ACTION" = restart ]; then
   stop_bridge
+  check_ports
+  clear_data
 elif PID="$(tracked_pid)"; then
   if health_matches "$PID"; then
     echo "Omi bridge is already running and healthy (PID $PID)."
@@ -264,7 +266,7 @@ for _ in {1..30}; do
     echo "Omi bridge started and healthy (PID $PID)."
     echo "Runtime:        $RUNTIME_INFO"
     echo "Health:         http://127.0.0.1:8788/health"
-    echo "Transcript log: $DIR/logs/omi_live_transcript.log"
+    echo "Transcript events: $DIR/logs/omi_transcript_events.jsonl"
     echo "Bridge log:     $DIR/logs/omi_bridge.log"
     echo "Console log:    $CONSOLE_LOG"
     exit 0

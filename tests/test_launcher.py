@@ -7,6 +7,33 @@ import unittest
 
 
 class ClearTests(unittest.TestCase):
+    def test_restart_stops_checks_ports_clears_and_continues_to_startup(self):
+        source = (Path(__file__).resolve().parents[1] / 'run.sh').read_text()
+        start = source.index('if [ "$ACTION" = restart ]; then')
+        dispatch = source[start:source.index('PID="$("$PYTHON"', start)]
+        result = subprocess.run(['bash', '-c',
+            'set -e\nACTION=restart\nstop_bridge() { echo stopped; }\n'
+            'check_ports() { echo checked; }\nclear_data() { echo cleared; }\n'
+            + dispatch + '\necho startup'], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         ['stopped', 'checked', 'cleared', 'checked', 'startup'])
+
+    def test_restart_does_not_clear_if_stop_or_port_check_fails(self):
+        source = (Path(__file__).resolve().parents[1] / 'run.sh').read_text()
+        start = source.index('if [ "$ACTION" = restart ]; then')
+        dispatch = source[start:source.index('PID="$("$PYTHON"', start)]
+        for failing in ('stop_bridge', 'check_ports'):
+            with self.subTest(failing=failing):
+                result = subprocess.run(['bash', '-c',
+                    'set -e\nACTION=restart\nstop_bridge() { :; }\n'
+                    'check_ports() { :; }\nclear_data() { echo cleared; }\n'
+                    + failing + '() { return 1; }\n'
+                    + dispatch + '\necho startup'], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertNotIn('cleared', result.stdout)
+                self.assertNotIn('startup', result.stdout)
+
     def test_clear_removes_bridge_history_and_preserves_service_files(self):
         launcher = Path(__file__).resolve().parents[1] / 'run.sh'
         source = launcher.read_text()

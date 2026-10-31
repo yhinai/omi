@@ -332,7 +332,7 @@ class LiveTests(unittest.IsolatedAsyncioTestCase):
 
 class BridgeLiveTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.state = bridge.BridgeState(stt_queue=asyncio.Queue(maxsize=24))
+        self.state = bridge.BridgeState()
         patcher = mock.patch.object(bridge, "state", self.state)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -356,14 +356,12 @@ class BridgeLiveTests(unittest.IsolatedAsyncioTestCase):
         bridge.publish_partial({"type": "partial", "utterance_id": "old", "text": ""})
         self.assertEqual(self.state.partial_caption["utterance_id"], "new")
 
-    def test_live_ingress_retains_ring_audio_and_bypasses_batch_buffer(self):
+    def test_live_ingress_forwards_audio(self):
         stream = mock.Mock()
         self.state.live_stt = stream
         bridge.ingest_raw_pcm(SPEECH)
         stream.feed.assert_called_once()
-        self.assertEqual(self.state.audio_ring[-1][2], SPEECH)
-        self.assertFalse(self.state.audio_sessions)
-        self.assertTrue(self.state.stt_queue.empty())
+        self.assertEqual(stream.feed.call_args.args[0], SPEECH)
 
     def test_final_events_are_marked_and_persisted_once(self):
         with mock.patch.object(bridge, "write_event", return_value=True) as output:
@@ -371,7 +369,7 @@ class BridgeLiveTests(unittest.IsolatedAsyncioTestCase):
         event = output.call_args.args[0]
         self.assertEqual((event["type"],event["is_final"],event["utterance_id"]), ("transcript",True,"u1"))
         self.assertEqual(self.state.metrics["transcripts_emitted"],1)
-        self.assertEqual(self.state.metrics["windows_processed"],1)
+        self.assertEqual(self.state.metrics["utterances_processed"],1)
 
     async def test_live_startup_uses_no_batch_worker_and_stops_before_http_session_closes(self):
         from live_stt import GeminiLiveSTT
@@ -387,7 +385,6 @@ class BridgeLiveTests(unittest.IsolatedAsyncioTestCase):
             stopped.set()
         app = {}
         with mock.patch.object(bridge, "GEMINI_API_KEY", "test"), \
-             mock.patch.object(bridge, "STT_MODE", "live"), \
              mock.patch.object(bridge, "seed_recent_events"), \
              mock.patch.object(GeminiLiveSTT, "run", run), \
              mock.patch.object(GeminiLiveSTT, "close", close):
@@ -397,8 +394,77 @@ class BridgeLiveTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("slicer_task", app)
                 self.assertNotIn("stt_worker_task", app)
                 self.assertEqual(bridge.build_health_dict()["stt_mode"], "live")
-                self.assertEqual(bridge.build_health_dict()["core_window_sec"], 0)
+                self.assertNotIn("core_window_sec", bridge.build_health_dict())
                 self.assertTrue(bridge.build_health_dict()["stream_connected"])
             finally:
                 await bridge.on_cleanup(app)
         self.assertIsNone(self.state.http_session)
+
+
+class LiveBridgeIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_phone_audio_reaches_provider_and_shutdown_persists_final(self):
+        """Exercise actual ingress, provider WebSocket, captions, files, and cleanup offline."""
+        import tempfile
+        from pathlib import Path
+        from aiohttp.test_utils import TestClient
+
+        partial_sent = False
+        samples = 0
+
+        async def provider(request):
+            nonlocal partial_sent, samples
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            async for message in ws:
+                data = json.loads(message.data)
+                if "setup" in data:
+                    await ws.send_json({"setupComplete": {}})
+                realtime = data.get("realtimeInput", {})
+                if "audio" in realtime:
+                    samples += len(live.base64.b64decode(realtime["audio"]["data"])) // 2
+                    if not partial_sent:
+                        partial_sent = True
+                        await ws.send_json({"serverContent": {
+                            "interimInputTranscription": {"text": "Controlled speech"}}})
+                if realtime.get("audioStreamEnd"):
+                    await ws.send_json({"serverContent": {
+                        "inputTranscription": {"text": "Controlled speech final."}}})
+                    await ws.send_json({"serverContent": {"generationComplete": True}})
+            return ws
+
+        provider_app = web.Application()
+        provider_app.router.add_get("/provider", provider)
+        async with TestServer(provider_app) as provider_server:
+            runtime = bridge.BridgeState()
+            with tempfile.TemporaryDirectory() as directory, \
+                 mock.patch.object(bridge, "state", runtime), \
+                 mock.patch.object(bridge, "GEMINI_API_KEY", "offline-test"), \
+                 mock.patch.object(bridge, "STREAM_TOKEN", ""), \
+                 mock.patch.object(bridge, "LOG_DIR", directory), \
+                 mock.patch.object(bridge, "event_logger") as events, \
+                 mock.patch.object(live, "LIVE_URL", str(provider_server.make_url("/provider"))):
+                async with TestClient(TestServer(bridge.create_app())) as client:
+                    async with asyncio.timeout(3):
+                        while not runtime.live_stt.connected:
+                            await asyncio.sleep(.01)
+                    self.assertEqual(bridge.build_health_dict()["status"], "ok")
+                    async with client.ws_connect("/listen?replay=0") as captions:
+                        async with client.ws_connect("/v1/listen") as phone:
+                            await phone.send_bytes(SPEECH)
+                            async with asyncio.timeout(3):
+                                while True:
+                                    caption = await captions.receive_json()
+                                    if caption.get("type") == "partial" and caption.get("text"):
+                                        break
+                            self.assertEqual(caption["text"], "Controlled speech")
+                            events.info.assert_not_called()
+                saved = [json.loads(call.args[0]) for call in events.info.call_args_list]
+                self.assertEqual([event["type"] for event in saved], ["transcript"])
+                self.assertEqual(saved[0]["text"], "Controlled speech final.")
+                self.assertTrue(saved[0]["is_final"])
+                self.assertGreaterEqual(samples, len(SPEECH) // 2)
+                self.assertEqual(runtime.metrics["utterances_processed"], 1)
+                self.assertEqual(runtime.metrics["transcripts_emitted"], 1)
+                self.assertFalse(runtime.background_tasks)
+                self.assertIsNone(runtime.http_session)
+                self.assertIn("Controlled speech final.", next(Path(directory).glob("*.md")).read_text())
