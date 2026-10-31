@@ -12,7 +12,7 @@ from unittest import mock
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-import omi_tui as tui
+import tui
 
 
 def event(text, session=1, source=100, **kwargs):
@@ -711,9 +711,9 @@ class ReplayConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_caption_endpoint_replays_without_pending_decoration(self):
-        import omi_bridge as bridge
+        import bridge
         runtime = bridge.BridgeState()
-        runtime.live_stt = bridge.GeminiLiveSTT(session=None, api_key="offline", model="test",
+        runtime.live_stt = bridge.LocalWhisperSTT(python="python", model="test", vad="vad",
             on_partial=bridge.publish_partial, on_final=bridge.record_live_final,
             on_gap=bridge.record_live_gap, on_latency=bridge.record_latency,
             on_connection=bridge.live_connection_changed)

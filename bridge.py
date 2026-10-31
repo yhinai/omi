@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.15
-"""Single-device PCM16 -> persistent Gemini Live transcription bridge."""
+"""Single-device PCM16 -> live transcription and terminal captions."""
 import asyncio
 from collections import deque
 from contextlib import suppress
@@ -38,21 +38,21 @@ if __name__ == "__main__":
 import aiohttp
 from aiohttp import web
 
-from live_stt import GeminiLiveSTT
+from stt import LocalWhisperSTT
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 SAMPLE_RATE = 16000
 BYTES_PER_SECOND = SAMPLE_RATE * 2
 MAX_AUDIO_AGE_SEC = 45.0
-GEMINI_API_KEY = ""
-GEMINI_LIVE_MODEL = "gemini-3.5-transcribe-live"
-IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD = 8.0, 80.0
+STT_BACKEND = "whisper"
+WHISPER_PYTHON = WHISPER_MODEL = WHISPER_VAD = ""
+IDLE_FLUSH_SEC = 8.0
 MAX_INPUT_BYTES = BYTES_PER_SECOND * 300
 HOST = "0.0.0.0"
 PORT, HEALTH_PORT = 8787, 8788
 STREAM_TOKEN = ""
-logger = logging.getLogger("omi_bridge")
+logger = logging.getLogger("bridge")
 event_logger = logging.getLogger("omi_transcript_events")
 
 
@@ -77,39 +77,35 @@ def _read_env_file(path):
 
 
 def _load_dotenv(local_path=None, environ=None):
-    """Resolve process > project .env, including both key aliases."""
+    """Resolve process variables over the project .env."""
     sources = [dict(os.environ if environ is None else environ),
                _read_env_file(local_path or os.path.join(BASE_DIR, ".env"))]
     values = {}
     for source in reversed(sources):
         values.update(source)
-    values["GEMINI_API_KEY"] = next(
-        (source[key].strip() for source in sources for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY")
-         if source.get(key, "").strip()), "")
     return values
 
 
 def configure(env=None):
-    global GEMINI_API_KEY, GEMINI_LIVE_MODEL, MAX_AUDIO_AGE_SEC
-    global IDLE_FLUSH_SEC, RMS_SILENCE_THRESHOLD, HOST, STREAM_TOKEN
+    global MAX_AUDIO_AGE_SEC
+    global IDLE_FLUSH_SEC, HOST, STREAM_TOKEN
+    global WHISPER_PYTHON, WHISPER_MODEL, WHISPER_VAD
     env = _load_dotenv() if env is None else env
     HOST = (env.get("OMI_HOST") or "0.0.0.0").strip()
     STREAM_TOKEN = (env.get("OMI_STREAM_TOKEN") or "").strip()
-    GEMINI_API_KEY = (env.get("GEMINI_API_KEY") or env.get("GOOGLE_API_KEY") or "").strip()
-    if not GEMINI_API_KEY or GEMINI_API_KEY.lower() in ("your_gemini_api_key_here", "your_api_key_here"):
-        raise ValueError("Set GEMINI_API_KEY (or GOOGLE_API_KEY) in ~/omi/.env or the environment")
-    if env.get("OMI_STT_MODE", "live").strip().lower() != "live":
-        raise ValueError("Only live transcription is supported; remove OMI_STT_MODE from your configuration")
-    GEMINI_LIVE_MODEL = env.get("OMI_GEMINI_LIVE_MODEL", "gemini-3.5-transcribe-live").strip()
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", GEMINI_LIVE_MODEL):
-        raise ValueError("OMI_GEMINI_LIVE_MODEL must be a valid model ID")
+    assets = os.path.expanduser("~/Library/Application Support/OmiWhisper")
+    WHISPER_PYTHON = os.path.expanduser(env.get("OMI_WHISPER_PYTHON", os.path.join(BASE_DIR, ".venv-whisper/bin/python")))
+    WHISPER_MODEL = os.path.expanduser(env.get("OMI_WHISPER_MODEL", os.path.join(assets, "whisper-turbo")))
+    WHISPER_VAD = os.path.expanduser(env.get("OMI_WHISPER_VAD", os.path.join(assets, "silero_vad.onnx")))
+    if not os.path.isfile(WHISPER_PYTHON) or not os.access(WHISPER_PYTHON, os.X_OK):
+        raise ValueError("Install the Python 3.14 Whisper worker environment; see README.md")
+    if not all(os.path.isfile(path) for path in (os.path.join(WHISPER_MODEL, "config.json"),
+            os.path.join(WHISPER_MODEL, "weights.safetensors"), WHISPER_VAD)):
+        raise ValueError("Whisper or Silero model files are missing; see README.md")
     MAX_AUDIO_AGE_SEC = float(env.get("OMI_MAX_AUDIO_AGE_SEC", "45"))
     IDLE_FLUSH_SEC = float(env.get("OMI_IDLE_FLUSH_SEC", "8"))
-    RMS_SILENCE_THRESHOLD = float(env.get("OMI_RMS_THRESHOLD", "80"))
     if not all(math.isfinite(v) and v > 0 for v in (MAX_AUDIO_AGE_SEC, IDLE_FLUSH_SEC)):
         raise ValueError("Maximum audio age and idle timeout must be finite and positive")
-    if not math.isfinite(RMS_SILENCE_THRESHOLD) or RMS_SILENCE_THRESHOLD < 0:
-        raise ValueError("RMS threshold must be finite and nonnegative")
 
 
 class OutputFileHandler(RotatingFileHandler):
@@ -148,28 +144,37 @@ def new_metrics():
 
 
 @dataclass
+class PhoneStream:
+    queue: asyncio.Queue
+    start_sample: int
+
+
+@dataclass
 class BridgeState:
+    recognized_utterances: deque = field(default_factory=lambda: deque(maxlen=256))
+    failed_finals: dict = field(default_factory=dict)
     daily_notes: object = None
     caption_listeners: dict = field(default_factory=dict)
     stream_clients: dict = field(default_factory=dict)
+    stream_admission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     recent_events: deque = field(default_factory=lambda: deque(maxlen=200))
     stream_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     background_tasks: dict = field(default_factory=dict)
-    http_session: aiohttp.ClientSession | None = None
     stopping: bool = False
     metrics: dict = field(default_factory=new_metrics)
-    live_stt: GeminiLiveSTT | None = None
+    live_stt: LocalWhisperSTT | None = None
     partial_caption: dict | None = None
     latency_samples: dict = field(default_factory=lambda: {
         name: deque(maxlen=128) for name in ("receipt_to_transcript_sec",
-                                           "receipt_to_first_partial_sec", "receipt_to_final_sec")})
+                                           "receipt_to_first_partial_sec", "receipt_to_final_sec",
+                                           "receipt_to_send_sec", "turn_close_to_final_sec", "turn_boundary_wait_sec")})
 
 
 state = BridgeState()
 
 
 def record_latency(name, seconds):
-    state.latency_samples[name].append(max(0.0, seconds))
+    state.latency_samples.setdefault(name, deque(maxlen=128)).append(max(0.0, seconds))
 
 
 def latency_summary(samples):
@@ -228,11 +233,15 @@ def publish_partial(event):
 
 
 def record_live_final(text, **timing):
-    state.metrics["last_stt_success_at"] = time.monotonic()
-    state.metrics["utterances_processed"] += 1
-    state.metrics["last_error"] = None
+    identity = timing.get("utterance_id")
+    if identity is None or identity not in state.recognized_utterances:
+        state.metrics["last_stt_success_at"] = time.monotonic()
+        state.metrics["utterances_processed"] += 1
+        if identity is not None:
+            state.recognized_utterances.append(identity)
     saved = record_transcript_line(text, **timing)
     if saved is not False:
+        state.metrics["last_error"] = None
         state.metrics["last_transcript_at"] = time.monotonic()
         state.metrics["transcripts_emitted"] += 1
     return saved
@@ -246,8 +255,8 @@ def record_live_gap(reason, seconds, **timing):
 
 
 def live_connection_changed(connected, error):
-    state.metrics["last_error"] = None if connected else "Gemini Live: " + str(error)
-    logger.info("Gemini Live %s", "connected" if connected else "reconnecting (" + str(error) + ")")
+    state.metrics["last_error"] = None if connected else STT_BACKEND + ": " + str(error)
+    logger.info("%s %s", STT_BACKEND, "ready" if connected else "reconnecting (" + str(error) + ")")
 
 
 def current_stt_in_flight():
@@ -261,7 +270,7 @@ def caption_status():
     stream = state.live_stt
     return {"type": "status", "stream_id": state.stream_id,
             "session_id": stream.session_id if stream is not None else None,
-            "stt_mode": "live",
+            "stt_mode": "live", "stt_backend": STT_BACKEND,
             "stream_connected": bool(stream is not None and stream.connected),
             "audio_active": age is not None and age < 3,
             "last_packet_age_sec": round(age, 1) if age is not None else None,
@@ -362,11 +371,12 @@ def output_failed(target, error):
     logger.error("Transcript output failed: %s", state.metrics["last_output_error"])
 
 
-def write_event(event):
+def write_event(event, *, already_persisted=False):
     """Persist JSONL first, then publish captions and update daily Markdown."""
     encoded = json.dumps(event, ensure_ascii=False)
     try:
-        event_logger.info(encoded)
+        if not already_persisted:
+            event_logger.info(encoded)
     except Exception as error:
         output_failed("jsonl", error)
         return False
@@ -375,19 +385,20 @@ def write_event(event):
     publish_caption(event)
     if event.get("type") == "transcript" and event.get("text"):
         text_val = event["text"]
-        seg = {"text": text_val, "start": 0.0, "end": 2.0, "speaker": "SPEAKER_0", "speaker_id": 0, "is_user": False}
-        words = [{"word": w, "punctuated_word": w, "start": 0.0, "end": 0.1, "speaker": 0} for w in text_val.split()]
-        reply = json.dumps({
-            "type": "Results",
-            "is_final": True,
-            "speech_final": True,
-            "text": text_val,
-            "segments": [seg],
-            "channel": {"alternatives": [{"transcript": text_val, "words": words}]},
-        }, ensure_ascii=False)
-        for ws_client, q in list(state.stream_clients.items()):
+        start, end = event.get("sample_offset"), event.get("sample_end_offset")
+        for client in list(state.stream_clients.values()):
+            # A late final from the previous phone connection belongs to its
+            # old timeline, not the replacement connection's recording.
+            if start is not None and start < client.start_sample:
+                continue
+            seg = {"text": text_val, "speaker": "SPEAKER_0", "speaker_id": 0, "is_user": False}
+            if start is not None and end is not None:
+                seg.update(start=(start - client.start_sample) / SAMPLE_RATE,
+                           end=(max(start, end) - client.start_sample) / SAMPLE_RATE)
+            reply = json.dumps({"type": "Results", "is_final": True, "speech_final": True,
+                                "text": text_val, "segments": [seg]}, ensure_ascii=False)
             try:
-                q.put_nowait(reply)
+                client.queue.put_nowait(reply)
             except asyncio.QueueFull:
                 pass
     timestamp, text = event["timestamp"], event["text"]
@@ -409,7 +420,7 @@ def write_event(event):
 
 
 def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=None,
-               session_id=None, sample_offset=None, utterance_id=None):
+               session_id=None, sample_offset=None, utterance_id=None, sample_end_offset=None):
     processed_at = time.time() if processed_at is None else processed_at
     source_at = audio_start_at if audio_start_at is not None else processed_at
     event = {"event_id": uuid.uuid4().hex, "stream_id": state.stream_id, "type": kind,
@@ -419,11 +430,13 @@ def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=N
             "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time"}
     if utterance_id is not None:
         event.update(utterance_id=utterance_id, is_final=True, transcription_mode="live")
+    if sample_end_offset is not None:
+        event["sample_end_offset"] = sample_end_offset
     return event
 
 
 def record_gap(reason, seconds, *, session_id=None, sample_offset=None, audio_start_at=None,
-               received_at=None):
+               received_at=None, detail=None):
     if seconds <= 0:
         return
     state.metrics[f"lost_audio_sec_{reason}"] += seconds
@@ -431,6 +444,8 @@ def record_gap(reason, seconds, *, session_id=None, sample_offset=None, audio_st
                        audio_start_at=audio_start_at, received_at=received_at,
                        session_id=session_id, sample_offset=sample_offset)
     event.update(reason=reason, duration_sec=seconds)
+    if detail:
+        event["detail"] = detail
     write_event(event)
 
 
@@ -438,9 +453,38 @@ def record_transcript_line(text, **timing):
     text = re.sub(r"(?<![A-Z])([.?!])([A-Z])", r"\1 \2", " ".join(text.split()).strip())
     if not text:
         return False
-    event = make_event("transcript", text, **timing)
-    if not write_event(event):
+    identity = (timing.get("session_id"), timing.get("utterance_id"))
+    retryable = identity[1] is not None
+    retry = state.failed_finals.get(identity) if retryable else None
+    event = retry or make_event("transcript", text, **timing)
+    persisted = False
+    if retry is not None:
+        # A write/flush can fail after the full line reached the file. Reuse the
+        # same event ID and check the bounded rotated journal before appending.
+        path = os.path.join(LOG_DIR, "omi_transcript_events.jsonl")
+        try:
+            for candidate in [path] + [path+f".{index}" for index in range(1, 4)]:
+                if not os.path.isfile(candidate):
+                    continue
+                with open(candidate, encoding="utf-8", errors="replace") as journal:
+                    for line in journal:
+                        try:
+                            persisted |= json.loads(line).get("event_id") == event["event_id"]
+                        except (ValueError, AttributeError):
+                            continue
+            if not persisted and os.path.isfile(path) and os.path.getsize(path):
+                with open(path, "rb+") as journal:
+                    journal.seek(-1, os.SEEK_END)
+                    if journal.read(1) != b"\n":
+                        journal.write(b"\n")  # Keep a partial failed line separate.
+        except OSError as error:
+            output_failed("jsonl", error)
+            return False
+    if not write_event(event, already_persisted=persisted):
+        if retryable:
+            state.failed_finals[identity] = event
         return False
+    state.failed_finals.pop(identity, None)
     return True
 
 
@@ -468,15 +512,23 @@ def build_health_dict():
     overloaded = bool(stream is not None and (stream.pending_bytes >= BYTES_PER_SECOND * 10 or len(stream.queue) >= 256))
     pending_age = oldest_pending_audio_age()
     stalled = pending_age is not None and pending_age > MAX_AUDIO_AGE_SEC
-    ready = (GEMINI_API_KEY and workers_alive and connected and not state.stopping and not overloaded
-             and not stalled and not state.metrics["last_error"] and not state.metrics["last_output_error"])
+    ready = (workers_alive and connected and not state.stopping and not overloaded
+             and not stalled and not getattr(stream, "save_error", None)
+             and not state.metrics["last_error"] and not state.metrics["last_output_error"])
     return {
         "status": "ok" if ready else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
-        "gemini_key_configured": bool(GEMINI_API_KEY), "stt_mode": "live", "model": GEMINI_LIVE_MODEL,
+        "stt_mode": "live", "stt_backend": STT_BACKEND,
+        "model": "whisper-large-v3-turbo-fp16",
+        "worker_load_warm_sec": getattr(stream, "load_warm_sec", None),
         "stream_connected": connected,
         "stream_reconnects": stream.reconnects if stream is not None else 0,
         "partial_updates": stream.partial_updates if stream is not None else 0,
+        "pending_finals": len(stream.closing_turns) if stream is not None else 0,
+        "pending_saves": len(getattr(stream, "pending_finals", ())),
+        "save_error": getattr(stream, "save_error", None),
+        "turns_without_text": stream.turns_without_text if stream is not None else 0,
+        "gap_causes": dict(stream.gap_causes) if stream is not None else {},
         "stt_in_flight": current_stt_in_flight(), "max_audio_age_sec": MAX_AUDIO_AGE_SEC,
         "latency": {name: latency_summary(samples) for name, samples in state.latency_samples.items()},
         "oldest_pending_audio_age_sec": pending_age,
@@ -533,12 +585,6 @@ async def handle_omi_ws(request):
         raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
     _verify_stream_auth(request)
     remote_ip = _client_remote(request)
-    if state.stream_clients:
-        if remote_ip != state.metrics.get("direct_ws_remote"):
-            raise web.HTTPConflict(text="Another direct audio stream is already active")
-        for old_ws in list(state.stream_clients):
-            state.stream_clients.pop(old_ws, None)
-            asyncio.create_task(old_ws.close())
     encoding = request.query.get("encoding", "linear16").strip().lower()
     if encoding not in ("linear16", "pcm16", "pcm", ""):
         raise web.HTTPBadRequest(text="encoding must be linear16 or pcm16")
@@ -550,11 +596,22 @@ async def handle_omi_ws(request):
     if sr != SAMPLE_RATE or channels != 1:
         raise web.HTTPBadRequest(text="sample_rate=16000 and channels=1 required")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_INPUT_BYTES + 1)
-    await ws.prepare(request)
     queue = asyncio.Queue(maxsize=32)
-    state.stream_clients[ws] = queue
-    state.metrics["direct_ws_remote"] = remote_ip
-    state.metrics["audio_source"] = "direct_ws"
+    # Serialize admission across the handshake so concurrent attempts cannot
+    # bypass the single-stream check. Failed upgrades leave the old stream alone.
+    async with state.stream_admission_lock:
+        if state.stream_clients and remote_ip != state.metrics.get("direct_ws_remote"):
+            raise web.HTTPConflict(text="Another direct audio stream is already active")
+        await ws.prepare(request)
+        for old_ws in list(state.stream_clients):
+            state.stream_clients.pop(old_ws, None)
+            asyncio.create_task(old_ws.close())
+        start_sample = state.live_stt.total_input_samples if state.live_stt is not None else 0
+        if state.live_stt is not None:
+            state.live_stt.new_session()
+        state.stream_clients[ws] = PhoneStream(queue, start_sample)
+        state.metrics["direct_ws_remote"] = remote_ip
+        state.metrics["audio_source"] = "direct_ws"
     logger.info("Direct phone WebSocket connected from %s", remote_ip)
 
     async def sender():
@@ -671,19 +728,15 @@ async def handle_listen(request):
 
 
 async def on_startup(app):
-    if not GEMINI_API_KEY:
-        raise ValueError("Gemini API key is required")
     seed_recent_events()
     state.daily_notes = DailyNotes(LOG_DIR)
-    state.http_session = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=12, connect=5, sock_read=10),
-        connector=aiohttp.TCPConnector(limit=10, limit_per_host=4), cookie_jar=aiohttp.DummyCookieJar())
     state.stopping = False
     state.metrics["started_at"] = time.monotonic()
-    state.live_stt = GeminiLiveSTT(session=state.http_session, api_key=GEMINI_API_KEY,
-        model=GEMINI_LIVE_MODEL, on_partial=publish_partial, on_final=record_live_final,
+    callbacks = dict(on_partial=publish_partial, on_final=record_live_final,
         on_gap=record_live_gap, on_latency=record_latency, on_connection=live_connection_changed,
-        max_age=MAX_AUDIO_AGE_SEC, idle_flush=IDLE_FLUSH_SEC, rms_threshold=RMS_SILENCE_THRESHOLD)
+        max_age=MAX_AUDIO_AGE_SEC, idle_flush=IDLE_FLUSH_SEC)
+    state.live_stt = LocalWhisperSTT(python=WHISPER_PYTHON, model=WHISPER_MODEL,
+                                   vad=WHISPER_VAD, **callbacks)
     for name, factory in (("caption_status_task", caption_status_worker), ("live_stt_task", state.live_stt.run)):
         app[name] = asyncio.create_task(factory())
         state.background_tasks[name] = app[name]
@@ -706,11 +759,6 @@ async def on_cleanup(app):
         flush_daily_paragraph()
         logger.info("Shutdown drain complete")
     finally:
-        if state.http_session is not None:
-            await state.http_session.close()
-            # aiohttp TLS transports finish closing after ClientSession.close().
-            await asyncio.sleep(.25)
-            state.http_session = None
         state.background_tasks.clear()
 
 
@@ -756,10 +804,10 @@ if __name__ == "__main__":
     try:
         configure()
     except (ValueError, OSError):
-        sys.exit("Invalid bridge configuration; check API key and numeric settings in .env")
+        sys.exit("Invalid bridge configuration; check model paths and numeric settings in .env")
     if len(sys.argv) > 1:
         if sys.argv[1:] != ["--check-config"]:
-            sys.exit("Usage: omi_bridge.py [--check-config]")
+            sys.exit("Usage: bridge.py [--check-config]")
         print("Bridge configuration is valid")
     else:
         configure_logging()

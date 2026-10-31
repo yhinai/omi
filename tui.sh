@@ -6,4 +6,4 @@ if [ ! -x "$PYTHON" ]; then
   echo "Python 3.15 environment missing. Set up the bridge with ~/omi/run.sh first." >&2
   exit 1
 fi
-exec "$PYTHON" -B "$DIR/omi_tui.py" "$@"
+exec "$PYTHON" -B "$DIR/tui.py" "$@"

@@ -18,12 +18,12 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 if os.environ.get("OMI_BRIDGE_PATH"):
-    spec = importlib.util.spec_from_file_location("omi_bridge", os.environ["OMI_BRIDGE_PATH"])
+    spec = importlib.util.spec_from_file_location("bridge", os.environ["OMI_BRIDGE_PATH"])
     bridge = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = bridge
     spec.loader.exec_module(bridge)
 else:
-    import omi_bridge as bridge
+    import bridge
 
 bridge.logger.addHandler(logging.NullHandler())
 bridge.logger.propagate = False
@@ -34,7 +34,7 @@ VersionInfo = namedtuple("VersionInfo", "major minor micro releaselevel serial")
 
 def live_state():
     runtime = bridge.BridgeState()
-    runtime.live_stt = bridge.GeminiLiveSTT(session=None, api_key="offline", model="test",
+    runtime.live_stt = bridge.LocalWhisperSTT(python="python", model="test", vad="vad",
         on_partial=bridge.publish_partial, on_final=bridge.record_live_final,
         on_gap=bridge.record_live_gap, on_latency=bridge.record_latency,
         on_connection=bridge.live_connection_changed)
@@ -79,7 +79,7 @@ import aiohttp.web, importlib.util, os, sys
 from unittest import mock
 sys.dont_write_bytecode = True
 before = dict(os.environ)
-spec = importlib.util.spec_from_file_location('omi_bridge_import_probe', sys.argv[1])
+spec = importlib.util.spec_from_file_location('bridge_import_probe', sys.argv[1])
 module = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = module
 with mock.patch('builtins.open', side_effect=AssertionError('file access during import')), \\
@@ -94,47 +94,40 @@ assert dict(os.environ) == before, 'import changed environment'
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_configuration_precedence_includes_gemini_key_aliases(self):
+    def test_process_configuration_overrides_project_file(self):
         with tempfile.TemporaryDirectory() as directory:
-            local = Path(directory) / "local.env"
-            local.write_text("GOOGLE_API_KEY=local-key\nOMI_IDLE_FLUSH_SEC=6\n")
-            merged = bridge._load_dotenv(local_path=local, environ={})
-            self.assertEqual(merged["GEMINI_API_KEY"], "local-key")
-            self.assertEqual(merged["OMI_IDLE_FLUSH_SEC"], "6")
-            merged = bridge._load_dotenv(local_path=local,
-                environ={"GOOGLE_API_KEY": "shell-key", "OMI_IDLE_FLUSH_SEC": "5"})
-            self.assertEqual(merged["GEMINI_API_KEY"], "shell-key")
-            self.assertEqual(merged["OMI_IDLE_FLUSH_SEC"], "5")
+            local = Path(directory)/"local.env"
+            local.write_text("OMI_IDLE_FLUSH_SEC=6\n")
+            self.assertEqual(bridge._load_dotenv(local_path=local, environ={})["OMI_IDLE_FLUSH_SEC"], "6")
+            self.assertEqual(bridge._load_dotenv(local_path=local, environ={"OMI_IDLE_FLUSH_SEC":"5"})["OMI_IDLE_FLUSH_SEC"], "5")
 
 
 class LiveConfigurationTests(unittest.TestCase):
+    def configure(self, env):
+        with mock.patch.object(bridge.os.path, "isfile", return_value=True), mock.patch.object(bridge.os, "access", return_value=True):
+            bridge.configure(env)
+
     def tearDown(self):
-        bridge.configure({"GEMINI_API_KEY": "offline-key"})
+        self.configure({})
 
-    def test_live_defaults_and_audio_tuning(self):
-        bridge.configure({"GEMINI_API_KEY": "offline-key", "OMI_MAX_AUDIO_AGE_SEC": "12",
-                          "OMI_IDLE_FLUSH_SEC": "4", "OMI_RMS_THRESHOLD": "0"})
-        self.assertEqual(bridge.MAX_AUDIO_AGE_SEC, 12)
-        self.assertEqual(bridge.IDLE_FLUSH_SEC, 4)
-        self.assertEqual(bridge.RMS_SILENCE_THRESHOLD, 0)
+    def test_local_defaults_and_audio_tuning(self):
+        self.configure({"OMI_MAX_AUDIO_AGE_SEC":"12", "OMI_IDLE_FLUSH_SEC":"4"})
+        self.assertEqual(bridge.MAX_AUDIO_AGE_SEC,12)
+        self.assertEqual(bridge.IDLE_FLUSH_SEC,4)
+        self.assertEqual(bridge.STT_BACKEND,"whisper")
 
-    def test_legacy_live_selector_is_tolerated_but_batch_is_rejected(self):
-        bridge.configure({"GEMINI_API_KEY": "offline-key", "OMI_STT_MODE": "live"})
-        with self.assertRaisesRegex(ValueError, "Only live transcription"):
-            bridge.configure({"GEMINI_API_KEY": "offline-key", "OMI_STT_MODE": "batch"})
-
-    def test_invalid_live_model_and_speech_threshold_are_rejected(self):
-        for name, values in (("OMI_GEMINI_LIVE_MODEL", ("", "../bad", "model?key=x")),
-                             ("OMI_RMS_THRESHOLD", ("-1", "nan", "inf"))):
-            for value in values:
-                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
-                    bridge.configure({"GEMINI_API_KEY": "offline-key", name: value})
+    def test_missing_worker_and_models_are_rejected(self):
+        with mock.patch.object(bridge.os.path,"isfile",return_value=False):
+            with self.assertRaisesRegex(ValueError,"worker environment"):
+                bridge.configure({})
+        with mock.patch.object(bridge.os.path,"isfile",side_effect=[True,False]), mock.patch.object(bridge.os,"access",return_value=True):
+            with self.assertRaisesRegex(ValueError,"model files"):
+                bridge.configure({})
 
 
 class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.patches = [mock.patch.object(bridge, "state", live_state()),
-                        mock.patch.object(bridge, "GEMINI_API_KEY", ""),
                         mock.patch.object(bridge, "flush_daily_paragraph")]
         for patcher in self.patches:
             patcher.start()
@@ -164,8 +157,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
     async def test_disconnected_provider_is_degraded_even_when_workers_are_alive(self):
         worker = mock.Mock()
         worker.done.return_value = False
-        with mock.patch.object(bridge, "GEMINI_API_KEY", "offline-key"), \
-             mock.patch.object(bridge.state, "background_tasks", {"worker": worker}):
+        with mock.patch.object(bridge.state, "background_tasks", {"worker": worker}):
             self.assertFalse(bridge.state.live_stt.connected)
             self.assertEqual(bridge.build_health_dict()["status"], "degraded")
 
@@ -208,8 +200,8 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 503)
         data = await response.json()
         self.assertIn("queue_depth", data)
-        self.assertEqual(data["model"], bridge.GEMINI_LIVE_MODEL)
-        self.assertFalse(data["gemini_key_configured"])
+        self.assertEqual(data["model"], "whisper-large-v3-turbo-fp16")
+        self.assertEqual(data["stt_backend"], "whisper")
         response = await client.get("/omi")
         self.assertEqual(response.status, 404)
 
@@ -217,8 +209,7 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         client = await self.client_for(bridge.create_health_app())
         alive = mock.Mock()
         alive.done.return_value = False
-        with mock.patch.object(bridge, "GEMINI_API_KEY", "offline-key"), \
-             mock.patch.object(bridge.state, "background_tasks", {"worker": alive}), \
+        with mock.patch.object(bridge.state, "background_tasks", {"worker": alive}), \
              mock.patch.object(bridge.state.live_stt, "connected", True), \
              mock.patch.dict(bridge.state.metrics, {"last_error": None}):
             response = await client.get("/health")
@@ -237,6 +228,72 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                 message = await ws.receive(timeout=1)
                 self.assertEqual(message.data, 1003)
         self.assertEqual(bridge.state.live_stt.pending_bytes, 0)
+
+    async def test_invalid_reconnect_preserves_working_stream(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        headers = {"Authorization": "Bearer secret-token", "X-Forwarded-For": "192.0.2.1"}
+        with mock.patch.object(bridge, "STREAM_TOKEN", "secret-token"):
+            async with client.ws_connect("/v1/listen", headers=headers) as phone:
+                original = next(iter(bridge.state.stream_clients))
+                for query in ("encoding=opus", "sample_rate=bad", "sample_rate=44100", "channels=2"):
+                    response = await client.get("/v1/listen?" + query, headers=headers)
+                    self.assertEqual(response.status, 400)
+                    self.assertIn(original, bridge.state.stream_clients)
+                    self.assertFalse(original.closed)
+                # Valid parameters still require a successful WebSocket upgrade.
+                response = await client.get("/v1/listen", headers=headers)
+                self.assertEqual(response.status, 400)
+                response = await client.get("/v1/listen", headers={**headers, "Authorization": "Bearer wrong"})
+                self.assertEqual(response.status, 401)
+                self.assertIn(original, bridge.state.stream_clients)
+                self.assertFalse(original.closed)
+                await phone.send_bytes(SPEECH)
+                async with asyncio.timeout(1):
+                    while not bridge.state.live_stt.pending_bytes:
+                        await asyncio.sleep(.01)
+                with mock.patch.object(bridge, "event_logger"):
+                    bridge.record_transcript_line("Original stream still works")
+                self.assertEqual((await phone.receive_json(timeout=1))["text"], "Original stream still works")
+
+    async def test_valid_reconnect_replaces_previous_stream(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        headers = {"X-Forwarded-For": "192.0.2.1"}
+        async with client.ws_connect("/v1/listen", headers=headers) as old_phone:
+            old_server = next(iter(bridge.state.stream_clients))
+            async with client.ws_connect("/v1/listen", headers=headers) as new_phone:
+                await old_phone.receive(timeout=1)
+                self.assertTrue(old_phone.closed)
+                self.assertNotIn(old_server, bridge.state.stream_clients)
+                self.assertEqual(len(bridge.state.stream_clients), 1)
+                await new_phone.send_bytes(SPEECH)
+                async with asyncio.timeout(1):
+                    while not bridge.state.live_stt.pending_bytes:
+                        await asyncio.sleep(.01)
+                with mock.patch.object(bridge, "event_logger"):
+                    bridge.record_transcript_line("Replacement stream works")
+                self.assertEqual((await new_phone.receive_json(timeout=1))["text"], "Replacement stream works")
+
+    async def test_phone_segments_use_connection_relative_audio_timing(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        bridge.state.live_stt.total_input_samples = 160000
+        async with client.ws_connect("/v1/listen") as phone:
+            with mock.patch.object(bridge, "event_logger") as events:
+                for text, start, end in (("First", 176000, 200000), ("Second", 208000, 224000)):
+                    bridge.record_transcript_line(text, sample_offset=start, sample_end_offset=end)
+                    reply = await phone.receive_json(timeout=1)
+                    segment = reply["segments"][0]
+                    self.assertEqual(segment["start"], (start - 160000) / 16000)
+                    self.assertEqual(segment["end"], (end - 160000) / 16000)
+                    self.assertEqual(json.loads(events.info.call_args.args[0])["sample_end_offset"], end)
+                bridge.state.live_stt.total_input_samples = 240000
+                async with client.ws_connect("/v1/listen") as replacement:
+                    # Old recognition must not be attached to the new recording.
+                    bridge.record_transcript_line("Late old final", sample_offset=224000, sample_end_offset=240000)
+                    bridge.record_transcript_line("New connection", sample_offset=240000, sample_end_offset=248000)
+                    reply = await replacement.receive_json(timeout=1)
+                    self.assertEqual(reply["text"], "New connection")
+                    self.assertEqual(reply["segments"][0]["start"], 0)
+                    self.assertEqual(reply["segments"][0]["end"], .5)
 
     async def test_direct_phone_websocket_adapter_ingests_pcm_and_returns_transcripts(self):
         client = await self.client_for(bridge.create_app(start_workers=False))
@@ -266,8 +323,13 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                 msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
                 self.assertEqual(msg["text"], "Direct phone transcript. Second sentence.")
                 self.assertEqual(msg["segments"][0]["text"], "Direct phone transcript. Second sentence.")
-                self.assertEqual(msg["channel"]["alternatives"][0]["transcript"],
-                                 "Direct phone transcript. Second sentence.")
+                # Diagnostic text without source timing must not invent timestamps.
+                self.assertNotIn("start", msg["segments"][0])
+                self.assertNotIn("end", msg["segments"][0])
+                self.assertEqual(set(msg), {"type", "is_final", "speech_final", "text", "segments"})
+                self.assertEqual(msg["type"], "Results")
+                self.assertTrue(msg["is_final"])
+                self.assertTrue(msg["speech_final"])
                 await ws.send_str(json.dumps({"type": "CloseStream"}))
 
 
@@ -412,8 +474,8 @@ class OutputHandlerTests(unittest.TestCase):
         for name in ("OMI_MAX_AUDIO_AGE_SEC", "OMI_IDLE_FLUSH_SEC"):
             for value in ("0", "-1", "nan", "inf"):
                 with self.subTest(name=name, value=value), self.assertRaises(ValueError):
-                    bridge.configure({"GEMINI_API_KEY": "offline-key", name: value})
-        bridge.configure({"GEMINI_API_KEY": "offline-key"})
+                    bridge.configure({name: value})
+        bridge.configure({})
 
 
 class LatencyTests(unittest.IsolatedAsyncioTestCase):
@@ -425,7 +487,7 @@ class LatencyTests(unittest.IsolatedAsyncioTestCase):
         clock.time.side_effect = lambda: 10000 - self.now  # Wall clock deliberately moves backwards.
         for patcher in (mock.patch.object(bridge, "state", self.state),
                         mock.patch.object(bridge, "time", clock),
-                        mock.patch("live_stt.time", clock)):
+                        mock.patch("stt.time", clock)):
             patcher.start()
             self.addCleanup(patcher.stop)
 
@@ -579,3 +641,49 @@ class CaptionFeedTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PartialAndFinalTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.state = bridge.BridgeState()
+        patcher = mock.patch.object(bridge, "state", self.state)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+    def test_partial_updates_are_coalesced_and_never_written_or_replayed(self):
+        listener = bridge.CaptionListener()
+        self.state.caption_listeners["test"] = listener
+        listener.queue.put_nowait({"type": "transcript", "text": "Already final"})
+        with mock.patch.object(bridge, "record_transcript_line") as record, \
+             mock.patch.object(bridge, "event_logger") as events:
+            for revision in range(100):
+                bridge.publish_partial({"type": "partial", "utterance_id": "u1", "revision": revision, "text": str(revision)})
+        self.assertEqual(listener.partial["text"], "99")
+        self.assertEqual(listener.queue.qsize(), 1)
+        self.assertFalse(self.state.recent_events)
+        record.assert_not_called()
+        events.info.assert_not_called()
+
+
+    def test_old_partial_clear_does_not_erase_a_new_utterance(self):
+        bridge.publish_partial({"type": "partial", "utterance_id": "new", "text": "Current words"})
+        bridge.publish_partial({"type": "partial", "utterance_id": "old", "text": ""})
+        self.assertEqual(self.state.partial_caption["utterance_id"], "new")
+
+
+    def test_live_ingress_forwards_audio(self):
+        stream = mock.Mock()
+        self.state.live_stt = stream
+        bridge.ingest_raw_pcm(SPEECH)
+        stream.feed.assert_called_once()
+        self.assertEqual(stream.feed.call_args.args[0], SPEECH)
+
+
+    def test_final_events_are_marked_and_persisted_once(self):
+        with mock.patch.object(bridge, "write_event", return_value=True) as output:
+            bridge.record_live_final("Final speech", utterance_id="u1", session_id=1)
+        event = output.call_args.args[0]
+        self.assertEqual((event["type"],event["is_final"],event["utterance_id"]), ("transcript",True,"u1"))
+        self.assertEqual(self.state.metrics["transcripts_emitted"],1)
+        self.assertEqual(self.state.metrics["utterances_processed"],1)

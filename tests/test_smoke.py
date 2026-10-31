@@ -1,4 +1,4 @@
-"""Verify the manual smoke check against a local provider without paid API calls."""
+"""Verify the manual smoke check against a fake local worker without loading a model."""
 from contextlib import redirect_stdout
 import importlib.util
 import io
@@ -10,11 +10,9 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 import wave
+import sys
 
-from aiohttp import web
-from aiohttp.test_utils import TestServer
-import live_stt
-import omi_bridge as bridge
+import bridge
 
 spec = importlib.util.spec_from_file_location("omi_smoke", Path(__file__).resolve().parents[1] / "scripts/smoke_test.py")
 smoke = importlib.util.module_from_spec(spec)
@@ -23,23 +21,28 @@ spec.loader.exec_module(smoke)
 
 class SmokeTests(unittest.IsolatedAsyncioTestCase):
     async def test_isolated_check_verifies_real_files_and_leaves_normal_logs_untouched(self):
-        async def provider(request):
-            ws = web.WebSocketResponse()
-            await ws.prepare(request)
-            async for message in ws:
-                data = json.loads(message.data)
-                if "setup" in data:
-                    await ws.send_json({"setupComplete": {}})
-                realtime = data.get("realtimeInput", {})
-                if "audio" in realtime:
-                    await ws.send_json({"serverContent": {"interimInputTranscription": {"text": "Test phrase"}}})
-                if realtime.get("audioStreamEnd"):
-                    await ws.send_json({"serverContent": {"inputTranscription": {"text": "Test phrase."}}})
-                    await ws.send_json({"serverContent": {"generationComplete": True}})
-            return ws
-
-        app = web.Application()
-        app.router.add_get("/provider", provider)
+        worker = """import sys,json,base64
+print(json.dumps({'type':'ready','load_warm_sec':0}),flush=True)
+first=None;end=0
+for line in sys.stdin:
+ r=json.loads(line)
+ if r['op']=='packet':
+  if first is None:first=r
+  end=r['sample_offset']+len(base64.b64decode(r['pcm_base64']))//2
+  print(json.dumps({'type':'partial','utterance_id':'test','text':'Test phrase'}),flush=True)
+ elif r['op'] in ('flush','shutdown'):
+  if first is not None:
+   print(json.dumps({'type':'final','utterance_id':'test','session_id':first['session_id'],'sample_offset':first['sample_offset'],'sample_end_offset':end,'received_at':first['received_at'],'audio_start_at':first['audio_start_at'],'text':'Test phrase.'}),flush=True)
+   first=None
+  print(json.dumps({'type':'covered','sample_end_offset':end}),flush=True)
+  print(json.dumps({'type':'flushed','request_id':r.get('request_id')}),flush=True)
+  if r['op']=='shutdown':break
+"""
+        factory = bridge.LocalWhisperSTT
+        def make_worker(**kwargs):
+            stream = factory(**kwargs)
+            stream.command = [sys.executable, "-u", "-c", worker]
+            return stream
         with tempfile.TemporaryDirectory() as directory:
             wav = Path(directory, "speech.wav")
             with wave.open(str(wav), "wb") as audio:
@@ -55,21 +58,19 @@ class SmokeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(Path(root, "omi_live_transcript.log").exists())
                 verify(root, finals, expected)
             try:
-                async with TestServer(app) as server:
-                    with mock.patch.object(bridge, "state", bridge.BridgeState()), \
-                         mock.patch.object(bridge, "configure"), \
-                         mock.patch.object(bridge, "GEMINI_API_KEY", "offline"), \
-                         mock.patch.object(bridge, "STREAM_TOKEN", "test-token"), \
-                         mock.patch.object(bridge, "LOG_DIR", str(original)), \
-                         mock.patch.object(bridge, "logger", diagnostics), \
-                         mock.patch.object(bridge, "event_logger", events), \
-                         mock.patch.object(live_stt, "LIVE_URL", str(server.make_url("/provider"))), \
-                         mock.patch.object(smoke, "verify_saved", side_effect=verify_outputs) as verification, \
-                         mock.patch.object(smoke.logging, "shutdown"), redirect_stdout(io.StringIO()) as output:
-                        await smoke.check(SimpleNamespace(wav=wav, expect="Test phrase", timeout=8))
-                        verification.assert_called_once()
-                        self.assertEqual(json.loads(output.getvalue())["status"], "passed")
-                        self.assertIsNone(bridge.state.http_session)
+                with mock.patch.object(bridge, "state", bridge.BridgeState()), \
+                     mock.patch.object(bridge, "configure"), \
+                     mock.patch.object(bridge, "STREAM_TOKEN", "test-token"), \
+                     mock.patch.object(bridge, "LOG_DIR", str(original)), \
+                     mock.patch.object(bridge, "logger", diagnostics), \
+                     mock.patch.object(bridge, "event_logger", events), \
+                     mock.patch.object(bridge, "LocalWhisperSTT", side_effect=make_worker), \
+                     mock.patch.object(smoke, "verify_saved", side_effect=verify_outputs) as verification, \
+                     mock.patch.object(smoke.logging, "shutdown"), redirect_stdout(io.StringIO()) as output:
+                    await smoke.check(SimpleNamespace(wav=wav, expect="Test phrase", timeout=8))
+                    verification.assert_called_once()
+                    self.assertEqual(json.loads(output.getvalue())["status"], "passed")
+                    self.assertFalse(hasattr(bridge.state, "http_session"))
                 self.assertEqual(list(original.iterdir()), [sentinel])
                 self.assertEqual(sentinel.read_text(), "existing history")
             finally:

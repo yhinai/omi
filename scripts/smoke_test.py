@@ -1,5 +1,5 @@
 #!/usr/bin/env python3.15
-"""Check audio -> Gemini -> captions and saved transcripts in an isolated temporary bridge."""
+"""Check audio -> local Whisper -> captions and saved transcripts in a temporary bridge."""
 import argparse
 import asyncio
 import json
@@ -9,14 +9,15 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import omi_bridge as bridge
+import bridge
 from aiohttp.test_utils import TestClient, TestServer
 
 PHRASE = "The bridge test is working. Blue lantern seven."
-CHUNK_BYTES = 32000
+CHUNK_BYTES = 3200
 
 
 def normalize(text):
@@ -39,7 +40,7 @@ def load_audio(args, directory):
         pcm = audio.readframes(audio.getnframes())
         if len(pcm) != audio.getnframes() * 2:
             raise RuntimeError("The WAV file contains incomplete audio frames")
-    return pcm + bytes(CHUNK_BYTES * 2)
+    return pcm + bytes(32000 * 2)
 
 
 def verify_saved(directory, finals, expected):
@@ -67,6 +68,7 @@ async def check(args):
                 while not bridge.state.live_stt.connected:
                     await asyncio.sleep(.05)
                 partials, finals = [], []
+                started = None
                 complete = asyncio.Event()
                 async with client.ws_connect("/listen?replay=0") as captions:
                     async def receive():
@@ -75,7 +77,7 @@ async def check(args):
                                 continue
                             event = json.loads(message.data)
                             if event.get("type") == "partial" and event.get("text"):
-                                partials.append(event)
+                                partials.append({**event, "observed_sec": time.monotonic()-started})
                             if event.get("type") == "transcript":
                                 finals.append(event)
                                 if normalize(args.expect) in normalize(" ".join(item["text"] for item in finals)):
@@ -83,9 +85,10 @@ async def check(args):
                     reader = asyncio.create_task(receive())
                     headers = {"Authorization": "Bearer " + bridge.STREAM_TOKEN} if bridge.STREAM_TOKEN else {}
                     async with client.ws_connect("/v1/listen", headers=headers) as phone:
+                        started = time.monotonic()
                         for offset in range(0, len(pcm), CHUNK_BYTES):
                             await phone.send_bytes(pcm[offset:offset + CHUNK_BYTES])
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(max(0, started+(offset+CHUNK_BYTES)/32000-time.monotonic()))
                         await phone.send_json({"type": "CloseStream"})
                         await complete.wait()
                     if not partials:
@@ -94,8 +97,14 @@ async def check(args):
                 await asyncio.gather(reader, return_exceptions=True)
             # Also validate any final events emitted during graceful shutdown.
             verify_saved(directory, finals, args.expect)
-            print(json.dumps({"status": "passed", "partial_updates": len(partials), "finals": len(finals),
-                              "jsonl_verified": True, "markdown_verified": True}), flush=True)
+            report = {"status": "passed", "backend": bridge.STT_BACKEND,
+                "partial_updates": len(partials), "finals": len(finals),
+                "first_partial_sec": partials[0]["observed_sec"],
+                "latency": bridge.build_health_dict()["latency"],
+                "jsonl_verified": True, "markdown_verified": True}
+            if getattr(args, "report", None):
+                args.report.write_text(json.dumps(report, indent=2)+"\n")
+            print(json.dumps(report), flush=True)
         finally:
             if reader is not None:
                 reader.cancel()
@@ -105,7 +114,8 @@ async def check(args):
 
 def main():
     bridge.require_python315()
-    parser = argparse.ArgumentParser(description=__doc__ + " Uses the paid Gemini API; leaves normal logs untouched.")
+    parser = argparse.ArgumentParser(description=__doc__ + " Runs locally; normal logs stay untouched.")
+    parser.add_argument("--report", type=Path, help="Write timing and verification results as JSON")
     parser.add_argument("--wav", type=Path, help="Mono PCM16/16000 Hz WAV, at most 30 seconds; otherwise uses macOS speech")
     parser.add_argument("--expect", help="Phrase that must appear in the saved transcript; required with --wav")
     parser.add_argument("--timeout", type=float, default=60, help="Overall streaming timeout in seconds (8-120)")
@@ -115,13 +125,13 @@ def main():
     args.expect = args.expect or PHRASE
     if not normalize(args.expect) or not 8 < args.timeout <= 120:
         parser.error("Use a nonempty phrase and a timeout greater than 8 and at most 120 seconds")
-    print("Running isolated Gemini check; normal API charges apply.", flush=True)
+    print("Running an isolated local Whisper check; normal logs stay untouched.", flush=True)
     try:
         asyncio.run(check(args))
     except (TimeoutError, bridge.aiohttp.ClientError, ValueError, OSError, RuntimeError,
             subprocess.SubprocessError, wave.Error, EOFError) as error:
         # Provider errors can contain request URLs; avoid exposing credentials or unrelated text.
-        sys.exit(f"Smoke check failed ({type(error).__name__}); check configuration, audio, and Gemini connectivity.")
+        sys.exit(f"Smoke check failed ({type(error).__name__}); check configuration, audio, and recognizer readiness.")
 
 
 if __name__ == "__main__":

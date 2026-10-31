@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT="$DIR/omi_bridge.py"
+SCRIPT="$DIR/bridge.py"
 PYTHON="$DIR/.venv/bin/python3.15"
 PID_FILE="$DIR/logs/omi_bridge.pid"
 IDENTITY_FILE="$DIR/logs/omi_bridge.identity"

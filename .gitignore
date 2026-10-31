@@ -1,4 +1,5 @@
 .venv/
+.venv-whisper/
 logs/
 omi_live_research.md
 *.log
