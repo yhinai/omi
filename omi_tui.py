@@ -101,7 +101,6 @@ class Row:
     text: str
     style: str = "text"
     soft_from: int | None = None
-    suffix: str = ""
     timestamp: str = ""
 
 
@@ -325,17 +324,6 @@ class Viewer:
             self.clear_draft()
         self.revision += 1
 
-    def pending(self, now):
-        if not self.connected or now - self.last_status >= 5 or not self.captions or self.draft:
-            return False
-        caption = self.captions[-1]
-        session_id = self.pipeline.get("session_id")
-        same_session = session_id is None or caption.session == (self.pipeline.get("stream_id"), session_id)
-        buffer_sec = self.pipeline.get("buffer_sec")
-        buffering = isinstance(buffer_sec, (float, int)) and buffer_sec > 0
-        return caption.kind == "transcript" and same_session and (self.transcribing or buffering)
-
-
     def live(self):
         self.following, self.anchor, self.unread, self.match = True, None, 0, None
         self.holding = False
@@ -382,13 +370,6 @@ def rows_for(viewer, width):
             stamp = caption.timestamp if viewer.show_times and caption.show_stamp and offset == 0 else ""
             rows.append(Row(caption.key, offset, line, "muted" if muted else "text", soft, timestamp=stamp))
             offset += len(line)
-        if caption is viewer.captions[-1] and viewer.pending(now):
-            # Decorate after wrapping: the ellipsis cannot push an existing word to another line.
-            if cells(rows[-1].text) + 2 <= width:
-                row = rows[-1]
-                rows[-1] = Row(row.key, row.offset, row.text, row.style, row.soft_from, " …", row.timestamp)
-            else:
-                rows.append(Row(caption.key, len(full_text), "…", "muted"))
         rows.append(Row(caption.key, len(full_text) + 1, ""))
     if viewer.draft and not draft_inlined:
         offset = 0
@@ -404,7 +385,7 @@ def rows_for(viewer, width):
 
 
 def transitions(viewer, now):
-    return tuple(c.key for c in viewer.captions if now < c.soft_until), viewer.pending(now)
+    return tuple(c.key for c in viewer.captions if now < c.soft_until)
 
 
 def next_transition(viewer, now):
@@ -665,8 +646,6 @@ def paint(screen, viewer, palette):
                     start_soft = max(0, row.soft_from - row.offset)
                     if start_soft < len(row.text):
                         put(screen, y, left + cells(row.text[:start_soft]), row.text[start_soft:], palette["muted"])
-                if row.suffix:
-                    put(screen, y, left + cells(row.text), row.suffix, palette["muted"])
                 if viewer.query and row.style == "text":
                     for match in re.finditer(re.escape(viewer.query), row.text, re.IGNORECASE):
                         put(screen, y, left + cells(row.text[:match.start()]), match.group(), palette["accent"] | curses.A_UNDERLINE)

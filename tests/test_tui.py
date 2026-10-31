@@ -563,26 +563,23 @@ class PageDetailTests(unittest.TestCase):
         with mock.patch.object(tui.time, "monotonic", return_value=102.1):
             self.assertIsNone(tui.rows_for(viewer, 76)[0].soft_from)
 
-    def test_ellipsis_is_reported_work_not_an_animation_or_inferred_microphone(self):
+    def test_pending_work_does_not_add_an_ellipsis(self):
         viewer = tui.Viewer(connected=True, show_times=False)
         with mock.patch.object(tui.time, "monotonic", return_value=100):
             viewer.add(event("1234567890"))
-            self.assertFalse(viewer.pending(100))
             viewer.add({"type": "status", "buffer_sec": 1, "stt_in_flight": False})
             rows = tui.rows_for(viewer, 10)
-            self.assertEqual(rows[0].text, "1234567890")
-            self.assertEqual(rows[1].text, "…")
+            self.assertEqual([r.text for r in rows], ["1234567890", ""])
             viewer.add({"type": "status", "buffer_sec": 0, "stt_in_flight": False})
             self.assertNotIn("…", [r.text for r in tui.rows_for(viewer, 10)])
             viewer.add({"type": "status", "buffer_sec": 0, "stt_in_flight": True})
-            self.assertTrue(viewer.pending(100))
-        self.assertFalse(viewer.pending(106))
+            self.assertEqual([r.text for r in tui.rows_for(viewer, 76)], ["1234567890", ""])
 
-    def test_pending_work_in_another_session_does_not_animate_the_old_paragraph(self):
+    def test_pending_work_in_another_session_leaves_the_old_paragraph_unchanged(self):
         viewer = tui.Viewer(connected=True)
         viewer.add(event("Earlier session", stream_id="old"))
         viewer.add({"type": "status", "buffer_sec": 5, "stream_id": "new", "session_id": 1})
-        self.assertFalse(viewer.pending(tui.time.monotonic()))
+        self.assertEqual([r.text for r in tui.rows_for(viewer, 76)], ["Earlier session", ""])
 
     def test_replay_is_neutral_deduplicated_and_retains_resume_cursor(self):
         viewer = tui.Viewer()
@@ -713,7 +710,7 @@ class ReplayConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_actual_caption_endpoint_replays_then_drives_the_live_ellipsis(self):
+    async def test_actual_caption_endpoint_replays_without_pending_decoration(self):
         import omi_bridge as bridge
         runtime = bridge.BridgeState()
         runtime.live_stt = bridge.GeminiLiveSTT(session=None, api_key="offline", model="test",
@@ -736,16 +733,16 @@ class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(viewer.replay_supported)
                     bridge.ingest_raw_pcm(bytes(16000))
                     bridge.record_transcript_line("The next thought.", session_id=1, audio_start_at=time.time())
-                    while viewer.last_event_id == "saved" or not viewer.pending(tui.time.monotonic()):
+                    while viewer.last_event_id == "saved" or not viewer.pipeline.get("buffer_sec"):
                         await asyncio.sleep(.01)
                     rows = tui.rows_for(viewer, 76)
-                    self.assertTrue(any(row.suffix == " …" for row in rows))
+                    self.assertFalse(any("…" in row.text for row in rows))
                     self.assertEqual(viewer.captions[-1].text, "The next thought.")
                     runtime.live_stt.queue.clear()
                     runtime.live_stt.pending_bytes = 0
-                    while viewer.pending(tui.time.monotonic()):
+                    while viewer.pipeline.get("buffer_sec"):
                         await asyncio.sleep(.01)
-                    self.assertFalse(any(row.suffix for row in tui.rows_for(viewer, 76)))
+                    self.assertFalse(any("…" in row.text for row in tui.rows_for(viewer, 76)))
                     self.assertFalse(any(c.kind == "gap" for c in viewer.captions))
             finally:
                 reader.cancel()
