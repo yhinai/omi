@@ -87,6 +87,7 @@ class Caption:
     show_stamp: bool = False
     soft_from: int = 0
     soft_until: float = 0
+    source_end_at: float | None = None
 
     @property
     def text(self):
@@ -117,6 +118,9 @@ class Viewer:
     draft_identity: tuple | None = None
     draft_session: tuple | None = None
     draft_revision: int = 0
+    draft_source_at: float | None = None
+    draft_timestamp: str = ""
+    draft_target_key: int | None = None
     finalized: deque = field(default_factory=lambda: deque(maxlen=200))
     following: bool = True
     anchor: tuple[int, int] | None = None
@@ -153,6 +157,7 @@ class Viewer:
 
     def clear_draft(self):
         self.draft, self.draft_identity, self.draft_session, self.draft_revision = "", None, None, 0
+        self.draft_source_at, self.draft_timestamp, self.draft_target_key = None, "", None
 
     def add(self, event):
         if not isinstance(event, dict):
@@ -194,11 +199,36 @@ class Viewer:
                     or (not text and identity != self.draft_identity)
                     or (identity == self.draft_identity and text and revision and revision <= self.draft_revision)):
                 return
+            if text and (not self.draft or identity != self.draft_identity):
+                source = event.get("audio_start_at")
+                self.draft_source_at = (source if isinstance(source, (int, float))
+                    and not isinstance(source, bool) and math.isfinite(source) else time.time())
+                try:
+                    self.draft_timestamp = datetime.fromtimestamp(self.draft_source_at).strftime("%H:%M:%S")
+                except (ValueError, OverflowError, OSError):
+                    self.draft_source_at = time.time()
+                    self.draft_timestamp = datetime.fromtimestamp(self.draft_source_at).strftime("%H:%M:%S")
+                session = ((event.get("stream_id"), event["session_id"])
+                           if event.get("session_id") is not None else None)
+                previous = self.captions[-1] if self.captions else None
+                end = (previous.source_end_at if previous.source_end_at is not None else previous.source_at) if previous else None
+                continuous = (previous is not None and previous.kind == "transcript"
+                    and (session is None or session == previous.session)
+                    and (end is None or 0 <= self.draft_source_at-end <= 8)
+                    and len(previous.words) < 150
+                    and not (len(previous.words) >= 90 and re.search(r"[.!?][^\w]*$", previous.words[-1])))
+                if continuous:
+                    self.draft_target_key = previous.key
+                else:
+                    self.next_key += 1
+                    self.draft_target_key = self.next_key
             self.draft = text
             self.draft_identity = identity if text else None
             self.draft_session = ((event.get("stream_id"), event["session_id"])
                                   if text and event.get("session_id") is not None else None)
             self.draft_revision = revision if text else 0
+            if not text:
+                self.clear_draft()
             self.revision += 1
             return
         if kind not in ("transcript", "gap"):
@@ -233,11 +263,26 @@ class Viewer:
         session = (event.get("stream_id"), session_id) if session_id is not None else None
         previous = self.captions[-1] if self.captions else None
         words = text.split()
+        utterance = ((event.get("stream_id"), event["utterance_id"])
+                     if event.get("utterance_id") is not None else None)
+        matching_draft = bool(kind == "transcript" and self.draft
+                              and self.draft_identity == utterance)
         # The same bridge session closes after its actual idle timeout. Source timing
         # prevents delayed network delivery from creating false paragraph breaks.
         continuous = (kind == "transcript" and previous is not None and previous.kind == kind
                       and session is not None and session == previous.session
                       and (source is None or previous.source_at is None or 0 <= source - previous.source_at <= 16))
+        reserved_key = None
+        if matching_draft:
+            continuous = previous is not None and previous.key == self.draft_target_key
+            if not continuous:
+                reserved_key = self.draft_target_key
+                stamp = self.draft_timestamp
+        source_end = source
+        start_sample, end_sample = event.get("sample_offset"), event.get("sample_end_offset")
+        if (source is not None and isinstance(start_sample, int) and isinstance(end_sample, int)
+                and end_sample >= start_sample):
+            source_end = source + (end_sample-start_sample)/16000
         while words:
             previous = self.captions[-1] if self.captions else None
             sentence_end = previous and len(previous.words) >= 90 and re.search(r"[.!?][^\w]*$", previous.words[-1])
@@ -246,8 +291,12 @@ class Viewer:
                 meaningful = (kind == "transcript" and (previous is None or previous.kind == "gap"
                     or (session is not None and previous.session != session)
                     or (source is not None and (self.last_stamp_at is None or source - self.last_stamp_at >= 180))))
-                self.next_key += 1
-                previous = Caption(self.next_key, stamp, [], kind, session, source, meaningful)
+                if reserved_key is not None:
+                    key, reserved_key, meaningful = reserved_key, None, True
+                else:
+                    self.next_key += 1
+                    key = self.next_key
+                previous = Caption(key, stamp, [], kind, session, source, meaningful)
                 self.captions.append(previous)
                 if meaningful:
                     self.last_stamp_at = source
@@ -260,6 +309,7 @@ class Viewer:
                         break
             previous.words.extend(words[:take])
             previous.source_at = source
+            previous.source_end_at = source_end
             previous.soft_from = prefix
             previous.soft_until = time.monotonic() + 2 if kind == "transcript" and not self.replaying else 0
             if not self.following and previous.key != self.last_unread_key:
@@ -284,6 +334,7 @@ class Viewer:
         buffer_sec = self.pipeline.get("buffer_sec")
         buffering = isinstance(buffer_sec, (float, int)) and buffer_sec > 0
         return caption.kind == "transcript" and same_session and (self.transcribing or buffering)
+
 
     def live(self):
         self.following, self.anchor, self.unread, self.match = True, None, 0, None
@@ -314,9 +365,7 @@ def rows_for(viewer, width):
             continue
         offset, text = 0, caption.text
         inline_draft = bool(viewer.draft and caption is viewer.captions[-1]
-                            and caption.kind == "transcript" and len(caption.words) < 150
-                            and (viewer.draft_session is None or viewer.draft_session == caption.session)
-                            and not (len(caption.words) >= 90 and re.search(r"[.!?][^\w]*$", caption.words[-1])))
+                            and caption.key == viewer.draft_target_key)
         if inline_draft:
             draft_inlined = True
             draft_start = len(text) + 1
@@ -342,8 +391,15 @@ def rows_for(viewer, width):
                 rows.append(Row(caption.key, len(full_text), "…", "muted"))
         rows.append(Row(caption.key, len(full_text) + 1, ""))
     if viewer.draft and not draft_inlined:
+        offset = 0
         for line in wrap(viewer.draft, width):
-            rows.append(Row(-1, 0, line, "muted"))
+            offset = viewer.draft.find(line, offset)
+            stamp = viewer.draft_timestamp if viewer.show_times and offset == 0 else ""
+            rows.append(Row(viewer.draft_target_key, offset, line, "muted", timestamp=stamp))
+            offset += len(line)
+        # Reserve the same trailing space as a final paragraph. Otherwise a
+        # full, following viewport would shift up one row on confirmation.
+        rows.append(Row(viewer.draft_target_key, len(viewer.draft)+1, ""))
     return rows
 
 

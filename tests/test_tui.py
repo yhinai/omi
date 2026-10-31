@@ -150,8 +150,8 @@ class ReadingTests(unittest.TestCase):
     def test_partial_replaces_draft_but_does_not_modify_committed_text(self):
         viewer = tui.Viewer()
         viewer.add(event("Committed words"))
-        viewer.add({"type": "partial", "text": "a draft"})
-        viewer.add({"type": "partial", "text": "the revised draft"})
+        viewer.add({"type": "partial", "text": "a draft", "audio_start_at": 108})
+        viewer.add({"type": "partial", "text": "the revised draft", "audio_start_at": 108})
         self.assertEqual(viewer.captions[0].text, "Committed words")
         self.assertEqual(viewer.draft, "the revised draft")
         row = tui.rows_for(viewer, 76)[0]
@@ -220,6 +220,56 @@ class Screen:
 
 
 class StreamOrderingTests(unittest.TestCase):
+    def test_speech_after_pause_has_its_own_timestamp_before_confirmation(self):
+        viewer = tui.Viewer()
+        viewer.add(event("Earlier words.", stream_id="s", source=100,
+                         sample_offset=0, sample_end_offset=64000))
+        draft = {"type": "partial", "stream_id": "s", "session_id": 1,
+                 "utterance_id": "new", "audio_start_at": 140}
+        viewer.add({**draft, "text": "New thought", "revision": 1})
+        before = tui.rows_for(viewer, 80)
+        self.assertEqual([r.text for r in before], ["Earlier words.", "", "New thought", ""])
+        row = before[-2]
+        self.assertTrue(row.timestamp)
+        viewer.add({**draft, "text": "New thought revised.", "revision": 2, "audio_start_at": 142})
+        revised = tui.rows_for(viewer, 80)[-2]
+        self.assertEqual((revised.key, revised.timestamp), (row.key, row.timestamp))
+        draft_rows = tui.rows_for(viewer, 80)
+        draft_top = tui.viewport(viewer, draft_rows, 2)
+        viewer.add(event("New thought revised.", stream_id="s", utterance_id="new", source=139))
+        after = tui.rows_for(viewer, 80)
+        self.assertEqual([r.text for r in after[:3]], ["Earlier words.", "", "New thought revised."])
+        self.assertEqual((after[2].key, after[2].timestamp), (row.key, row.timestamp))
+        self.assertEqual(tui.viewport(viewer, after, 2), draft_top)
+        self.assertEqual([(r.key, r.offset, r.text, r.timestamp) for r in after],
+                         [(r.key, r.offset, r.text, r.timestamp) for r in draft_rows])
+        self.assertEqual(viewer.captions[0].text, "Earlier words.")
+        self.assertFalse(viewer.draft)
+
+    def test_pause_uses_previous_audio_end_rather_than_utterance_start(self):
+        viewer = tui.Viewer()
+        viewer.add(event("Long utterance.", stream_id="s", source=100,
+                         sample_offset=0, sample_end_offset=320000))
+        viewer.add({"type": "partial", "stream_id": "s", "session_id": 1,
+                    "utterance_id": "next", "text": "Continuation", "audio_start_at": 122})
+        self.assertEqual(tui.rows_for(viewer, 80)[0].text, "Long utterance. Continuation")
+        viewer.add(event("Continuation", stream_id="s", utterance_id="next", source=122))
+        self.assertEqual(len(viewer.captions), 1)
+        self.assertEqual(tui.rows_for(viewer, 80)[0].text, "Long utterance. Continuation")
+
+    def test_draft_without_source_time_reserves_timestamp_at_first_arrival(self):
+        viewer = tui.Viewer()
+        with mock.patch.object(tui.time, "time", return_value=100):
+            viewer.add({"type": "partial", "utterance_id": "u", "text": "Opening"})
+        before = tui.rows_for(viewer, 12)[0]
+        with mock.patch.object(tui.time, "time", return_value=200):
+            viewer.add({"type": "partial", "utterance_id": "u", "text": "Opening words wrap across lines"})
+        rows = tui.rows_for(viewer, 12)
+        self.assertEqual(rows[0].timestamp, before.timestamp)
+        self.assertTrue(all(not row.timestamp for row in rows[1:]))
+        viewer.show_times = False
+        self.assertTrue(all(not row.timestamp for row in tui.rows_for(viewer, 12)))
+
     def test_earlier_final_or_clear_cannot_erase_newer_draft(self):
         viewer = tui.Viewer()
         viewer.add({"type": "partial", "text": "Next thought", "stream_id": "s",
@@ -242,14 +292,14 @@ class StreamOrderingTests(unittest.TestCase):
         self.assertEqual(viewer.draft, "Current words")
         rows = tui.rows_for(viewer, 80)
         self.assertEqual(rows[0].text, "Earlier conversation")
-        self.assertEqual(rows[-1].text, "Current words")
+        self.assertEqual(rows[-2].text, "Current words")
         self.assertEqual(viewer.captions[0].text, "Earlier conversation")
 
     def test_draft_starts_new_paragraph_after_sentence_at_paragraph_limit(self):
         viewer = tui.Viewer()
         viewer.add(event("word " * 89 + "end."))
         viewer.add({"type": "partial", "text": "New paragraph"})
-        self.assertEqual(tui.rows_for(viewer, 100)[-1].text, "New paragraph")
+        self.assertEqual(tui.rows_for(viewer, 100)[-2].text, "New paragraph")
 
 
 class LayoutTests(unittest.TestCase):
@@ -279,7 +329,7 @@ class LayoutTests(unittest.TestCase):
         viewer = tui.Viewer(show_times=False)
         viewer.add(event("An earlier paragraph.", session=1))
         viewer.add(event("Current words", session=2))
-        viewer.add({"type": "partial", "text": "first draft"})
+        viewer.add({"type": "partial", "text": "first draft", "audio_start_at": 108})
         screen = Screen()
         with mock.patch.object(tui.curses, "doupdate") as update:
             tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
@@ -287,7 +337,7 @@ class LayoutTests(unittest.TestCase):
             tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
             self.assertEqual(update.call_count, 1)
             self.assertFalse(screen.cleared)
-            viewer.add({"type": "partial", "text": "revised draft"})
+            viewer.add({"type": "partial", "text": "revised draft", "audio_start_at": 108})
             tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
             self.assertEqual(screen.cleared, [3])
             self.assertEqual(update.call_count, 2)

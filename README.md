@@ -47,6 +47,8 @@ The launcher refuses to stop unrelated processes occupying the ports. `restart` 
 
 The viewer shows partial text immediately and retains finalized text for reading. It reconnects and replays up to 200 recent events; older history stays in your saved files. Expired replay cursors can leave gaps.
 
+After a pause of more than eight seconds, or a new session, the first draft starts a new timestamped paragraph. Confirmation updates that paragraph in place, preserving its timestamp and position. Short continuations stay with the current paragraph. Draft timestamps use audio timing when supplied, otherwise the first draft's arrival time. Reopen `tui.sh` after viewer updates to load the new code.
+
 | Key | Action |
 | --- | --- |
 | `?` / Esc | Help / dismiss |
