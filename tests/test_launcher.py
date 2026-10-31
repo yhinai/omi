@@ -81,3 +81,17 @@ class ClearTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[:2], ['stopped', 'cleared'])
         self.assertNotIn('unexpected-restart', result.stdout)
+
+
+class DependencyTests(unittest.TestCase):
+    def test_dependency_check_enforces_supported_aiohttp_range(self):
+        source = (Path(__file__).resolve().parents[1]/'run.sh').read_text()
+        line = next(line for line in source.splitlines() if "import aiohttp; assert" in line)
+        check = line.split("-c '",1)[1].split("'",1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)/'aiohttp.py'
+            for version, supported in [('3.9.0',False),('3.14.4',False),('3.14.5',True),('3.15.0',True),('4.0.0',False)]:
+                with self.subTest(version=version):
+                    package.write_text('__version__ = '+repr(version)+'\n')
+                    result = subprocess.run([sys.executable,'-B','-c',check],cwd=directory,capture_output=True,text=True)
+                    self.assertEqual(result.returncode==0,supported)

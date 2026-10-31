@@ -7,11 +7,17 @@ import asyncio
 import base64
 from collections import deque
 import json
+import logging
+import re
 from pathlib import Path
 import time
 import uuid
 
-from common import BPS, Packet
+from common import (BPS, Packet, QUEUE_MAX_BYTES, QUEUE_MAX_PACKETS,
+                    REPLAY_MAX_BYTES, PACKET_MAX_BYTES, SHUTDOWN_TIMEOUT,
+                    WORKER_DIAGNOSTIC_BYTES)
+
+logger = logging.getLogger("bridge")
 
 
 class LocalWhisperSTT:
@@ -28,7 +34,7 @@ class LocalWhisperSTT:
         self.last_packet_mono = None
         self.reconnects = self.partial_updates = self.final_count = self.turns_without_text = 0
         self.gap_causes = {}
-        self.closing_turns = []
+        self.pending_final_count = 0
         self.wake, self.stop_event = asyncio.Event(), asyncio.Event()
         self.task = self.process = None
         self.flush_waiters = {}
@@ -41,6 +47,8 @@ class LocalWhisperSTT:
         self.release_end = 0
         self.protected_pcm = deque()
         self.save_error = None
+        self.last_flush_completed = None
+        self.worker_diagnostics = bytearray()
 
     @property
     def pending_age(self):
@@ -77,9 +85,9 @@ class LocalWhisperSTT:
         self.wake.set()
 
     def _bound_queue(self):
-        while self.pending_bytes > BPS*10 or len(self.queue) > 256:
+        while self.pending_bytes > QUEUE_MAX_BYTES or len(self.queue) > QUEUE_MAX_PACKETS:
             packet = self.queue[0]
-            count = len(packet.pcm) if len(self.queue)>256 else min(len(packet.pcm), self.pending_bytes-BPS*10)
+            count = len(packet.pcm) if len(self.queue)>QUEUE_MAX_PACKETS else min(len(packet.pcm), self.pending_bytes-QUEUE_MAX_BYTES)
             self.gap("queue_evicted", count/BPS, packet, "local_unsent_queue_evicted")
             self.pending_bytes -= count
             if count == len(packet.pcm):
@@ -98,10 +106,15 @@ class LocalWhisperSTT:
         identity = self.request_flush()
         waiter = self.flush_waiters[identity] = asyncio.Event()
         try:
-            await asyncio.wait_for(waiter.wait(), timeout)
-            await asyncio.wait_for(self.save_ready.wait(), timeout)
+            async with asyncio.timeout(timeout):
+                await waiter.wait()
+                await self.save_ready.wait()
+            self.last_flush_completed = True
+            return True
         except TimeoutError:
-            pass
+            self.last_flush_completed = False
+            logger.warning("Local transcription flush timed out; accepted audio remains pending")
+            return False
         finally:
             self.flush_waiters.pop(identity, None)
 
@@ -173,7 +186,7 @@ class LocalWhisperSTT:
         elif kind == "no_text":
             self.turns_without_text += 1
         elif kind == "status":
-            self.closing_turns = [None]*event["pending_finals"]
+            self.pending_final_count = event["pending_finals"]
             self._speech_pending = event["speech_pending"]
 
     @staticmethod
@@ -202,7 +215,7 @@ class LocalWhisperSTT:
                     self.queue.popleft()
                     self.pending_bytes -= len(packet.pcm)
                     continue
-                size = min(3200, len(packet.pcm))
+                size = min(PACKET_MAX_BYTES, len(packet.pcm))
                 if self.controls:
                     size = min(size, max(0, self.controls[0][1]-packet.sample_offset)*2)
                 chunk = Packet(packet.pcm[:size], packet.received_at, packet.received_mono, packet.sample_offset, packet.session_id)
@@ -220,7 +233,7 @@ class LocalWhisperSTT:
                     "audio_start_at": chunk.received_at-(len(packet.pcm)+size)/BPS})
                 self.on_latency("receipt_to_send_sec", time.monotonic()-chunk.received_mono)
                 # A stalled worker must not build an unbounded replay copy.
-                if sum(len(item.pcm) for item in self.retained) > BPS*45:
+                if sum(len(item.pcm) for item in self.retained) > REPLAY_MAX_BYTES:
                     raise TimeoutError("Local worker did not release source audio")
                 continue
             if self.stopping and not shutdown_sent:
@@ -248,11 +261,13 @@ class LocalWhisperSTT:
         delay = 1
         try:
             while True:
-                sender = receiver = None
+                sender = receiver = diagnostics = None
                 try:
                     self.process = await asyncio.create_subprocess_exec(*self.command,
                         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.DEVNULL, limit=131072)
+                        stderr=asyncio.subprocess.PIPE, limit=131072)
+                    self.worker_diagnostics.clear()
+                    diagnostics = asyncio.create_task(self._read_diagnostics())
                     ready = json.loads(await asyncio.wait_for(self.process.stdout.readline(), 60))
                     if ready.get("type") != "ready":
                         raise ConnectionError("Invalid local worker startup")
@@ -269,6 +284,10 @@ class LocalWhisperSTT:
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
+                    # Model error strings can include recognized text. Log only
+                    # exception names and allowlisted runtime failure signals.
+                    await asyncio.sleep(0)
+                    self._report_diagnostics(error)
                     self.on_connection(False, type(error).__name__)
                 finally:
                     self.connected = False
@@ -283,6 +302,12 @@ class LocalWhisperSTT:
                         except TimeoutError:
                             self.process.kill()
                             await self.process.wait()
+                    if diagnostics is not None:
+                        try:
+                            await asyncio.wait_for(asyncio.shield(diagnostics), 1)
+                        except TimeoutError:
+                            diagnostics.cancel()
+                        await asyncio.gather(diagnostics, return_exceptions=True)
                     if self.last_partial:
                         self.on_partial({**self.last_partial, "text": ""})
                         self.last_partial = None
@@ -302,7 +327,7 @@ class LocalWhisperSTT:
                     self.retained.clear()
                     self.pending_bytes = sum(len(packet.pcm) for packet in self.queue)
                     self._bound_queue()
-                    self.closing_turns.clear()
+                    self.pending_final_count = 0
                     self._speech_pending = False
                 if self.stopping:
                     break
@@ -318,19 +343,45 @@ class LocalWhisperSTT:
             await asyncio.gather(saver, return_exceptions=True)
 
     async def close(self):
+        completed = True
         self.stopping = True
         self.wake.set()
         self.stop_event.set()
         if self.task is not None:
             try:
-                await asyncio.wait_for(asyncio.shield(self.task), 20)
+                await asyncio.wait_for(asyncio.shield(self.task), SHUTDOWN_TIMEOUT)
             except TimeoutError:
+                completed = False
+                self.last_flush_completed = False
+                logger.error("Local transcription shutdown drain timed out")
                 self.task.cancel()
                 await asyncio.gather(self.task, return_exceptions=True)
+        if self.queue:
+            completed = False
         for packet in self.queue:
             self.gap("failed", len(packet.pcm)/BPS, packet, "local_shutdown_unsent")
         self.queue.clear()
         self.pending_bytes = 0
         self.retry_saves()
         if self.pending_finals:
-            raise OSError("Shutdown left unsaved finals; source PCM and final text remain in memory")
+            self.last_flush_completed = False
+            raise OSError("Shutdown left unsaved finals; memory-only recovery is lost when the bridge exits")
+        self.last_flush_completed = completed
+        return completed
+
+    async def _read_diagnostics(self):
+        while chunk := await self.process.stderr.read(1024):
+            self.worker_diagnostics.extend(chunk)
+            del self.worker_diagnostics[:-WORKER_DIAGNOSTIC_BYTES]
+
+    def _report_diagnostics(self, error):
+        text = self.worker_diagnostics.decode("utf-8", errors="replace")
+        known = {"RuntimeError", "MemoryError", "ValueError", "TypeError", "ImportError",
+                 "ModuleNotFoundError", "FileNotFoundError", "OSError", "InvalidArgument"}
+        types = sorted(known.intersection(re.findall(r"\b([A-Za-z]+(?:Error|Exception))\b", text)))
+        allowed = ("out of memory", "Metal GPU is unavailable", "No module named", "No such file or directory")
+        signals = [signal for signal in allowed if signal.casefold() in text.casefold()]
+        logger.error("Whisper worker failure: %s; runtime exceptions=%s; signals=%s; stderr_bytes=%d",
+                     type(error).__name__, ",".join(types) or "none", ",".join(signals) or "none",
+                     len(self.worker_diagnostics))
+        self.worker_diagnostics.clear()

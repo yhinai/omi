@@ -214,7 +214,7 @@ if ! RUNTIME_INFO="$(runtime_info "$PYTHON" 2>/dev/null)"; then
   echo "Use '$0 stop' for a graceful stop, then move .venv aside and recreate it; see README.md." >&2
   exit 1
 fi
-if ! "$PYTHON" -c 'import aiohttp; assert tuple(map(int, aiohttp.__version__.split(".")[:2])) >= (3, 9)' >/dev/null 2>&1; then
+if ! "$PYTHON" -c 'import aiohttp; assert (3, 14, 5) <= tuple(map(int, aiohttp.__version__.split(".")[:3])) < (4, 0, 0)' >/dev/null 2>&1; then
   "$PYTHON" -m pip install -r "$DIR/requirements.txt"
 fi
 "$PYTHON" "$SCRIPT" --check-config

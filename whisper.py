@@ -17,11 +17,10 @@ import stat
 import time
 import types
 import uuid
-from common import RATE, WHISPER_POLICY
+from common import RATE, WHISPER_POLICY, PACKET_MAX_BYTES
 
 FRAME = 512
 PRE_ROLL = 31  # 992 ms retained before the voice trigger; no extra waiting.
-MAX_TURN = int(WHISPER_POLICY.max_turn_seconds * RATE)
 
 
 def emit(event):
@@ -178,7 +177,7 @@ class Stream:
     def feed(self, packet):
         raw = base64.b64decode(packet["pcm_base64"], validate=True)
         offset, session = packet["sample_offset"], packet["session_id"]
-        if not raw or len(raw) % 2 or len(raw) > 3200:
+        if not raw or len(raw) % 2 or len(raw) > PACKET_MAX_BYTES:
             raise ValueError("Expected at most 100 ms of PCM16")
         if session != self.session_id or offset != self.expected_offset:
             self.tail()

@@ -5,7 +5,6 @@ from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
-import hashlib
 import hmac
 import json
 import logging
@@ -39,11 +38,12 @@ import aiohttp
 from aiohttp import web
 
 from stt import LocalWhisperSTT
+from storage import TranscriptStore, DailyNotes
+from common import RATE, BPS, QUEUE_AUDIO_SECONDS, QUEUE_MAX_BYTES, QUEUE_MAX_PACKETS
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
-SAMPLE_RATE = 16000
-BYTES_PER_SECOND = SAMPLE_RATE * 2
+SAMPLE_RATE, BYTES_PER_SECOND = RATE, BPS
 MAX_AUDIO_AGE_SEC = 45.0
 STT_BACKEND = "whisper"
 WHISPER_PYTHON = WHISPER_MODEL = WHISPER_VAD = ""
@@ -108,27 +108,18 @@ def configure(env=None):
         raise ValueError("Maximum audio age and idle timeout must be finite and positive")
 
 
-class OutputFileHandler(RotatingFileHandler):
-    def handleError(self, record):
-        # Logging normally swallows disk errors; output health must see them.
-        raise sys.exc_info()[1]
-
-
 def configure_logging():
     os.makedirs(LOG_DIR, exist_ok=True)
-    for target, filename, fmt in (
-        (logger, "omi_bridge.log", "[%(asctime)s] %(message)s"),
-        (event_logger, "omi_transcript_events.jsonl", "%(message)s"),
-    ):
-        target.setLevel(logging.INFO)
-        target.propagate = False
-        for handler in target.handlers[:]:
-            target.removeHandler(handler)
-            handler.close()
-        handler_class = RotatingFileHandler if target is logger else OutputFileHandler
-        handler = handler_class(os.path.join(LOG_DIR, filename), maxBytes=5 * 1024 * 1024, backupCount=3)
-        handler.setFormatter(logging.Formatter(fmt, datefmt="%Y-%m-%d %H:%M:%S"))
-        target.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    handler = RotatingFileHandler(os.path.join(LOG_DIR, "omi_bridge.log"),
+                                 maxBytes=5 * 1024 * 1024, backupCount=3)
+    handler.setFormatter(logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(handler)
+    state.storage.configure_logging(event_logger)
 
 
 def new_metrics():
@@ -152,8 +143,12 @@ class PhoneStream:
 @dataclass
 class BridgeState:
     recognized_utterances: deque = field(default_factory=lambda: deque(maxlen=256))
-    failed_finals: dict = field(default_factory=dict)
-    daily_notes: object = None
+    storage: TranscriptStore = field(default_factory=lambda: TranscriptStore(
+        directory=lambda: LOG_DIR, append=lambda encoded: event_logger.info(encoded),
+        create_event=lambda *args, **kwargs: make_event(*args, **kwargs),
+        on_commit=lambda event: publish_saved(event),
+        on_error=lambda target, error: output_failed(target, error),
+        on_recovered=lambda: state.metrics.update(last_output_error=None)))
     caption_listeners: dict = field(default_factory=dict)
     stream_clients: dict = field(default_factory=dict)
     stream_admission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -294,75 +289,11 @@ async def caption_status_worker():
 
 
 def seed_recent_events():
-    """Bounded startup reads, including rotation backups; malformed lines are skipped."""
-    events, seen = [], set()
-    for suffix in ("", ".1", ".2", ".3"):
-        try:
-            with open(os.path.join(LOG_DIR, "omi_transcript_events.jsonl") + suffix, "rb") as stream:
-                size = stream.seek(0, os.SEEK_END)
-                stream.seek(max(0, size - 1024 * 1024))
-                if stream.tell():
-                    stream.readline()
-                lines = stream.read().splitlines()
-        except OSError:
-            continue
-        for line in reversed(lines):
-            try:
-                event = json.loads(line)
-            except (ValueError, UnicodeError):
-                continue
-            if not isinstance(event, dict) or event.get("type", "transcript") != "transcript" or not isinstance(event.get("text"), str):
-                continue
-            event.setdefault("type", "transcript")
-            identity = event.get("event_id")
-            if not isinstance(identity, str) or not identity:
-                event["event_id"] = identity = "legacy-" + hashlib.sha256(line).hexdigest()
-            if identity not in seen:
-                events.append(event)
-                seen.add(identity)
-            if len(events) == 200:
-                break
-        if len(events) == 200:
-            break
-    state.recent_events = deque(reversed(events), maxlen=200)
-
-
-class DailyNotes:
-    """A paragraph projection; persist each update so restart does not lose a partial paragraph."""
-
-    def __init__(self, directory):
-        self.directory = directory
-        self.day, self.words, self.last_time = None, [], None
-
-    def close_paragraph(self):
-        self.words = []
-
-    def add(self, timestamp, text):
-        dt = datetime.fromisoformat(timestamp)
-        day = timestamp[:10]
-        path = os.path.join(self.directory, f"{day}.md")
-        if not os.path.exists(path) or os.path.getsize(path) == 0:
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(f"# Omi Transcript — {day}\n\n")
-        if day != self.day or (self.last_time and (dt - self.last_time).total_seconds() > IDLE_FLUSH_SEC):
-            self.words = []
-        if not self.words:
-            self.start, self.offset = timestamp[11:], os.path.getsize(path)
-        self.day, self.last_time = day, dt
-        self.words.extend(text.split())
-        # Offset comes from getsize (bytes); binary I/O keeps Unicode offsets correct.
-        with open(path, "r+b") as f:
-            f.seek(self.offset)
-            f.write(f"**[{self.start}]** {' '.join(self.words)}\n\n".encode("utf-8"))
-            f.truncate()
-        if len(self.words) >= 120:
-            self.words = []
-
+    state.recent_events = state.storage.recent_events()
 
 
 def flush_daily_paragraph():
-    if state.daily_notes is not None:
-        state.daily_notes.close_paragraph()
+    state.storage.flush()
 
 
 def output_failed(target, error):
@@ -371,15 +302,11 @@ def output_failed(target, error):
     logger.error("Transcript output failed: %s", state.metrics["last_output_error"])
 
 
-def write_event(event, *, already_persisted=False):
-    """Persist JSONL first, then publish captions and update daily Markdown."""
-    encoded = json.dumps(event, ensure_ascii=False)
-    try:
-        if not already_persisted:
-            event_logger.info(encoded)
-    except Exception as error:
-        output_failed("jsonl", error)
-        return False
+def write_event(event):
+    return state.storage.write(event)
+
+
+def publish_saved(event):
     if event.get("type") != "gap":
         state.recent_events.append(dict(event))
     publish_caption(event)
@@ -401,22 +328,6 @@ def write_event(event, *, already_persisted=False):
                 client.queue.put_nowait(reply)
             except asyncio.QueueFull:
                 pass
-    timestamp, text = event["timestamp"], event["text"]
-    errors_before = state.metrics["output_errors"]
-    try:
-        if state.daily_notes is not None:
-            if event["type"] == "gap":
-                state.daily_notes.close_paragraph()
-            state.daily_notes.add(timestamp, text)
-            if event["type"] == "gap":
-                state.daily_notes.close_paragraph()
-    except Exception as error:
-        output_failed("markdown", error)
-        if state.daily_notes is not None:
-            state.daily_notes.close_paragraph()
-    if errors_before == state.metrics["output_errors"]:
-        state.metrics["last_output_error"] = None
-    return True
 
 
 def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=None,
@@ -450,42 +361,7 @@ def record_gap(reason, seconds, *, session_id=None, sample_offset=None, audio_st
 
 
 def record_transcript_line(text, **timing):
-    text = re.sub(r"(?<![A-Z])([.?!])([A-Z])", r"\1 \2", " ".join(text.split()).strip())
-    if not text:
-        return False
-    identity = (timing.get("session_id"), timing.get("utterance_id"))
-    retryable = identity[1] is not None
-    retry = state.failed_finals.get(identity) if retryable else None
-    event = retry or make_event("transcript", text, **timing)
-    persisted = False
-    if retry is not None:
-        # A write/flush can fail after the full line reached the file. Reuse the
-        # same event ID and check the bounded rotated journal before appending.
-        path = os.path.join(LOG_DIR, "omi_transcript_events.jsonl")
-        try:
-            for candidate in [path] + [path+f".{index}" for index in range(1, 4)]:
-                if not os.path.isfile(candidate):
-                    continue
-                with open(candidate, encoding="utf-8", errors="replace") as journal:
-                    for line in journal:
-                        try:
-                            persisted |= json.loads(line).get("event_id") == event["event_id"]
-                        except (ValueError, AttributeError):
-                            continue
-            if not persisted and os.path.isfile(path) and os.path.getsize(path):
-                with open(path, "rb+") as journal:
-                    journal.seek(-1, os.SEEK_END)
-                    if journal.read(1) != b"\n":
-                        journal.write(b"\n")  # Keep a partial failed line separate.
-        except OSError as error:
-            output_failed("jsonl", error)
-            return False
-    if not write_event(event, already_persisted=persisted):
-        if retryable:
-            state.failed_finals[identity] = event
-        return False
-    state.failed_finals.pop(identity, None)
-    return True
+    return state.storage.final(text, **timing)
 
 
 def buffered_audio_bytes():
@@ -509,7 +385,7 @@ def build_health_dict():
     stream = state.live_stt
     workers_alive = bool(state.background_tasks) and all(not task.done() for task in state.background_tasks.values())
     connected = bool(stream is not None and stream.connected)
-    overloaded = bool(stream is not None and (stream.pending_bytes >= BYTES_PER_SECOND * 10 or len(stream.queue) >= 256))
+    overloaded = bool(stream is not None and (stream.pending_bytes >= QUEUE_MAX_BYTES or len(stream.queue) >= QUEUE_MAX_PACKETS))
     pending_age = oldest_pending_audio_age()
     stalled = pending_age is not None and pending_age > MAX_AUDIO_AGE_SEC
     ready = (workers_alive and connected and not state.stopping and not overloaded
@@ -524,9 +400,10 @@ def build_health_dict():
         "stream_connected": connected,
         "stream_reconnects": stream.reconnects if stream is not None else 0,
         "partial_updates": stream.partial_updates if stream is not None else 0,
-        "pending_finals": len(stream.closing_turns) if stream is not None else 0,
+        "pending_finals": stream.pending_final_count if stream is not None else 0,
         "pending_saves": len(getattr(stream, "pending_finals", ())),
         "save_error": getattr(stream, "save_error", None),
+        "last_flush_completed": getattr(stream, "last_flush_completed", None),
         "turns_without_text": stream.turns_without_text if stream is not None else 0,
         "gap_causes": dict(stream.gap_causes) if stream is not None else {},
         "stt_in_flight": current_stt_in_flight(), "max_audio_age_sec": MAX_AUDIO_AGE_SEC,
@@ -540,7 +417,7 @@ def build_health_dict():
         "last_packet_age_sec": round(now - state.metrics["last_packet_at"], 1) if state.metrics["last_packet_at"] is not None else None,
         "last_stt_success_age_sec": round(now - state.metrics["last_stt_success_at"], 1) if state.metrics["last_stt_success_at"] is not None else None,
         "last_transcript_age_sec": round(now - state.metrics["last_transcript_at"], 1) if state.metrics["last_transcript_at"] is not None else None,
-        "queue_depth": len(stream.queue) if stream is not None else 0, "queue_capacity_audio_sec": 10,
+        "queue_depth": len(stream.queue) if stream is not None else 0, "queue_capacity_audio_sec": QUEUE_AUDIO_SECONDS,
         "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
         "direct_ws_connected": bool(state.stream_clients),
         **{key: state.metrics[key] for key in ("utterances_processed", "audio_gaps", "queue_evictions", "last_error",
@@ -642,7 +519,10 @@ async def handle_omi_ws(request):
                     continue
                 if isinstance(ctrl, dict) and ctrl.get("type") == "CloseStream":
                     if state.live_stt is not None:
-                        await state.live_stt.flush_now()
+                        completed = await state.live_stt.flush_now()
+                        if completed is False:
+                            logger.warning("Phone close requested before transcription drain completed")
+                            await ws.close(code=1013, message=b"Transcription drain pending; audio retained")
                     break
             elif message.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                 break
@@ -729,7 +609,7 @@ async def handle_listen(request):
 
 async def on_startup(app):
     seed_recent_events()
-    state.daily_notes = DailyNotes(LOG_DIR)
+    state.storage.notes = DailyNotes(LOG_DIR, idle_flush=IDLE_FLUSH_SEC)
     state.stopping = False
     state.metrics["started_at"] = time.monotonic()
     callbacks = dict(on_partial=publish_partial, on_final=record_live_final,
@@ -757,7 +637,10 @@ async def on_cleanup(app):
         await state.live_stt.close()
         await app["live_stt_task"]
         flush_daily_paragraph()
-        logger.info("Shutdown drain complete")
+        if state.live_stt.last_flush_completed is False:
+            logger.warning("Shutdown drain incomplete; inspect reported gaps and pending saves")
+        else:
+            logger.info("Shutdown drain complete")
     finally:
         state.background_tasks.clear()
 

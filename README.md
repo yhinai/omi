@@ -15,7 +15,8 @@ Omi wearable → phone → /v1/listen → Whisper Turbo (MLX GPU)
 - `bridge.py` — phone ingress, caption delivery, saved transcripts and health.
 - `stt.py` — worker lifecycle, audio buffering, replay and save retries.
 - `whisper.py` — local GPU recognition and CPU speech detection.
-- `common.py` — shared audio types and recognition policy.
+- `common.py` — shared audio types, queue limits and recognition policy.
+- `storage.py` — journal writes, duplicate protection, replay loading and daily Markdown.
 - `tui.py` — terminal caption viewer; launch with `tui.sh`.
 - `run.sh` — start, stop and inspect the service.
 
@@ -103,7 +104,7 @@ New plain-text transcript logs are no longer written. Old files are not converte
 
 Partials are temporary; only finals and diagnostic gaps are saved. JSONL writes happen before caption publication and Markdown updates. File errors degrade health; a later successful output clears the error. Markdown is a readable projection, not a transactional backup.
 
-Unsent audio is bounded to ten seconds and 256 packet records. Newer audio wins during overload; dropped or uncertain speech is recorded as a gap. Worker reconnects use backoff and replay unresolved audio; recognized-but-unsaved finals are retried in source order. Shutdown allows up to 20 seconds to drain live transcription. Crashes or forced termination can lose RAM-only audio.
+Unsent audio is bounded to ten seconds and 256 packet records. Newer audio wins during overload; dropped or uncertain speech is recorded as a gap. Worker reconnects use backoff and replay unresolved audio; recognized-but-unsaved finals are retried in source order. Phone flush requests return completion or timeout; shutdown allows up to 20 seconds to drain live transcription and reports incomplete drains. Crashes or forced termination can lose RAM-only audio.
 
 Settings in `.env.example` cover local model paths, maximum unsent-audio age, and idle timeout. Only local English live transcription is supported. Timing is estimated from bridge receipt and excludes buffering before the bridge.
 
@@ -117,7 +118,7 @@ curl -fsS http://127.0.0.1:8788/health | .venv/bin/python3.15 -m json.tool
 .venv/bin/python3.15 scripts/smoke_test.py
 ```
 
-Health is loopback-only: HTTP 200 means ready; 503 means degraded. Check `stt_backend`, `model`, `stream_connected`, `direct_ws_connected`, packet/transcript age, queue depth, output errors, and latency. A healthy idle bridge does not prove speech recognition. `pending_finals`, `gap_causes`, and `turns_without_text` expose turn completion and gap diagnostics. `latency.receipt_to_send_sec` measures queue delay; `latency.turn_close_to_final_sec` measures recognition after the turn closes. Gap JSONL records include a `detail` cause when available; energy-detected audio duration is not a count of missing spoken words.
+Health is loopback-only: HTTP 200 means ready; 503 means degraded. Check `stt_backend`, `model`, `stream_connected`, `direct_ws_connected`, packet/transcript age, queue depth, output errors, and latency. A healthy idle bridge does not prove speech recognition. `pending_finals`, `pending_saves`, `last_flush_completed`, `gap_causes`, and `turns_without_text` expose turn completion, save recovery and gap diagnostics. Worker failures log bounded runtime metadata; raw stderr and recognized text are not written to diagnostic logs. `latency.receipt_to_send_sec` measures queue delay; `latency.turn_close_to_final_sec` measures recognition after the turn closes. Gap JSONL records include a `detail` cause when available; energy-detected audio duration is not a count of missing spoken words.
 
 Tests use synthetic data and a fake local worker without loading a model. The single manual smoke check runs real local Whisper in a temporary bridge. It verifies partial captions, finalized JSONL, daily Markdown, and shutdown without touching the running phone stream or normal logs. It synthesizes a known phrase using macOS speech; alternatively:
 

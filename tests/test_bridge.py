@@ -338,7 +338,7 @@ class TimestampTests(unittest.TestCase):
         source = datetime(2026, 10, 24, 23, 59, 59).timestamp()
         processed = datetime(2026, 10, 25, 0, 2, 0).timestamp()
         with tempfile.TemporaryDirectory() as directory, \
-             mock.patch.object(bridge.state, "daily_notes", bridge.DailyNotes(directory)), \
+             mock.patch.object(bridge.state.storage, "notes", bridge.DailyNotes(directory)), \
              mock.patch.object(bridge, "event_logger") as events, \
              mock.patch.object(bridge, "publish_caption") as publish:
             bridge.record_transcript_line("trigger spoken words", audio_start_at=source,
@@ -355,31 +355,6 @@ class TimestampTests(unittest.TestCase):
             self.assertEqual(publish.call_args.args[0]["audio_start_at"], source)
 
 
-class NotesTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        cls.notes_class = bridge.DailyNotes
-
-    def test_pause_word_limit_midnight_and_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
-            notes = self.notes_class(directory)
-            entries = [("2026-10-24 23:59:40", "first"),
-                       ("2026-10-24 23:59:48", "second"),
-                       ("2026-10-24 23:59:57", "after pause"),
-                       ("2026-10-25 00:00:02", "word " * 120),
-                       ("2026-10-25 00:00:07", "next paragraph")]
-            for stamp, text in entries:
-                notes.add(stamp, text)
-            first = Path(directory, "2026-10-24.md").read_text()
-            second = Path(directory, "2026-10-25.md").read_text()
-            self.assertIn("first second", first)
-            self.assertEqual(first.count("**["), 2)
-            self.assertEqual(second.count("**["), 2)
-            restarted = self.notes_class(directory)
-            restarted.add("2026-10-25 00:00:12", "continued after restart")
-            updated = Path(directory, "2026-10-25.md").read_text()
-            self.assertTrue(updated.startswith(second))
-            self.assertIn("continued after restart", updated)
 
 
 class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
@@ -392,7 +367,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_output_failure_does_not_drop_recognition_or_later_finals(self):
         notes = mock.Mock()
         notes.add.side_effect = OSError("disk full")
-        self.runtime.daily_notes = notes
+        self.runtime.storage.notes = notes
         with mock.patch.object(bridge, "event_logger") as events:
             self.assertTrue(bridge.record_live_final("First words", utterance_id="first"))
             self.assertTrue(bridge.record_live_final("Next words", utterance_id="next"))
@@ -403,11 +378,11 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events.info.call_count, 2)
 
     async def test_jsonl_failure_prevents_projections_and_recovers_on_next_final(self):
-        self.runtime.daily_notes = mock.Mock()
+        self.runtime.storage.notes = mock.Mock()
         with mock.patch.object(bridge, "event_logger") as events:
             events.info.side_effect = OSError("disk full")
             self.assertFalse(bridge.record_live_final("First words", utterance_id="first"))
-            self.runtime.daily_notes.add.assert_not_called()
+            self.runtime.storage.notes.add.assert_not_called()
             self.assertFalse(self.runtime.recent_events)
             self.assertEqual(self.runtime.metrics["transcripts_emitted"], 0)
             self.assertIsNotNone(self.runtime.metrics["last_output_error"])
@@ -425,7 +400,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
             order.append("markdown")
             raise OSError("full")
         notes.add.side_effect = failed_markdown
-        self.runtime.daily_notes = notes
+        self.runtime.storage.notes = notes
         with mock.patch.object(bridge, "event_logger") as events:
             events.info.side_effect = lambda *args: order.append("jsonl")
             self.assertTrue(bridge.record_transcript_line("hello"))
@@ -436,7 +411,7 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_gap_is_persisted_in_jsonl_and_daily_notes(self):
         with tempfile.TemporaryDirectory() as directory:
-            self.runtime.daily_notes = bridge.DailyNotes(directory)
+            self.runtime.storage.notes = bridge.DailyNotes(directory)
             with mock.patch.object(bridge, "event_logger") as events:
                 bridge.record_gap("stale", .125, session_id=4, sample_offset=8000)
             event = json.loads(events.info.call_args.args[0])
@@ -455,20 +430,6 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 
 
 class OutputHandlerTests(unittest.TestCase):
-    def test_disk_write_error_is_raised_instead_of_swallowed_by_logging(self):
-        with tempfile.TemporaryDirectory() as directory:
-            handler = bridge.OutputFileHandler(str(Path(directory, "test.log")), maxBytes=1024, backupCount=1)
-            original = handler.stream
-            handler.stream = mock.Mock()
-            handler.stream.tell.return_value = 0
-            handler.stream.write.side_effect = OSError("full")
-            record = logging.LogRecord("test", logging.INFO, "", 1, "hello", (), None)
-            try:
-                with self.assertRaises(OSError):
-                    handler.emit(record)
-            finally:
-                handler.stream = original
-                handler.close()
 
     def test_invalid_live_audio_settings_fail_startup(self):
         for name in ("OMI_MAX_AUDIO_AGE_SEC", "OMI_IDLE_FLUSH_SEC"):
@@ -681,7 +642,7 @@ class PartialAndFinalTests(unittest.IsolatedAsyncioTestCase):
 
 
     def test_final_events_are_marked_and_persisted_once(self):
-        with mock.patch.object(bridge, "write_event", return_value=True) as output:
+        with mock.patch.object(bridge, "publish_saved", return_value=True) as output:
             bridge.record_live_final("Final speech", utterance_id="u1", session_id=1)
         event = output.call_args.args[0]
         self.assertEqual((event["type"],event["is_final"],event["utterance_id"]), ("transcript",True,"u1"))

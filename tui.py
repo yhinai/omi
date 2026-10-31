@@ -115,7 +115,6 @@ class Viewer:
     transcribing: bool = False
     draft: str = ""
     draft_identity: tuple | None = None
-    draft_session: tuple | None = None
     draft_revision: int = 0
     draft_source_at: float | None = None
     draft_timestamp: str = ""
@@ -155,7 +154,7 @@ class Viewer:
         self.wake.set()
 
     def clear_draft(self):
-        self.draft, self.draft_identity, self.draft_session, self.draft_revision = "", None, None, 0
+        self.draft, self.draft_identity, self.draft_revision = "", None, 0
         self.draft_source_at, self.draft_timestamp, self.draft_target_key = None, "", None
 
     def add(self, event):
@@ -223,8 +222,6 @@ class Viewer:
                     self.draft_target_key = self.next_key
             self.draft = text
             self.draft_identity = identity if text else None
-            self.draft_session = ((event.get("stream_id"), event["session_id"])
-                                  if text and event.get("session_id") is not None else None)
             self.draft_revision = revision if text else 0
             if not text:
                 self.clear_draft()

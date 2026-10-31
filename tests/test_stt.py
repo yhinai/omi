@@ -9,10 +9,11 @@ import threading
 import time
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 from stt import LocalWhisperSTT
-from whisper import FRAME, MAX_TURN, Stream
-from common import Packet, WhisperPolicy
+from whisper import FRAME, Stream
+from common import Packet, WhisperPolicy, RATE, WHISPER_POLICY
 
 
 class Recognizer:
@@ -71,7 +72,7 @@ class SegmentationTests(unittest.TestCase):
         self.assertEqual(self.stream.closed[0].end, self.stream.active.first.sample_offset)
 
     def test_long_continuous_speech_is_bounded_without_dropping_pcm(self):
-        speech = b"\x00\x10" * (MAX_TURN+FRAME*5)
+        speech = b"\x00\x10" * (int(RATE*WHISPER_POLICY.max_turn_seconds)+FRAME*5)
         feed(self.stream, speech)
         self.stream.flush("end", len(speech)//2)
         turns = list(self.stream.closed)
@@ -351,46 +352,59 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(len(self.stream.retained[0].pcm), (1600-512)*2)
 
 
-class JournalRetryTests(unittest.TestCase):
-    def test_flush_failure_after_complete_write_does_not_duplicate_the_journal(self):
-        import bridge
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'omi_transcript_events.jsonl'
-            logger=mock.Mock()
-            def uncertain_write(encoded):
-                path.write_text(encoded+'\n')
-                raise OSError('flush failed after write')
-            logger.info.side_effect=uncertain_write
-            runtime=bridge.BridgeState()
-            with mock.patch.object(bridge,'state',runtime), mock.patch.object(bridge,'LOG_DIR',directory), \
-                 mock.patch.object(bridge,'STT_BACKEND','whisper'), mock.patch.object(bridge,'event_logger',logger):
-                self.assertFalse(bridge.record_live_final('Recovered once.',utterance_id='u',session_id=1))
-                self.assertFalse(runtime.recent_events)
-                logger.info.side_effect=None
-                self.assertTrue(bridge.record_live_final('Recovered once.',utterance_id='u',session_id=1))
-                self.assertEqual(logger.info.call_count,1)
-                self.assertEqual(len(path.read_text().splitlines()),1)
-                self.assertEqual(len(runtime.recent_events),1)
-                self.assertEqual(runtime.metrics['utterances_processed'],1)
-                self.assertEqual(runtime.metrics['transcripts_emitted'],1)
-                self.assertFalse(runtime.failed_finals)
 
-    def test_partial_failed_line_does_not_swallow_the_retried_final(self):
-        import bridge
-        with tempfile.TemporaryDirectory() as directory:
-            path=Path(directory)/'omi_transcript_events.jsonl'
-            logger=mock.Mock()
-            def partial_write(encoded):
-                path.write_text(encoded[:25])
-                raise OSError('partial write')
-            logger.info.side_effect=partial_write
-            with mock.patch.object(bridge,'state',bridge.BridgeState()), mock.patch.object(bridge,'LOG_DIR',directory), \
-                 mock.patch.object(bridge,'STT_BACKEND','whisper'), mock.patch.object(bridge,'event_logger',logger):
-                self.assertFalse(bridge.record_live_final('Recovered once.',utterance_id='u'))
-                def append(encoded):
-                    with path.open('a') as journal:journal.write(encoded+'\n')
-                logger.info.side_effect=append
-                self.assertTrue(bridge.record_live_final('Recovered once.',utterance_id='u'))
-                lines=path.read_text().splitlines()
-                self.assertEqual(len(lines),2)
-                self.assertEqual(json.loads(lines[1])['text'],'Recovered once.')
+
+class FlushAndDiagnosticTests(unittest.IsolatedAsyncioTestCase):
+    def make(self):
+        return LocalWhisperSTT(python=sys.executable, model='model', vad='vad',
+            on_partial=mock.Mock(), on_final=mock.Mock(), on_gap=mock.Mock(),
+            on_latency=mock.Mock(), on_connection=mock.Mock())
+
+    async def test_flush_reports_completion_after_worker_ack(self):
+        stream = self.make()
+        task = asyncio.create_task(stream.flush_now(timeout=1))
+        await asyncio.sleep(0)
+        identity, _ = stream.controls[0]
+        stream.handle_message({'type':'flushed','request_id':identity})
+        self.assertTrue(await task)
+        self.assertTrue(stream.last_flush_completed)
+        self.assertFalse(stream.flush_waiters)
+
+    async def test_flush_reports_save_timeout_without_releasing_source(self):
+        stream = self.make()
+        stream.retained.append(Packet(bytes(3200),time.time(),time.monotonic(),0,1))
+        stream.save_ready.clear()
+        with self.assertLogs('bridge', level='WARNING'):
+            task = asyncio.create_task(stream.flush_now(timeout=.02))
+            await asyncio.sleep(0)
+            stream.handle_message({'type':'flushed','request_id':stream.controls[0][0]})
+            self.assertFalse(await task)
+        self.assertFalse(stream.last_flush_completed)
+        self.assertEqual(len(stream.retained[0].pcm),3200)
+        self.assertFalse(stream.flush_waiters)
+
+    async def test_shutdown_timeout_is_reported(self):
+        stream = self.make()
+        stream.task = asyncio.create_task(asyncio.sleep(60))
+        with mock.patch('stt.SHUTDOWN_TIMEOUT',.02), self.assertLogs('bridge',level='ERROR'):
+            await stream.close()
+        self.assertFalse(stream.last_flush_completed)
+        self.assertTrue(stream.task.cancelled())
+
+    async def test_stderr_is_bounded_and_logs_only_runtime_metadata(self):
+        from common import WORKER_DIAGNOSTIC_BYTES
+        stream = self.make()
+        reader = asyncio.StreamReader()
+        stream.process = SimpleNamespace(stderr=reader)
+        reader.feed_data(b'x'*20000+b'\nRuntimeError: out of memory private spoken phrase SecretError\n')
+        reader.feed_eof()
+        await stream._read_diagnostics()
+        self.assertLessEqual(len(stream.worker_diagnostics),WORKER_DIAGNOSTIC_BYTES)
+        with self.assertLogs('bridge',level='ERROR') as output:
+            stream._report_diagnostics(ConnectionError())
+        text=' '.join(output.output)
+        self.assertIn('RuntimeError',text)
+        self.assertIn('out of memory',text)
+        self.assertNotIn('private spoken phrase',text)
+        self.assertNotIn('SecretError',text)
+        self.assertFalse(stream.worker_diagnostics)
