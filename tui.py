@@ -215,6 +215,7 @@ class Viewer:
     anchor: tuple[int, int] | None = None
     unread: int = 0
     show_times: bool = True
+    turn_headers: bool = False
     focus: bool = False
     diagnostics: bool = False
     mouse_enabled: bool = True
@@ -278,6 +279,7 @@ class Viewer:
         if isinstance(turns,list) and turns and event.get('type','transcript')=='transcript':
             valid=[t for t in turns[:512] if isinstance(t,dict) and isinstance(t.get('text'),str) and t['text'].strip()]
             if valid:
+                self.turn_headers=True
                 identity=event.get('event_id')
                 if isinstance(identity,str):
                     if identity in self.seen:
@@ -399,7 +401,7 @@ class Viewer:
                            if event.get("session_id") is not None else None)
                 previous = self.captions[-1] if self.captions else None
                 same_session = bool(previous is not None and session is not None and session == previous.session)
-                continuous = (previous is not None and not previous.speaker_labelled and previous.kind == "transcript"
+                continuous = (previous is not None and previous.kind == "transcript"
                     and (session is None or session == previous.session)
                     and within_paragraph(self.draft_source_at, previous, DRAFT_NO_TIMING_SEC,
                                          speech_start_offset=event.get("speech_start_offset"),
@@ -473,7 +475,7 @@ class Viewer:
                                            same_session=same_session))
         reserved_key = None
         if matching_draft:
-            continuous = previous is not None and previous.key == self.draft_target_key
+            continuous = continuous or (previous is not None and previous.key == self.draft_target_key)
             if not continuous:
                 reserved_key = self.draft_target_key
                 stamp = self.draft_timestamp
@@ -596,23 +598,25 @@ def rows_for(viewer, width):
             full_text = text
         lines = wrap(full_text, width) if draft_start is not None else cached_lines(caption, width)
         is_bookmarked = caption.key in viewer.bookmarks
-        if caption.speaker_label:
-            rows.append(Row(caption.key,0,"","muted",timestamp=caption.timestamp if viewer.show_times else "",
-                            bookmarked=is_bookmarked,speaker_label=caption.speaker_label,speaker_header=True))
+        if viewer.turn_headers or caption.speaker_label:
+            rows.append(Row(caption.key,0,"","muted",timestamp="",
+                            bookmarked=False,speaker_label=caption.speaker_label,speaker_header=True))
         for line in lines:
             offset = full_text.find(line, offset)
             muted = caption.kind == "gap" or (viewer.focus and caption.key != focused) or (draft_start is not None and offset >= draft_start)
             soft = caption.soft_from if not muted and draft_start is None and now < caption.soft_until else None
             if not muted and draft_start is not None and offset + len(line) > draft_start:
                 soft = draft_start
-            stamp = caption.timestamp if not caption.speaker_label and viewer.show_times and (caption.show_stamp or is_bookmarked) and offset == 0 else ""
+            stamp = caption.timestamp if viewer.show_times and (viewer.turn_headers or caption.show_stamp or is_bookmarked) and offset == 0 else ""
             rows.append(Row(caption.key, offset, line, "muted" if muted else "text", soft,
-                            timestamp=stamp, bookmarked=is_bookmarked and offset == 0 and not caption.speaker_label))
+                            timestamp=stamp, bookmarked=is_bookmarked and offset == 0))
             offset += len(line)
         rows.append(Row(caption.key, len(full_text) + 1, ""))
-        if caption.speaker_label:
+        if viewer.turn_headers or caption.speaker_label:
             rows.append(Row(caption.key, len(full_text) + 2, ""))
     if viewer.draft and not draft_inlined:
+        if viewer.turn_headers:
+            rows.append(Row(viewer.draft_target_key,0,"","muted",timestamp="",speaker_header=True))
         offset = 0
         for line in wrap(viewer.draft, width):
             offset = viewer.draft.find(line, offset)
@@ -622,6 +626,8 @@ def rows_for(viewer, width):
         # Reserve the same trailing space as a final paragraph. Otherwise a
         # full, following viewport would shift up one row on confirmation.
         rows.append(Row(viewer.draft_target_key, len(viewer.draft)+1, ""))
+        if viewer.turn_headers:
+            rows.append(Row(viewer.draft_target_key,len(viewer.draft)+2,""))
     return rows
 
 
@@ -730,7 +736,7 @@ def jump_bookmark(viewer, rows, available, backwards=False):
 
 def caption_text(caption, stamp=False):
     if caption.speaker_label:
-        return f"{caption.timestamp}  {caption.speaker_label}\n          {caption.text}"
+        return f"          {caption.speaker_label}\n{caption.timestamp}  {caption.text}"
     return f"[{caption.timestamp}] {caption.text}" if stamp else caption.text
 
 
@@ -1531,7 +1537,7 @@ async def run(screen, args):
         palette = {role: attr for role, (_, attr) in spec.items()} if mono else build_palette(spec)
     except curses.error:
         palette = {role: attr for role, (_, attr) in palette_spec(theme, True).items()}
-    viewer, rendered = Viewer(mouse_enabled=args.mouse == "wheel", sync_output=args.sync_output), None
+    viewer, rendered = Viewer(mouse_enabled=args.mouse == "wheel", sync_output=args.sync_output, turn_headers=True), None
     parts = urlsplit(args.url)
     viewer.local_battery = (parts.scheme=='ws' and parts.hostname in {'localhost','127.0.0.1','::1'}
                             and parts.port==8787 and parts.path=='/listen')

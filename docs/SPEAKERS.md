@@ -103,23 +103,25 @@ The wearer has not been enrolled or measured by these synthetic tests.
 
 ## Caption layout
 
-The terminal viewer uses a separate header for each speaker turn:
+The terminal viewer reserves a separate speaker row above each turn, and keeps the
+recording timestamp beside the spoken text in its original column:
 
 ```text
-12:00:00  Speaker 1
-          Demo's in prison.
+          Speaker 1
+12:00:00  Demo's in prison.
 
 
-12:00:03  Speaker 2
-          Another reply.
+          Speaker 2
+12:00:03  Another reply.
 ```
 
-The recording timestamp keeps its existing horizontal position. The speaker starts
-at the transcript column, with the spoken text directly below and two blank lines
-between turns. The viewer splits multi-speaker finals into separate display turns
-and can join adjacent chunks of the same scoped speaker. It does not insert bracketed
-speaker tags into sentence text or attach an unattributed partial to the preceding
-labeled speaker. Session export/bookmarks retain the timestamp/speaker header layout.
+From the first partial, the speaker row is already reserved but blank. Confirmation
+fills that row instead of moving the sentence. Provisional continuation text flows
+in muted style after the preceding turn; it remains unconfirmed until a final arrives.
+A final with the same scoped speaker joins the existing sentence. A confirmed different
+speaker starts a separate block. Two blank lines separate turns, and the original
+recording-start timestamp is retained. Session export/bookmarks use the same layout.
+No bracketed speaker tags are inserted into sentence text.
 
 These labels are anonymous provider groups, not verified identities. Local verification
 uncertainty remains in the saved metadata; the reading margin omits the repeated

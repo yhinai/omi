@@ -847,7 +847,7 @@ class SpeakerGutterTests(unittest.TestCase):
         for caption in viewer.captions:
             y=next(y for y,row in enumerate(screen.lines) if caption.speaker_label in ''.join(row))
             header=''.join(screen.lines[y]);body=''.join(screen.lines[y+1])
-            self.assertEqual(header.index(caption.timestamp),left-10)
+            self.assertEqual(body.index(caption.timestamp),left-10)
             self.assertEqual(header.index(caption.speaker_label),left)
             self.assertEqual(body.index(caption.text),left)
             self.assertFalse(''.join(screen.lines[y+2]).strip())
@@ -855,7 +855,7 @@ class SpeakerGutterTests(unittest.TestCase):
             self.assertNotIn('uncertain',header);self.assertNotIn('[Speaker',header)
         self.assertEqual(viewer.last_event_id,'original')
         viewer.add(self.speaker_event());self.assertEqual(len(viewer.captions),2)
-        self.assertIn('Speaker 1\n          First voice.',tui.session_text(viewer))
+        self.assertIn('Speaker 1\n'+viewer.captions[0].timestamp+'  First voice.',tui.session_text(viewer))
 
     def test_adjacent_same_speaker_chunks_join_and_different_speakers_do_not(self):
         viewer=tui.Viewer();e=self.speaker_event();e['speaker_turns']=e['speaker_turns'][:1]
@@ -879,6 +879,56 @@ class SpeakerGutterTests(unittest.TestCase):
             tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
         y=next(y for y,row in enumerate(screen.lines) if 'Speaker 1' in ''.join(row))
         header=''.join(screen.lines[y]);body=''.join(screen.lines[y+1])
-        self.assertEqual(header.index(viewer.captions[0].timestamp),3)
+        self.assertEqual(body.index(viewer.captions[0].timestamp),3)
         self.assertEqual(header.index('Speaker 1'),13)
         self.assertEqual(body.index('First voice.'),13)
+
+class StableSpeakerStreamingTests(unittest.TestCase):
+    def draft(self, text, source=100, identity='u1',offset=0):
+        return dict(type='partial',text=text,audio_start_at=source,stream_id='s',session_id=1,
+                    utterance_id=identity,revision=1,sample_offset=offset)
+
+    def final(self,text,source=100,identity='u1',offset=0,end=32000,speaker=0):
+        return dict(type='transcript',text=text,audio_start_at=source,stream_id='s',session_id=1,
+                    utterance_id=identity,event_id=identity,timestamp='2026-11-14 12:00:00',
+                    sample_offset=offset,sample_end_offset=end,speaker_turns=[dict(text=text,speaker_id=speaker,
+                        speaker_key=f'epoch:{speaker}',sample_offset=offset,sample_end_offset=end)])
+
+    def test_header_is_reserved_before_speaker_is_known(self):
+        viewer=tui.Viewer(turn_headers=True)
+        viewer.add(self.draft('So what do I do to distinguish between'))
+        before=tui.rows_for(viewer,72)
+        text_row=next(i for i,r in enumerate(before) if r.text)
+        self.assertEqual(text_row,1)
+        self.assertTrue(before[0].speaker_header);self.assertEqual(before[0].speaker_label,'')
+        key=before[1].key
+        viewer.add(self.final('So what do I do to distinguish between'))
+        after=tui.rows_for(viewer,72)
+        self.assertEqual(next(i for i,r in enumerate(after) if r.text),text_row)
+        self.assertEqual(after[1].key,key)
+        self.assertEqual(after[0].speaker_label,'Speaker 1')
+        self.assertEqual(len(before),len(after))
+
+    def test_partial_tail_and_same_speaker_final_complete_same_sentence(self):
+        viewer=tui.Viewer(turn_headers=True)
+        prefix='So what do I do to distinguish between'
+        viewer.add(self.draft(prefix));viewer.add(self.final(prefix))
+        key=viewer.captions[-1].key
+        viewer.add(self.draft('the two speakers?',source=102.1,identity='u2',offset=33600))
+        self.assertEqual(viewer.draft_target_key,key)
+        rows=tui.rows_for(viewer,90)
+        self.assertEqual([r.text for r in rows if r.text],[prefix+' the two speakers?'])
+        viewer.add(self.final('the two speakers?',source=102.1,identity='u2',offset=33600,end=64000))
+        self.assertEqual(len(viewer.captions),1)
+        self.assertEqual(viewer.captions[0].key,key)
+        self.assertEqual(viewer.captions[0].text,prefix+' the two speakers?')
+        self.assertEqual(sum(r.speaker_header for r in tui.rows_for(viewer,90)),1)
+        self.assertEqual(viewer.last_event_id,'u2')
+
+    def test_confirmed_speaker_change_still_starts_a_new_block(self):
+        viewer=tui.Viewer(turn_headers=True)
+        viewer.add(self.final('First speaker.'))
+        viewer.add(self.draft('Reply.',source=102.1,identity='u2',offset=33600))
+        viewer.add(self.final('Reply.',source=102.1,identity='u2',offset=33600,end=64000,speaker=1))
+        self.assertEqual(len(viewer.captions),2)
+        self.assertEqual([c.speaker_label for c in viewer.captions],['Speaker 1','Speaker 2'])
