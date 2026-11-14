@@ -10,7 +10,7 @@ This Mac uses **Deepgram Nova-3 English**. Local Whisper remains an explicit fal
 
 ## Daily use
 
-From `/Users/alhinai/omi`:
+From `/Users/alhinai/vexo-captions` on the Mac:
 
 ```bash
 ./omi start
@@ -58,6 +58,8 @@ This sends synthesized test audio through a real Pipecat pipeline and Deepgram o
 
 [Operations](docs/OPERATIONS.md) covers use and recovery. [Architecture](docs/ARCHITECTURE.md) defines ownership and guarantees. [Recovery archive](docs/archive/README.md) preserves retired research, experiments and the hackathon packet; [evidence](docs/evidence/README.md) records verification scope and limits.
 
-For Vexo band 43 over USB, see [Vexo setup and operation](docs/VEXO.md).
+For Vexo band 43 over Bluetooth or USB, see [Vexo setup and operation](docs/VEXO.md).
+
+The Mac is the sole active host; the Mini deployment is retired. [Continue on the Mac](docs/HANDOFF_MAC.md) contains the complete operating handoff, recovery locations, completed work and remaining priorities.
 
 [Wearable optimization audit](docs/OPTIMIZATION.md) traces the Vexo/Omi stages, measured latency, deployment boundaries and remaining validation for multiple devices.

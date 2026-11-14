@@ -13,4 +13,6 @@ The published `pipecat-smoke.json` and `pipecat-whisper-fallback.json` record is
 
 Older receipts and REA bundles are preserved in the [recovery archive](../archive/README.md). Match source hashes, backend, configuration and input before reusing a claim. A current service-health check does not validate microphone identity or recognition accuracy.
 
+The Mac-only cutover copies the Mini's ignored receipts, full REA bundle, source snapshot, Git history and older recovery archives into a private package on the Mac. [Mac handoff](../HANDOFF_MAC.md) records its location. `mac-only-cutover.json` is an ignored local receipt with retirement, transfer and destination verification. Original capture paths remain unchanged in historical evidence; the private transfer manifest and destination index identify their new location.
+
 The earlier wearable comparison was inconclusive: the user confirmed that the intended phrase was absent from the private recording. Raw diagnostic audio remains outside the repository. The maintained demo fixture is synthesized speech at `assets/demo.wav`; it is unrelated to that private recording.
