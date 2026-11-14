@@ -219,6 +219,7 @@ class Viewer:
     held_text: dict = field(default_factory=dict, repr=False)
     sync_output: str = "auto"
     paint_cache: object = field(default=None, repr=False)
+    local_battery: bool = False
     pipeline: dict = field(default_factory=dict)
     replaying: bool = False
     replay_supported: bool = False
@@ -1096,7 +1097,7 @@ async def apply_mouse(viewer, rows, available, top, left, mx, my, bstate, clipbo
         viewer.revision += 1
 
 
-def geometry(height, width, following=True, measure: int | None = READING_MEASURE):
+def geometry(height, width, following=True, measure: int | None = READING_MEASURE, right_reserve=0):
     # Wide windows get a centred column, but never wider than a readable measure.
     natural = max(1, width // 2 if width >= 80 else width - 16)
     column = min(natural, measure) if measure else natural
@@ -1104,6 +1105,7 @@ def geometry(height, width, following=True, measure: int | None = READING_MEASUR
     bottom_cushion = 4 if following and height >= 18 else 2
     available = max(1, height - top - bottom_cushion)
     left = (width - column) // 2 if width >= 80 else 13
+    column = min(column,max(1,width-left-right_reserve))
     return column, left, top, available
 
 
@@ -1224,8 +1226,20 @@ class Frame:
                 sys.stdout.flush()
 
 
+def battery_label(viewer):
+    if not viewer.local_battery:return ""
+    try:
+        from cli import current_battery
+        from config import VEXO_BAND
+    except ImportError:
+        return "--%"
+    value = current_battery({'kind':'vexo','band':VEXO_BAND})
+    percent = value.get('percent') if value else None
+    return f"{percent}%" if isinstance(percent,int) and not isinstance(percent,bool) and 0<=percent<=100 else "--%"
+
+
 def wall_clock():
-    """Local time, seconds included: the page's only chrome, and it earns its row."""
+    """Local time, seconds included, above the local wearable battery reading."""
     return datetime.now().strftime("%H:%M:%S")
 
 
@@ -1263,11 +1277,14 @@ def paint(screen, viewer, palette, measure: int | None = READING_MEASURE):
     if height < 10 or width < 32:
         put(screen, 1, 2, "A little more room, please.", palette["muted"])
     else:
-        column, left, top, available = geometry(height, width, viewer.following and not viewer.holding, measure)
+        column, left, top, available = geometry(height, width, viewer.following and not viewer.holding, measure, right_reserve=4 if viewer.local_battery else 0)
         rows = rows_for(viewer, column)
         # The clock belongs to the terminal, not the column: pin it to the top right corner.
         stamp = wall_clock()
         put(screen, 0, max(0, width - cells(stamp)), stamp, clock_attr(viewer, palette), reserve=0)
+        battery = battery_label(viewer)
+        if battery:
+            put(screen, 1, max(0,width-cells(battery)), battery, palette["muted"], reserve=0)
         start = viewport(viewer, rows, available)
         if not viewer.following and viewer.anchor is not None and not any(r.key == viewer.anchor[0] for r in rows):
             viewer.anchor = (rows[0].key, rows[0].offset) if rows else None
@@ -1459,6 +1476,9 @@ async def run(screen, args):
     except curses.error:
         palette = {role: attr for role, (_, attr) in palette_spec(theme, True).items()}
     viewer, rendered = Viewer(mouse_enabled=args.mouse == "wheel", sync_output=args.sync_output), None
+    parts = urlsplit(args.url)
+    viewer.local_battery = (parts.scheme=='ws' and parts.hostname in {'localhost','127.0.0.1','::1'}
+                            and parts.port==8787 and parts.path=='/listen')
     clipboard = clipboard_mode(args.clipboard)
     pending = deque()
     title_state = None
@@ -1486,7 +1506,7 @@ async def run(screen, args):
                 if screen.getmaxyx() != (size.lines, size.columns):
                     curses.resizeterm(size.lines, size.columns)
             height, width = screen.getmaxyx()
-            column, left, top, available = geometry(height, width, viewer.following and not viewer.holding, args.measure)
+            column, left, top, available = geometry(height, width, viewer.following and not viewer.holding, args.measure, right_reserve=4 if viewer.local_battery else 0)
             rows = rows_for(viewer, column)
             had_input = False
             # Drain curses' own input buffer, which can outlive readiness of the fd.
@@ -1532,7 +1552,7 @@ async def run(screen, args):
                 if with_curses_mouse and viewer.mouse_enabled != previous_mouse_enabled:
                     curses.mousemask((curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0)) if viewer.mouse_enabled else 0)
                     mouse_protocol(viewer.mouse_enabled)
-                column, left, top, available = geometry(height, width, viewer.following and not viewer.holding, args.measure)
+                column, left, top, available = geometry(height, width, viewer.following and not viewer.holding, args.measure, right_reserve=4 if viewer.local_battery else 0)
                 rows = rows_for(viewer, column)
             else:
                 viewer.wake.set()
@@ -1543,7 +1563,7 @@ async def run(screen, args):
                     set_title(f"Omi · {label}")
                     title_state = label
             token = (viewer.revision, (height, width), viewer.status(now), now < viewer.toast_until,
-                     transitions(viewer, now), wall_clock(),
+                     transitions(viewer, now), wall_clock(), battery_label(viewer),
                      int(now) if viewer.diagnostics else None)
             # Holding leaves the actual terminal pixels alone for native selection.
             # Reception continues; keyboard input and resizing still redraw the view.

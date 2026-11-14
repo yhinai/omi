@@ -806,3 +806,28 @@ class ClockStateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class BatteryClockTests(unittest.TestCase):
+    def test_battery_is_right_aligned_directly_under_clock(self):
+        viewer=tui.Viewer(connected=True,local_battery=True)
+        viewer.add(event('Words remain in their reading column',event_id='battery'))
+        screen=Screen(26,100)
+        with mock.patch.object(tui.curses,'doupdate'),mock.patch.object(tui,'wall_clock',return_value='13:04:05'),mock.patch.object(tui,'battery_label',return_value='30%'):
+            tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
+        self.assertTrue(''.join(screen.lines[0]).endswith('13:04:05'))
+        self.assertTrue(''.join(screen.lines[1]).endswith('30%'))
+        self.assertIn('Words remain',screen.text)
+
+    def test_battery_does_not_overlap_text_in_narrow_screen(self):
+        viewer=tui.Viewer(connected=True,local_battery=True)
+        viewer.add(event('A long caption '*20,event_id='battery'))
+        screen=Screen(12,32)
+        with mock.patch.object(tui.curses,'doupdate'),mock.patch.object(tui,'battery_label',return_value='100%'):
+            tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
+        self.assertTrue(''.join(screen.lines[1]).endswith('100%'))
+
+    def test_unavailable_battery_is_explicit_and_remote_viewer_hides_it(self):
+        import cli
+        self.assertEqual(tui.battery_label(tui.Viewer()),'')
+        with mock.patch.object(cli,'current_battery',return_value=None):
+            self.assertEqual(tui.battery_label(tui.Viewer(local_battery=True)),'--%')
