@@ -1,7 +1,9 @@
 """Optional Pipecat subprocess transport; reuse Omi's tested Deepgram source/save contract."""
 import asyncio
 import base64
+from contextlib import suppress
 import json
+import math
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +27,7 @@ class PipelineSocket:
         self.sequence = 0
         self.failure = None
         self.frame_counts = {}
+        self.provider_connect_sec = None
 
     async def __aenter__(self):
         launch = asyncio.create_task(self.process_factory(
@@ -37,8 +40,12 @@ class PipelineSocket:
             self.process = await asyncio.shield(launch)
             self.diagnostics = asyncio.create_task(self._drain_diagnostics())
             ready = json.loads(await asyncio.wait_for(self.process.stdout.readline(), 30))
-            if ready != {"kind": "ready", "protocol": 1, "pipecat": PIPECAT_VERSION, "deepgram_sdk": SDK_VERSION}:
+            required = {"kind": "ready", "protocol": 1, "pipecat": PIPECAT_VERSION, "deepgram_sdk": SDK_VERSION}
+            if not isinstance(ready, dict) or any(ready.get(k) != v for k,v in required.items()):
                 raise ConnectionError("Pipecat pipeline did not become ready")
+            seconds = ready.get("provider_connect_sec")
+            if isinstance(seconds, (int, float)) and not isinstance(seconds, bool) and math.isfinite(seconds) and seconds >= 0:
+                self.provider_connect_sec = seconds
             self.pump = asyncio.create_task(self._receive())
             return self
         except BaseException:
@@ -91,6 +98,10 @@ class PipelineSocket:
             await asyncio.wait_for(future, 5)
         finally:
             self.waiters.pop(identity, None)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()  # Consume a simultaneous pipe-failure notification.
 
     async def send_bytes(self, raw):
         await self._send({"op": "audio", "pcm": base64.b64encode(raw).decode("ascii")})
@@ -111,11 +122,11 @@ class PipelineSocket:
                 await asyncio.wait_for(self.process.wait(), 5)
             except (OSError, TimeoutError, ConnectionError):
                 if self.process.returncode is None:
-                    self.process.terminate()
+                    with suppress(ProcessLookupError):self.process.terminate()
                 try:
                     await asyncio.wait_for(self.process.wait(), 3)
                 except TimeoutError:
-                    self.process.kill()
+                    with suppress(ProcessLookupError):self.process.kill()
                     await self.process.wait()
         for task in (self.pump, self.diagnostics):
             if task is not None:task.cancel()
@@ -151,3 +162,12 @@ class PipecatDeepgramSTT(DeepgramSTT):
     @property
     def pipeline_frames(self):
         return getattr(self._pipeline_session.socket, "frame_counts", {})
+
+    def _latency(self, name, seconds):
+        if name == "provider_connect_sec":
+            super()._latency("pipeline_start_sec", seconds)
+            actual = getattr(self._pipeline_session.socket, "provider_connect_sec", None)
+            if actual is not None:
+                super()._latency("provider_connect_sec", actual)
+        else:
+            super()._latency(name, seconds)

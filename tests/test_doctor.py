@@ -295,3 +295,7 @@ class UnknownConfigurationTests(unittest.TestCase):
             names={r['check'] for r in report['checks']}
             self.assertIn('pipecat_package_pipecat-ai',names)
             self.assertFalse(any(n.startswith('worker_') for n in names))
+            with mock.patch.object(doctor,'probe',side_effect=probe),mock.patch.object(doctor.shutil,'which',return_value='lsof'), \
+                 mock.patch.object(doctor,'live_health',return_value=(200,{'status':'ok','stt_backend':'deepgram'})):
+                live=doctor.inspect(root,environ=env,live=True)
+            self.assertEqual(next(c['status'] for c in live['checks'] if c['check']=='live_health'),'fail')

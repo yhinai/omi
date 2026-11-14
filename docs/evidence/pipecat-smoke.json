@@ -4,19 +4,19 @@
   "pipeline": "pipecat",
   "partial_updates": 3,
   "finals": 1,
-  "first_partial_sec": 1.3461712920106947,
+  "first_partial_sec": 2.5446111250203103,
   "latency": {
     "receipt_to_transcript_sec": {
       "samples": 1,
-      "last": 3.433,
-      "p50": 3.433,
-      "p95": 3.433
+      "last": 4.619,
+      "p50": 4.619,
+      "p95": 4.619
     },
     "receipt_to_first_partial_sec": {
       "samples": 1,
-      "last": 1.346,
-      "p50": 1.346,
-      "p95": 1.346
+      "last": 2.544,
+      "p50": 2.544,
+      "p95": 2.544
     },
     "speech_start_to_first_partial_sec": {
       "samples": 0,
@@ -26,9 +26,9 @@
     },
     "receipt_to_final_sec": {
       "samples": 1,
-      "last": 3.432,
-      "p50": 3.432,
-      "p95": 3.432
+      "last": 4.614,
+      "p50": 4.614,
+      "p95": 4.614
     },
     "speech_end_to_final_sec": {
       "samples": 0,
@@ -38,9 +38,9 @@
     },
     "receipt_to_send_sec": {
       "samples": 52,
-      "last": 0.001,
-      "p50": 0.072,
-      "p95": 0.452
+      "last": 0.908,
+      "p50": 1.283,
+      "p95": 1.643
     },
     "turn_close_to_final_sec": {
       "samples": 0,
@@ -60,17 +60,23 @@
       "p50": null,
       "p95": null
     },
+    "pipeline_start_sec": {
+      "samples": 1,
+      "last": 1.673,
+      "p50": 1.673,
+      "p95": 1.673
+    },
     "provider_connect_sec": {
       "samples": 1,
-      "last": 0.484,
-      "p50": 0.484,
-      "p95": 0.484
+      "last": 0.363,
+      "p50": 0.363,
+      "p95": 0.363
     },
     "final_to_persist_sec": {
       "samples": 1,
-      "last": 0.001,
-      "p50": 0.001,
-      "p95": 0.001
+      "last": 0.005,
+      "p50": 0.005,
+      "p95": 0.005
     }
   },
   "pipeline_frames": {

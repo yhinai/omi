@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import sys
+import time
 
 
 def emit(value):
@@ -22,7 +23,7 @@ async def serve(reader, settings, output=emit, client=None):
     from pipecat.frames.frames import DataFrame, EndFrame, InputAudioRawFrame, TranscriptionFrame, InterimTranscriptionFrame
     from pipecat.pipeline.pipeline import Pipeline
     from pipecat.pipeline.worker import PipelineParams, PipelineWorker
-    from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+    from pipecat.processors.frame_processor import FrameProcessor
     from pipecat.services.deepgram.stt import DeepgramSTTService
     from pipecat.workers.runner import WorkerRunner
 
@@ -30,6 +31,7 @@ async def serve(reader, settings, output=emit, client=None):
     started = asyncio.Event()
     sent = {}
     frame_counts = {"audio": 0, "interim": 0, "final": 0}
+    connection_seconds = None
 
     @dataclass
     class ProviderFrame(DataFrame):
@@ -52,10 +54,13 @@ async def serve(reader, settings, output=emit, client=None):
             return options
 
         async def _connection_handler(self):
+            nonlocal connection_seconds
             # One SDK connection per Omi epoch. Parent owns replay/retry; hidden
             # SDK reconnects would reset provider timestamps under the same clock.
             try:
+                connecting_at = time.monotonic()
                 async with self._client.listen.v1.connect(**self._build_connect_kwargs()) as connection:
+                    connection_seconds = max(0, time.monotonic() - connecting_at)
                     self._connection = connection
                     self._connection_settled.set()
                     connection.on(EventType.MESSAGE, self._on_message)
@@ -160,7 +165,7 @@ async def serve(reader, settings, output=emit, client=None):
     try:
         await wait_or_fail(started.wait(), 25)
         output({"kind": "ready", "protocol": 1, "pipecat": importlib.metadata.version("pipecat-ai"),
-                "deepgram_sdk": importlib.metadata.version("deepgram-sdk")})
+                "deepgram_sdk": importlib.metadata.version("deepgram-sdk"), "provider_connect_sec": connection_seconds})
         while True:
             line = await wait_or_fail(reader.readline(), 120)
             if not line:break

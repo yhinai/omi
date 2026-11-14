@@ -233,10 +233,13 @@ def inspect(root=ROOT, *, environ=None, live=False):
     if live:
         try:
             code, health = live_health()
-            valid = code == 200 and health.get("status") == "ok" and health.get("stt_backend") == backend
+            expected_pipeline = env.get("OMI_DEEPGRAM_PIPELINE", "direct").strip().lower() if backend == "deepgram" else "local"
+            actual_pipeline = health.get("stt_pipeline", "direct" if health.get("stt_backend") == "deepgram" else "local")
+            valid = (code == 200 and health.get("status") == "ok" and health.get("stt_backend") == backend
+                     and actual_pipeline == expected_pipeline)
             add("live_health", "pass" if valid else "fail",
-                "Loopback bridge reports ready with the selected backend." if valid else
-                "Loopback bridge is degraded, uses a different backend, or returned unexpected health; inspect local health.")
+                "Loopback bridge reports ready with the selected backend and pipeline." if valid else
+                "Loopback bridge is degraded, uses a different backend/pipeline, or returned unexpected health; inspect local health.")
             if valid:
                 phone = health.get("direct_ws_connected") is True
                 add("live_phone", "pass" if phone else "warn", "Phone audio stream connected." if phone else "No phone stream; healthy idle state does not verify recognition.")

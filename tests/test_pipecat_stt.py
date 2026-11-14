@@ -114,3 +114,11 @@ class PipecatAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(selected.pipeline,'pipecat')
         with self.assertRaises(ValueError):
             DeepgramConfig.from_env({'DEEPGRAM_API_KEY':'synthetic','OMI_DEEPGRAM_PIPELINE':'typo'})
+
+    def test_pipeline_start_does_not_inflate_provider_connection_metric(self):
+        latency=mock.Mock()
+        stream=PipecatDeepgramSTT(python=sys.executable,api_key='synthetic',on_final=mock.Mock(),
+            on_partial=mock.Mock(),on_gap=mock.Mock(),on_latency=latency,on_connection=mock.Mock())
+        stream._pipeline_session.socket=mock.Mock(provider_connect_sec=.1)
+        stream._latency('provider_connect_sec',.6)
+        self.assertEqual(latency.call_args_list,[mock.call('pipeline_start_sec',.6),mock.call('provider_connect_sec',.1)])
