@@ -84,6 +84,9 @@ async def main(args):
                     last_progress=now
             if proposal.get('dismiss'):
                 action='wave candidate (preview only)';action_at=now
+            if calibration and calibration.saved:
+                print('\x1b[H\x1b[2J'+'\n'.join(calibration.lines(now)),flush=True)
+                break
             if now-last_print>.1:
                 if interactive:
                     if calibration:

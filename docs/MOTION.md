@@ -80,3 +80,11 @@ The reported speed/range comes from the IMU. Gravity-based tilt is approximate d
 fast acceleration. Host telemetry age does not establish physical response latency.
 Repeated validation and ordinary-activity tests are still needed before claiming precise
 selection, stable pointing or low false-activation rates.
+
+When the guided reference completes, the viewer prints its summary once and exits,
+leaving captions running. The raw personal reference and derived analyses stay private
+under ignored `logs/`; the completion flag means all labeled trials were collected,
+not that the gestures are accurate enough to control the Mac. Slow/fast separation,
+pose repeatability, neutral return, single/double-tap event counts and ordinary-activity
+responses must be assessed before selecting mappings. Absolute angular speed alone
+can confuse deliberate waves with scroll motions.
