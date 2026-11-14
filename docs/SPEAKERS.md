@@ -109,12 +109,13 @@ The terminal viewer uses a separate header for each speaker turn:
 12:00:00  Speaker 1
           Demo's in prison.
 
+
 12:00:03  Speaker 2
           Another reply.
 ```
 
 The recording timestamp keeps its existing horizontal position. The speaker starts
-at the transcript column, with the spoken text directly below and a blank line
+at the transcript column, with the spoken text directly below and two blank lines
 between turns. The viewer splits multi-speaker finals into separate display turns
 and can join adjacent chunks of the same scoped speaker. It does not insert bracketed
 speaker tags into sentence text or attach an unattributed partial to the preceding

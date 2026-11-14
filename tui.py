@@ -610,6 +610,8 @@ def rows_for(viewer, width):
                             timestamp=stamp, bookmarked=is_bookmarked and offset == 0 and not caption.speaker_label))
             offset += len(line)
         rows.append(Row(caption.key, len(full_text) + 1, ""))
+        if caption.speaker_label:
+            rows.append(Row(caption.key, len(full_text) + 2, ""))
     if viewer.draft and not draft_inlined:
         offset = 0
         for line in wrap(viewer.draft, width):
@@ -793,7 +795,8 @@ def session_text(viewer):
         if caption.kind != "transcript":
             continue
         parts.append(caption_text(caption,stamp=caption.show_stamp))
-    return "\n\n".join(parts)
+    separator = "\n\n\n" if any(c.speaker_label for c in viewer.captions) else "\n\n"
+    return separator.join(parts)
 
 
 def export_session(viewer, directory):

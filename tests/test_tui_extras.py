@@ -851,6 +851,7 @@ class SpeakerGutterTests(unittest.TestCase):
             self.assertEqual(header.index(caption.speaker_label),left)
             self.assertEqual(body.index(caption.text),left)
             self.assertFalse(''.join(screen.lines[y+2]).strip())
+            self.assertFalse(''.join(screen.lines[y+3]).strip())
             self.assertNotIn('uncertain',header);self.assertNotIn('[Speaker',header)
         self.assertEqual(viewer.last_event_id,'original')
         viewer.add(self.speaker_event());self.assertEqual(len(viewer.captions),2)
