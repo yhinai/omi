@@ -131,7 +131,7 @@ async def serve(reader, settings, output=emit, client=None):
         settings=DeepgramSTTService.Settings(model=settings.get("model", "nova-3"),
             language=settings.get("language", "en"), interim_results=True,
             endpointing=settings.get("endpointing_ms", 300), diarize=settings.get("diarize", False),
-            punctuate=True, smart_format=True, extra={"no_delay": True, "redact_usage": True, "vad_events": True}))
+            punctuate=True, smart_format=True, keyterm=settings.get("keyterms") or None, extra={"no_delay": True, "redact_usage": True, "vad_events": True}))
     if client is not None:service._client = client
     worker = PipelineWorker(Pipeline([service, Sink()]),
         params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=16000,

@@ -1,6 +1,7 @@
 """Import-safe recognition contract and cloud configuration; no network or model imports."""
 from dataclasses import dataclass, field
 import os
+import json
 from pathlib import Path
 from typing import Mapping, Protocol
 
@@ -35,6 +36,7 @@ class DeepgramConfig:
     diarize: bool = False
     pipeline: str = "direct"
     python: str = ""
+    keyterms: tuple = ()
 
     @classmethod
     def from_env(cls, env: Mapping[str, str]):
@@ -63,4 +65,9 @@ class DeepgramConfig:
             raise ValueError("OMI_DEEPGRAM_PIPELINE must be direct or pipecat")
         python = os.path.expanduser(env.get("OMI_PIPECAT_PYTHON",
             str(Path(__file__).parent / ".venv-pipecat/bin/python")))
-        return cls(key, model, language, endpointing, diarize == "true", pipeline, python)
+        try:
+            terms=json.loads(env.get("OMI_DEEPGRAM_KEYTERMS", "[]"))
+        except (TypeError, ValueError):raise ValueError("Keyterms must be a JSON array") from None
+        if not isinstance(terms,list) or len(terms)>100 or any(not isinstance(t,str) or not t.strip() or len(t)>100 for t in terms) or sum(len(t) for t in terms)>500:
+            raise ValueError("Use at most 100 nonempty keyterms totaling at most 500 characters")
+        return cls(key, model, language, endpointing, diarize == "true", pipeline, python, tuple(terms))

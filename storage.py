@@ -3,6 +3,7 @@
 The journal is authoritative. Caption/phone delivery runs only after journal
 acceptance; Markdown is a readable projection. Failed finals stay retryable.
 """
+from speakers import display_text
 from collections import deque
 from datetime import datetime
 import hashlib
@@ -113,7 +114,9 @@ class TranscriptStore:
             if self.notes is not None:
                 if event["type"] == "gap":
                     self.notes.close_paragraph()
-                self.notes.add(event["timestamp"], event["text"])
+                if event.get("speaker_turns"):self.notes.close_paragraph()
+                self.notes.add(event["timestamp"], display_text(event))
+                if event.get("speaker_turns"):self.notes.close_paragraph()
                 if event["type"] == "gap":
                     self.notes.close_paragraph()
         except Exception as error:

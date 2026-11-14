@@ -154,7 +154,7 @@ class PipecatDeepgramSTT(DeepgramSTT):
             fields["recognition"] = {**fields["recognition"], "orchestration": "pipecat",
                                      "pipecat_version": PIPECAT_VERSION, "deepgram_sdk_version": SDK_VERSION}
             return on_final(text, **fields)
-        settings = {k: kwargs[k] for k in ("model", "language", "endpointing_ms", "diarize") if k in kwargs}
+        settings = {k: kwargs[k] for k in ("model", "language", "endpointing_ms", "diarize", "keyterms") if k in kwargs}
         self._pipeline_session = _Session(python, api_key, settings, socket_factory)
         super().__init__(api_key=api_key, on_final=save,
             session_factory=lambda **unused: self._pipeline_session, **kwargs)

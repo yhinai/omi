@@ -66,7 +66,7 @@ class _Epoch:
 class DeepgramSTT:
     def __init__(self, *, api_key, on_partial, on_final, on_gap, on_latency,
                  on_connection, model="nova-3", language="en", endpointing_ms=300,
-                 diarize=False, max_age=45, idle_flush=8, session_factory=None):
+                 diarize=False, max_age=45, idle_flush=8, session_factory=None, enrich_speaker=None, keyterms=()):
         if not isinstance(api_key, str) or not api_key.strip():
             raise ValueError("A Deepgram API key is required")
         if model != "nova-3" or language.lower() not in ("en", "en-us"):
@@ -79,6 +79,8 @@ class DeepgramSTT:
         self._api_key = api_key.strip()
         self.model, self.language, self.endpointing_ms = model, language.lower(), endpointing_ms
         self.diarize = diarize
+        self.enrich_speaker = enrich_speaker
+        self.keyterms = tuple(keyterms)
         self.on_partial, self.on_final, self.on_gap = on_partial, on_final, on_gap
         self.on_latency, self.on_connection = on_latency, on_connection
         self.max_age, self.idle_flush = max_age, idle_flush
@@ -131,12 +133,13 @@ class DeepgramSTT:
         return len(self.pending_finals)
 
     def connection_url(self):
-        return "wss://api.deepgram.com/v1/listen?" + urlencode({
+        options = {
             "model": self.model, "language": self.language, "encoding": "linear16",
             "sample_rate": RATE, "channels": 1, "interim_results": "true",
             "endpointing": self.endpointing_ms, "punctuate": "true", "smart_format": "true",
             "no_delay": "true", "diarize": str(self.diarize).lower(), "vad_events": "true",
-            "mip_opt_out": "true", "redact_usage": "true"})
+            "mip_opt_out": "true", "redact_usage": "true"}
+        return "wss://api.deepgram.com/v1/listen?" + urlencode([*options.items(), *(("keyterm", term) for term in self.keyterms)])
 
     def new_session(self):
         self.request_flush()
@@ -318,7 +321,7 @@ class DeepgramSTT:
         return error
 
     def _handle_result(self, event, epoch):
-        received_mono = time.monotonic()
+        received_mono = event.get("_omi_received_mono", time.monotonic())
         if epoch.start is None:
             return
         start = epoch.start + round(self._seconds(event.get("start"))*RATE)
@@ -358,6 +361,8 @@ class DeepgramSTT:
                 item["confidence"] = max(0, min(1, confidence))
             if isinstance(word.get("speaker"), int) and not isinstance(word["speaker"], bool) and word["speaker"] >= 0:
                 item["speaker"] = word["speaker"]
+            if self.enrich_speaker is not None and isinstance(word.get("_voice_identity"), dict):
+                item["voice_identity"] = dict(word["_voice_identity"])
             words.append(item)
         last_word_end = None
         if provider_words and len(provider_words) <= 512:
@@ -466,6 +471,40 @@ class DeepgramSTT:
             except TimeoutError:
                 await asyncio.wait_for(ws.send_json({"type": "KeepAlive"}), 5)
 
+    async def _annotate_speakers(self, event, epoch):
+        if self.enrich_speaker is None or not self.diarize or event.get("is_final") is not True or epoch.start is None:
+            return
+        alternatives=(event.get("channel") or {}).get("alternatives") or []
+        words=alternatives[0].get("words", []) if alternatives else []
+        if len(words)>512:return
+        groups=[]
+        for word in words:
+            speaker=word.get("speaker")
+            if not groups or groups[-1][0].get("speaker")!=speaker:groups.append([])
+            groups[-1].append(word)
+        for word in words:word["_voice_identity"]={"status":"uncertain","reason":"insufficient_or_missing_audio"}
+        try:
+            async with asyncio.timeout(4):
+                for group in groups[:8]:
+                    speaker=group[0].get("speaker")
+                    if not isinstance(speaker,int) or isinstance(speaker,bool):continue
+                    start=epoch.start+round(self._seconds(group[0].get("start"))*RATE)
+                    end=min(epoch.start+round(self._seconds(group[-1].get("end"))*RATE),start+8*RATE)
+                    if not epoch.start<=start<end<=epoch.end or end-start<RATE*1.5:continue
+                    cursor=start; pieces=[]
+                    for packet in self.retained:
+                        if packet.session_id!=epoch.session or packet.end<=cursor:continue
+                        if packet.sample_offset>cursor:break
+                        finish=min(end,packet.end)
+                        pieces.append(packet.pcm[(cursor-packet.sample_offset)*2:(finish-packet.sample_offset)*2])
+                        cursor=finish
+                        if cursor==end:break
+                    if cursor!=end:continue
+                    identity=await self.enrich_speaker(b"".join(pieces))
+                    for word in group:word["_voice_identity"]=identity
+        except Exception:
+            pass # Verification failure stays uncertain and never drops recognized words.
+
     async def _receive(self, ws, epoch):
         while True:
             try:
@@ -478,6 +517,8 @@ class DeepgramSTT:
                 event = json.loads(message.data)
                 kind = event.get("type")
                 if kind == "Results":
+                    event["_omi_received_mono"] = time.monotonic()
+                    await self._annotate_speakers(event, epoch)
                     self._handle_result(event, epoch)
                 elif kind == "SpeechStarted":
                     self._speech_pending = True

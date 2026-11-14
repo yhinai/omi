@@ -1,6 +1,7 @@
 #!/usr/bin/env python3.15
 """A quiet, read-only page of Omi captions; finalized words appear immediately."""
 import argparse
+from speakers import display_text
 import asyncio
 import base64
 from collections import deque
@@ -171,6 +172,7 @@ class Caption:
     voice_end_offset: int | None = None
     rev: int = 0
     timed: bool = False
+    speaker_labelled: bool = False
     _cache: tuple | None = None
 
     @property
@@ -381,7 +383,7 @@ class Viewer:
             return
         if kind not in ("transcript", "gap"):
             return
-        text = clean(event.get("text", ""))[:8000]
+        text = clean(display_text(event))[:8000]
         if not text:
             return
         identity = event.get("event_id")
@@ -426,7 +428,7 @@ class Viewer:
         valid_voice_span = (isinstance(speech_start, int) and not isinstance(speech_start, bool)
                             and isinstance(voice_end, int) and not isinstance(voice_end, bool)
                             and voice_end >= speech_start)
-        continuous = (kind == "transcript" and previous is not None and previous.kind == kind
+        continuous = (not event.get("speaker_turns") and kind == "transcript" and previous is not None and previous.kind == kind
                       and same_session
                       and within_paragraph(source, previous, speech_start_offset=speech_start,
                                            same_session=same_session))
@@ -450,7 +452,7 @@ class Viewer:
         while words:
             previous = self.captions[-1] if self.captions else None
             sentence_end = previous and len(previous.words) >= 90 and re.search(r"[.!?][^\w]*$", previous.words[-1])
-            append = continuous and previous is not None and len(previous.words) < 150 and not sentence_end
+            append = continuous and previous is not None and not previous.speaker_labelled and len(previous.words) < 150 and not sentence_end
             if not append:
                 meaningful = (kind == "transcript" and (previous is None or previous.kind == "gap"
                     or (session is not None and previous.session != session)
@@ -461,6 +463,7 @@ class Viewer:
                     self.next_key += 1
                     key = self.next_key
                 previous = Caption(key, stamp, [], kind, session, source, meaningful)
+                previous.speaker_labelled = bool(event.get("speaker_turns"))
                 self.captions.append(previous)
                 if self.bookmarks:
                     self.bookmarks.intersection_update({c.key for c in self.captions})

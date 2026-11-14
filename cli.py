@@ -68,6 +68,8 @@ def main(argv=None):
     source.add_argument("name", choices=("vexo",))
     source.add_argument("--band", type=int, choices=(VEXO_BAND,), required=True)
     source.add_argument("--transport", choices=("serial", "ble"), default="serial")
+    voice = commands.add_parser("voice", help="Local voice enrollment, status or deletion")
+    voice.add_argument("arguments", nargs=argparse.REMAINDER)
     dev = commands.add_parser("dev", help="Explicit development, demo and diagnostic tools")
     dev.add_argument("tool", choices=("test", "smoke", "benchmark", "faults", "demo", "capture"))
     args, extra = parser.parse_known_args(argv)
@@ -86,7 +88,10 @@ def main(argv=None):
             if report["service"] == "healthy":
                 print("Service health does not establish microphone quality or recognition accuracy.")
         return 0 if report["service"] == "healthy" else 1
-    if args.command == "source":
+    if args.command == "voice":
+        executable = sys.executable
+        arguments = [str(ROOT/"voice_cli.py"), *args.arguments]
+    elif args.command == "source":
         executable = str(ROOT / ".venv-vexo/bin/python")
         arguments = [str(ROOT / "vexo_source.py"), "--band", str(args.band), "--transport", args.transport]
     elif args.command in {"start", "stop", "restart"}:

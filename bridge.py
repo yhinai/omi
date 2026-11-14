@@ -36,6 +36,7 @@ import aiohttp
 from aiohttp import web
 
 from config import load_env, VEXO_BAND
+from speakers import turns, VoiceClient, MODEL as SPEAKER_MODEL, PROFILE as SPEAKER_PROFILE
 from backend_settings import DeepgramConfig, TranscriptionBackend
 from diagnostics import AudioCapture
 from storage import TranscriptStore, DailyNotes
@@ -111,6 +112,8 @@ def create_transcription_backend(callbacks):
         if DEEPGRAM_CONFIG is None:
             raise ValueError("Configure Deepgram before creating its backend")
         config = DEEPGRAM_CONFIG
+        if state.voice_client is not None:
+            callbacks["enrich_speaker"] = state.voice_client.classify
         if config.pipeline == "pipecat":
             from pipecat_stt import PipecatDeepgramSTT
             factory = PipecatDeepgramSTT
@@ -119,7 +122,7 @@ def create_transcription_backend(callbacks):
             from deepgram_stt import DeepgramSTT
             factory = DeepgramSTT
         return factory(api_key=config.api_key, model=config.model, language=config.language,
-                           endpointing_ms=config.endpointing_ms, diarize=config.diarize, **callbacks)
+                           endpointing_ms=config.endpointing_ms, diarize=config.diarize, keyterms=config.keyterms, **callbacks)
     from stt import LocalWhisperSTT
     return LocalWhisperSTT(python=WHISPER_PYTHON, model=WHISPER_MODEL,
                            vad=WHISPER_VAD, worker_env=WHISPER_ENV, **callbacks)
@@ -172,6 +175,7 @@ class BridgeState:
         on_commit=lambda event: publish_saved(event),
         on_error=lambda target, error: output_failed(target, error),
         on_recovered=lambda: state.metrics.update(last_output_error=None)))
+    voice_client: object = None
     source_sessions: dict = field(default_factory=dict)
     caption_listeners: dict = field(default_factory=dict)
     caption_admission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -441,6 +445,9 @@ def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=N
         event["source"] = dict(source)
     if recognition is not None:
         event["recognition"] = recognition
+        words = recognition.get("words", [])
+        if any("speaker" in word for word in words):
+            event["speaker_turns"] = turns(words, recognition.get("connection_epoch", ""))
     if utterance_id is not None:
         event.update(utterance_id=utterance_id, is_final=True, transcription_mode="live")
     if sample_end_offset is not None:
@@ -513,6 +520,7 @@ def build_health_dict():
         "stream_connected": connected,
         "backend_ready": backend_ready,
         "cloud_audio_processing": STT_BACKEND == "deepgram",
+        "voice_identification": ("enrolled" if os.path.isfile(state.voice_client.profile) else "not_enrolled") if state.voice_client else "disabled",
         "provider_connection_state": getattr(stream, "connection_state", "connected" if connected else "disconnected"),
         "provider_resolved_model": getattr(stream, "resolved_model", None),
             "stt_pipeline": getattr(stream, "pipeline", "direct" if STT_BACKEND == "deepgram" else "local"),
@@ -793,6 +801,12 @@ async def handle_listen(request):
 
 
 async def on_startup(app):
+    env=load_env()
+    if env.get("OMI_VOICE_IDENTIFICATION", "false").lower()=="true" and STT_BACKEND=="deepgram":
+        if not DEEPGRAM_CONFIG.diarize:
+            raise ValueError("Voice identification currently needs Deepgram diarization")
+        state.voice_client=VoiceClient(env.get("OMI_SPEAKER_PYTHON",os.path.join(BASE_DIR,".venv-speaker/bin/python")),BASE_DIR,model=env.get("OMI_SPEAKER_MODEL",str(SPEAKER_MODEL)),
+            profile=env.get("OMI_SPEAKER_PROFILE",str(SPEAKER_PROFILE)))
     seed_recent_events()
     state.storage.notes = DailyNotes(LOG_DIR, idle_flush=IDLE_FLUSH_SEC)
     state.stopping = False
@@ -827,6 +841,9 @@ async def on_cleanup(app):
         else:
             logger.info("Shutdown drain complete")
     finally:
+        if state.voice_client is not None:
+            await state.voice_client.close()
+            state.voice_client=None
         state.background_tasks.clear()
 
 
