@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import sys
+import time
 
 from config import VEXO_BAND
 
@@ -14,6 +15,18 @@ ROOT = Path(__file__).resolve().parent
 def nonnegative(value):
     return (isinstance(value, (int, float)) and not isinstance(value, bool)
             and math.isfinite(value) and value >= 0)
+
+
+def current_battery(source):
+    if not isinstance(source,dict) or source.get('kind')!='vexo':return None
+    try:
+        value=json.loads((ROOT/'logs/vexo-motion.json').read_text())
+        battery=value.get('battery')
+        if (value.get('band')!=source.get('band') or not value.get('connected') or not isinstance(battery,dict)
+                or not 0<=time.time()-value.get('published_at',0)<5
+                or not 0<=time.time()-battery.get('received_at',0)<60):return None
+        return {k:battery.get(k) for k in ('percent','charging','state','millivolts')}
+    except (OSError,ValueError,TypeError):return None
 
 
 def status_report():
@@ -38,6 +51,7 @@ def status_report():
         age = health.get("last_transcript_age_sec")
         pid = health.get("pid")
         return {"service": "healthy" if healthy else "degraded", "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+                "battery": current_battery(health.get("source_identity")) if phone else None,
                 "source": health.get("source_identity"), "source_loss": health.get("source_loss", {}),
                 "backend": backend, "phone": "connected" if phone else "disconnected",
                 "pipeline": health.get("stt_pipeline") if health.get("stt_pipeline") in {"direct", "pipecat", "local"}

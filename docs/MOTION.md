@@ -88,3 +88,9 @@ not that the gestures are accurate enough to control the Mac. Slow/fast separati
 pose repeatability, neutral return, single/double-tap event counts and ordinary-activity
 responses must be assessed before selecting mappings. Absolute angular speed alone
 can confuse deliberate waves with scroll motions.
+
+The Bluetooth owner also requests the band's battery stream every 30 seconds.
+`./omi status --json` includes fresh battery percent, charging state and voltage;
+stale/disconnected readings are omitted. This does not open a competing USB or BLE
+connection. With the motion view closed, the private status snapshot is updated at
+most once per second, and motion/event streams remain off.

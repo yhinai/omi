@@ -124,13 +124,14 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
                 raise Discontinuity('wrong_band')
             band.on('audio', on_audio)
             band.on('motion', telemetry.on_motion)
+            band.on('battery', telemetry.on_battery)
             band.on('event', telemetry.on_event)
             band.on('disconnect', lambda _: None if closing.is_set() else fail('device_disconnected'))
             band.on('stream-taken', lambda _: fail('source_taken'))
             worker = threading.Thread(target=decode)
             worker.start()
             print(f'MICROPHONE ON: Vexo-HACK-{band_number:02}; audio goes to the selected bridge recognizer.', flush=True)
-            await asyncio.to_thread(band.configure, audio=True)
+            await asyncio.to_thread(band.configure, audio=True, battery=30)
             deadline = time.monotonic()
             last = deadline
             report_at = deadline

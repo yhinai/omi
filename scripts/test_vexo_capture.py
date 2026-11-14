@@ -81,7 +81,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         band=FakeBand(); ws=Socket()
         session=SimpleNamespace(ws_connect=lambda *a,**kw:ws)
         stats=dict(received_packets=0,sent_samples=0,lost_packets=0,old_packets=0,queue_overflows=0,discarded_packets=0,corrupt_packets=0)
-        with mock.patch.object(source,'find_port',return_value='/dev/fake') as find, mock.patch.object(source.Band,'connect',return_value=band) as connect, mock.patch.object(source,'MotionTelemetry',return_value=SimpleNamespace(on_motion=lambda e:None,on_event=lambda e:None,tick=mock.AsyncMock(),close=mock.Mock())):
+        with mock.patch.object(source,'find_port',return_value='/dev/fake') as find, mock.patch.object(source.Band,'connect',return_value=band) as connect, mock.patch.object(source,'MotionTelemetry',return_value=SimpleNamespace(on_motion=lambda e:None,on_event=lambda e:None,on_battery=lambda e:None,tick=mock.AsyncMock(),close=mock.Mock())):
             if loss or flood:
                 with self.assertRaises(source.Discontinuity):
                     await source.capture(session,{'OMI_STREAM_TOKEN':'synthetic-test-token'},stop,43,stats,transport)

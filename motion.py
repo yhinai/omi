@@ -28,6 +28,7 @@ class MotionTelemetry:
     def __init__(self):
         self.lock = threading.Lock()
         self.generation = uuid.uuid4().hex
+        self.battery = None
         self.sample = None
         self.recent_samples = deque(maxlen=50)
         self.events = deque(maxlen=30)
@@ -35,6 +36,11 @@ class MotionTelemetry:
         self.enabled = False
         self.error = None
         self.last_poll = self.last_publish = 0
+
+    def on_battery(self, event):
+        with self.lock:
+            self.battery = {k:event.get(k) for k in ('percent','millivolts','state','charging')}
+            self.battery['received_at'] = time.time()
 
     def on_motion(self, event):
         value = {k: event.get(k) for k in ('t','n','ax','ay','az','gx','gy','gz')}
@@ -66,14 +72,14 @@ class MotionTelemetry:
                     self.error = None
                 except Exception as error:
                     self.error = type(error).__name__
-        if now - self.last_publish >= .1:
+        if now - self.last_publish >= (.1 if self.enabled else 1):
             self.last_publish = now
             await asyncio.to_thread(self.publish)
 
     def publish(self, connected=True):
         with self.lock:
             value = dict(band=VEXO_BAND, generation=self.generation, connected=connected,
-                         enabled=self.enabled and connected, sample=self.sample if connected else None,
+                         enabled=self.enabled and connected, battery=self.battery, sample=self.sample if connected else None,
                          samples=self.count, recent_samples=list(self.recent_samples) if connected else [], events=list(self.events), published_at=time.time(), error=self.error)
         try:
             atomic_json(STATE, value)

@@ -69,3 +69,17 @@ class CliTests(unittest.TestCase):
         executable, arguments=self.dispatch(['motion','--json','--seconds','1'])
         self.assertEqual(executable,str(cli.ROOT/'.venv-vexo/bin/python'))
         self.assertEqual(arguments[-3:],['--json','--seconds','1'])
+
+    def test_battery_status_rejects_stale_or_other_source_data(self):
+        import tempfile,time,json
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as directory,mock.patch.object(cli,'ROOT',Path(directory)):
+            logs=Path(directory)/'logs';logs.mkdir()
+            p=logs/'vexo-motion.json'
+            now=time.time()
+            value=dict(band=43,connected=True,published_at=now,battery=dict(percent=30,charging=False,state='battery',millivolts=3780,received_at=now))
+            p.write_text(json.dumps(value))
+            self.assertEqual(cli.current_battery(dict(kind='vexo',band=43))['percent'],30)
+            self.assertIsNone(cli.current_battery(dict(kind='omi')))
+            value['battery']['received_at']=now-70;p.write_text(json.dumps(value))
+            self.assertIsNone(cli.current_battery(dict(kind='vexo',band=43)))
