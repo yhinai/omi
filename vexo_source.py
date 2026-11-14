@@ -15,6 +15,7 @@ import av
 
 import aiohttp
 from config import ROOT, load_env, VEXO_BAND
+from motion import MotionTelemetry
 sys.path.insert(0, str(ROOT / 'vendor/vexo-open-kit/python'))
 from vexo_open.sync import Band
 from vexo_open.audio import PcmDecoder
@@ -114,6 +115,7 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
             if not closing.is_set():
                 fail('bridge_disconnected')
         receiver = asyncio.create_task(receive_results())
+        telemetry = MotionTelemetry()
         band = None
         worker = None
         try:
@@ -121,6 +123,8 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
             if band.number != band_number:
                 raise Discontinuity('wrong_band')
             band.on('audio', on_audio)
+            band.on('motion', telemetry.on_motion)
+            band.on('event', telemetry.on_event)
             band.on('disconnect', lambda _: None if closing.is_set() else fail('device_disconnected'))
             band.on('stream-taken', lambda _: fail('source_taken'))
             worker = threading.Thread(target=decode)
@@ -131,6 +135,7 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
             last = deadline
             report_at = deadline
             while not stop.is_set() and not failed.is_set():
+                await telemetry.tick(band)
                 try:
                     raw, received = pcm.get_nowait()
                 except queue.Empty:
@@ -152,6 +157,7 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
                 raise Discontinuity(reason[0])
         finally:
             closing.set()
+            telemetry.close()
             if band is not None:
                 try:
                     await asyncio.to_thread(band.configure, audio=False)

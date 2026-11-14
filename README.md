@@ -63,3 +63,5 @@ For Vexo band 43 over Bluetooth or USB, see [Vexo setup and operation](docs/VEXO
 The Mac is the sole active host; the Mini deployment is retired. [Continue on the Mac](docs/HANDOFF_MAC.md) contains the complete operating handoff, recovery locations, completed work and remaining priorities.
 
 [Wearable optimization audit](docs/OPTIMIZATION.md) traces the Vexo/Omi stages, measured latency, deployment boundaries and remaining validation for multiple devices.
+
+Live wrist motion training and guided calibration: [MOTION.md](docs/MOTION.md).

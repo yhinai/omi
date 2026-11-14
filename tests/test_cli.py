@@ -64,3 +64,8 @@ class CliTests(unittest.TestCase):
         executable, arguments = self.dispatch(['source','vexo','--band','43','--transport','ble'])
         self.assertEqual(executable,str(cli.ROOT/'.venv-vexo/bin/python'))
         self.assertEqual(arguments[-4:],['--band','43','--transport','ble'])
+
+    def test_motion_uses_existing_source_telemetry_viewer(self):
+        executable, arguments=self.dispatch(['motion','--json','--seconds','1'])
+        self.assertEqual(executable,str(cli.ROOT/'.venv-vexo/bin/python'))
+        self.assertEqual(arguments[-3:],['--json','--seconds','1'])

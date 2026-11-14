@@ -64,6 +64,7 @@ def main(argv=None):
                             ("captions", "Open the terminal viewer"),
                             ("verify", "Observe new live captions and optionally a specific test phrase")):
         commands.add_parser(name, help=help_text, add_help=False)
+    commands.add_parser("motion", help="Live wearable motion and gesture training (display only)", add_help=False)
     source = commands.add_parser("source", help="Run a wearable input in the foreground; Ctrl+C drains")
     source.add_argument("name", choices=("vexo",))
     source.add_argument("--band", type=int, choices=(VEXO_BAND,), required=True)
@@ -73,7 +74,7 @@ def main(argv=None):
     dev = commands.add_parser("dev", help="Explicit development, demo and diagnostic tools")
     dev.add_argument("tool", choices=("test", "smoke", "benchmark", "faults", "demo", "capture"))
     args, extra = parser.parse_known_args(argv)
-    forwarding = args.command in {"check", "captions", "verify", "dev"}
+    forwarding = args.command in {"check", "captions", "verify", "dev", "motion"}
     if extra and not forwarding:
         parser.error("unrecognized arguments: " + " ".join(extra))
     if args.command == "status":
@@ -88,7 +89,10 @@ def main(argv=None):
             if report["service"] == "healthy":
                 print("Service health does not establish microphone quality or recognition accuracy.")
         return 0 if report["service"] == "healthy" else 1
-    if args.command == "voice":
+    if args.command == "motion":
+        executable = str(ROOT / ".venv-vexo/bin/python")
+        arguments = [str(ROOT / "motion_view.py"), *extra]
+    elif args.command == "voice":
         executable = sys.executable
         arguments = [str(ROOT/"voice_cli.py"), *args.arguments]
     elif args.command == "source":
