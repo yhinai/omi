@@ -1,7 +1,7 @@
-# Vexo USB captions on macOS
+# Vexo Bluetooth and USB captions on macOS
 
 The Vexo source and recognition backend are separate choices. The input command uses
-Python 3.14, pyserial and PyAV; the existing Python 3.15 bridge still owns recognition,
+Python 3.14, Bleak, pyserial and PyAV; the existing Python 3.15 bridge still owns recognition,
 session/sample clocks, immutable save retries, journal and caption delivery.
 
 ## Install
@@ -20,14 +20,22 @@ Ask the organisers to replace an exposed key.
 
 ## Operate
 
-Keep band 43 on USB, and disconnect the browser dashboard first. In the checkout:
+Disconnect the browser dashboard, then double-tap band 43 so it blinks blue. In the checkout:
 
 ```sh
 ./omi start
-./omi source vexo --band 43 --transport serial
+./omi source vexo --band 43 --transport ble
 ```
 
-The source command runs in the foreground. Ctrl+C disables the microphone, closes USB,
+Bluetooth is the primary wireless connection. USB may remain connected for charging;
+no serial port is opened in Bluetooth mode. Keep the band near the Mac. If it cannot
+be found, double-tap it again to reopen its 60-second discovery window. Grant macOS
+Bluetooth access to the calling app if prompted. Do not pair in System Settings.
+
+For the USB fallback, stop Bluetooth capture and run
+`./omi source vexo --band 43 --transport serial`.
+
+The source command runs in the foreground. Ctrl+C disables the microphone, closes the device connection,
 drains queued PCM, sends CloseStream and waits for bridge completion. From another terminal:
 
 ```sh
@@ -62,14 +70,14 @@ Sequence rollover is accepted; duplicate/old packets are discarded and counted. 
 forward sequence gap ends the source session. SDK concealment is bypassed by feeding
 individual validated packets without sequence arguments. Corruption, overload, stale
 audio, unplug, or stream takeover ends the session; a fresh USB scan and decoder are
-used on retry. No invented samples bridge these breaks. Unknown-duration breaks are
+used on retry in USB mode; Bluetooth retries use the SDK filter for band 43 and a new decoder. No invented samples bridge these breaks. Unknown-duration breaks are
 journalled as source-discontinuity events rather than assigned fabricated durations.
 Source counters appear in loopback health, and console totals report received packets,
 missing/old/corrupt/discarded packets, queue overflows and sent samples.
 
 Source identity is copied into each finalized event by its recognizer session, including
 late finals; it is not read from the latest mutable source status. This identifies the
-verified USB source, not a speaker. A complete process crash can still lose RAM queues.
+verified wearable connection, not a speaker. A complete process crash can still lose RAM queues.
 There is no automatic launch-at-login setup in the generic source command.
 
 ## Checks
@@ -115,3 +123,20 @@ source installation. Its isolated Whisper smoke produced a final with matching J
 and Markdown. The actual `./omi backend whisper` / `./omi backend deepgram` switch
 commands were then exercised with capture stopped, returning to Pipecat/Deepgram.
 Whisper was verified with synthetic speech, not the live band phrase.
+
+
+## Bluetooth verification
+
+Bluetooth uses the same PCM queues, Opus decoder, authentication and recognizer path.
+`X-Vexo-Transport` binds `ble` or `serial` to the input session and saved final provenance.
+There is no automatic transport switching. The adapter closes and rescans the same band
+on link loss; double-tap again if its advertising window has expired. USB fallback stays
+available explicitly. No firmware changes were made.
+
+The Bluetooth change passed 438 core tests (two optional runtime tests skipped), nine
+capture checks and the existing eight fault scenarios. A real BLE session received
+7,837 audio packets and drained 2,507,840 samples with zero missing, old, corrupt,
+overflowed or discarded packets. Its spoken test sentence produced a Bluetooth-tagged
+Pipecat final, verified in authenticated caption replay, JSONL, Markdown and viewer
+layout. Recognition omitted one article; this was input/persistence verification,
+not an accuracy benchmark. Normal stop disabled the microphone and drained the bridge.

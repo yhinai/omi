@@ -59,3 +59,8 @@ class CliTests(unittest.TestCase):
         with mock.patch.object(cli.os, "execv") as execute, mock.patch("sys.stderr"), self.assertRaises(SystemExit):
             cli.main(["restart", "--set-whisper"])
         execute.assert_not_called()
+
+    def test_vexo_bluetooth_selection_reaches_capture_worker(self):
+        executable, arguments = self.dispatch(['source','vexo','--band','43','--transport','ble'])
+        self.assertEqual(executable,str(cli.ROOT/'.venv-vexo/bin/python'))
+        self.assertEqual(arguments[-4:],['--band','43','--transport','ble'])

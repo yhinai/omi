@@ -606,7 +606,10 @@ async def handle_omi_ws(request):
     if source_kind == "vexo":
         if request.headers.get("X-Vexo-Band") != str(VEXO_BAND):
             raise web.HTTPBadRequest(text="Expected Vexo band 43")
-        source.update(band=VEXO_BAND, name=f"Vexo-HACK-{VEXO_BAND:02}", transport="serial")
+        transport = request.headers.get("X-Vexo-Transport", "serial")
+        if transport not in {"serial", "ble"}:
+            raise web.HTTPBadRequest(text="Expected serial or ble Vexo transport")
+        source.update(band=VEXO_BAND, name=f"Vexo-HACK-{VEXO_BAND:02}", transport=transport)
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_INPUT_BYTES + 1)
     queue = asyncio.Queue(maxsize=32)
     # Serialize admission across the handshake so concurrent attempts cannot

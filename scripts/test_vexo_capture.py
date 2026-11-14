@@ -38,7 +38,7 @@ class CaptureTests(unittest.TestCase):
             with self.assertRaisesRegex(source.Discontinuity,'port_in_use'):source.find_port()
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
-    async def exercise(self, *, loss=False, flood=False):
+    async def exercise(self, *, loss=False, flood=False, transport="serial"):
         import asyncio
         import time
         import threading
@@ -81,12 +81,15 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         band=FakeBand(); ws=Socket()
         session=SimpleNamespace(ws_connect=lambda *a,**kw:ws)
         stats=dict(received_packets=0,sent_samples=0,lost_packets=0,old_packets=0,queue_overflows=0,discarded_packets=0,corrupt_packets=0)
-        with mock.patch.object(source,'find_port',return_value='/dev/fake'),mock.patch.object(source.Band,'connect',return_value=band):
+        with mock.patch.object(source,'find_port',return_value='/dev/fake') as find, mock.patch.object(source.Band,'connect',return_value=band) as connect:
             if loss or flood:
                 with self.assertRaises(source.Discontinuity):
-                    await source.capture(session,{'OMI_STREAM_TOKEN':'synthetic-test-token'},stop,43,stats)
+                    await source.capture(session,{'OMI_STREAM_TOKEN':'synthetic-test-token'},stop,43,stats,transport)
             else:
-                await source.capture(session,{'OMI_STREAM_TOKEN':'synthetic-test-token'},stop,43,stats)
+                await source.capture(session,{'OMI_STREAM_TOKEN':'synthetic-test-token'},stop,43,stats,transport)
+        if transport == 'ble':
+            find.assert_not_called()
+            connect.assert_called_once_with(43,transport='ble')
         self.assertEqual(band.configured[-1],{'audio':False})
         if loss or flood:
             self.assertTrue(ws.controls[-2]['discontinuity'])
@@ -109,3 +112,6 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         stats=await self.exercise(flood=True)
         self.assertGreater(stats['queue_overflows'],0)
         self.assertGreater(stats['discarded_packets'],0)
+
+    async def test_bluetooth_uses_same_pcm_drain_without_serial_discovery(self):
+        await self.exercise(transport="ble")

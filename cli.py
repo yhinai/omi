@@ -67,7 +67,7 @@ def main(argv=None):
     source = commands.add_parser("source", help="Run a wearable input in the foreground; Ctrl+C drains")
     source.add_argument("name", choices=("vexo",))
     source.add_argument("--band", type=int, choices=(VEXO_BAND,), required=True)
-    source.add_argument("--transport", choices=("serial",), default="serial")
+    source.add_argument("--transport", choices=("serial", "ble"), default="serial")
     dev = commands.add_parser("dev", help="Explicit development, demo and diagnostic tools")
     dev.add_argument("tool", choices=("test", "smoke", "benchmark", "faults", "demo", "capture"))
     args, extra = parser.parse_known_args(argv)
@@ -88,7 +88,7 @@ def main(argv=None):
         return 0 if report["service"] == "healthy" else 1
     if args.command == "source":
         executable = str(ROOT / ".venv-vexo/bin/python")
-        arguments = [str(ROOT / "vexo_source.py"), "--band", str(args.band)]
+        arguments = [str(ROOT / "vexo_source.py"), "--band", str(args.band), "--transport", args.transport]
     elif args.command in {"start", "stop", "restart"}:
         executable, arguments = str(ROOT / "run.sh"), [args.command]
     else:

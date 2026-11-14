@@ -1,4 +1,4 @@
-"""Vexo USB capture only. Recognition and persistence belong to the bridge."""
+"""Vexo Bluetooth or USB capture only. Recognition and persistence belong to the bridge."""
 import argparse
 import asyncio
 import fcntl
@@ -54,7 +54,7 @@ def find_port():
     return ports[0]
 
 
-async def capture(session, env, stop, band_number, stats):
+async def capture(session, env, stop, band_number, stats, transport="serial"):
     # Decoder import and initialization complete BEFORE enabling microphone.
     decoder = PcmDecoder(conceal=False)
     validator = av.CodecContext.create('opus', 'r')
@@ -101,12 +101,12 @@ async def capture(session, env, stop, band_number, stats):
             stats['discarded_packets'] += 1
             stats['lost_packets'] += sequence.lost
             fail('decode_or_sequence_discontinuity')
-    port = find_port()
+    options = {"port": find_port()} if transport == "serial" else {}
     token = env.get('OMI_STREAM_TOKEN', '')
     if not token:
         raise ValueError('OMI_STREAM_TOKEN required')
     async with session.ws_connect('http://127.0.0.1:8787/v1/listen?encoding=linear16&sample_rate=16000&channels=1',
-            headers={'Authorization': 'Bearer ' + token, 'X-Audio-Source': 'vexo', 'X-Vexo-Band': str(band_number)},
+            headers={'Authorization': 'Bearer ' + token, 'X-Audio-Source': 'vexo', 'X-Vexo-Band': str(band_number), 'X-Vexo-Transport': transport},
             heartbeat=20) as ws:
         async def receive_results():
             async for _ in ws:
@@ -117,11 +117,11 @@ async def capture(session, env, stop, band_number, stats):
         band = None
         worker = None
         try:
-            band = await asyncio.to_thread(Band.connect, band_number, transport='serial', port=port)
+            band = await asyncio.to_thread(Band.connect, band_number, transport=transport, **options)
             if band.number != band_number:
                 raise Discontinuity('wrong_band')
             band.on('audio', on_audio)
-            band.on('disconnect', lambda _: None if closing.is_set() else fail('usb_disconnected'))
+            band.on('disconnect', lambda _: None if closing.is_set() else fail('device_disconnected'))
             band.on('stream-taken', lambda _: fail('source_taken'))
             worker = threading.Thread(target=decode)
             worker.start()
@@ -160,7 +160,7 @@ async def capture(session, env, stop, band_number, stats):
                 try:
                     await asyncio.to_thread(band.disconnect)
                 except Exception:
-                    fail('usb_disconnect_failed')
+                    fail('device_disconnect_failed')
             decode_stop.set()
             if worker:
                 await asyncio.to_thread(worker.join, 3)
@@ -191,7 +191,7 @@ async def capture(session, env, stop, band_number, stats):
             print('MICROPHONE OFF; bridge drain completed.', flush=True)
 
 
-async def run(number):
+async def run(number, transport="serial"):
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -202,7 +202,7 @@ async def run(number):
         while not stop.is_set():
             stats['sessions'] += 1
             try:
-                await capture(session, env, stop, number, stats)
+                await capture(session, env, stop, number, stats, transport)
             except Exception as error:
                 # No provider bodies, tokens or microphone content in diagnostics.
                 print('Source session ended:', str(error) if isinstance(error, Discontinuity) else type(error).__name__, flush=True)
@@ -216,8 +216,9 @@ async def run(number):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--band', type=int, choices=(VEXO_BAND,), required=True)
+    parser.add_argument("--transport", choices=("serial", "ble"), default="serial")
     args = parser.parse_args()
     (ROOT/'logs').mkdir(exist_ok=True)
     with (ROOT/'logs/vexo-source.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        asyncio.run(run(args.band))
+        asyncio.run(run(args.band, args.transport))
