@@ -1,4 +1,4 @@
-"""Live local motion training and gesture proposals; display only."""
+"""Live motion preview, guided calibration, or opt-in Mac controls (--control)."""
 import argparse
 import asyncio
 import fcntl
@@ -52,7 +52,7 @@ async def main(args):
         while not args.seconds or time.monotonic()-start<args.seconds:
             now=time.time()
             if now-last_lease>1:
-                LEASE.touch(mode=0o600);os.chmod(LEASE,0o600);last_lease=now
+                LEASE.write_text('preview');os.chmod(LEASE,0o600);last_lease=now
             try:
                 state=json.loads(STATE.read_text())
             except (OSError,ValueError):state={}
@@ -113,15 +113,20 @@ async def main(args):
 if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--calibrate',action='store_true',help='Guided labeled reference, with Space starting each trial')
+    parser.add_argument('--control',action='store_true',help='Opt in to actual Mac pointer and scroll control')
     parser.add_argument('--hand',choices=('left','right'),default='left')
     parser.add_argument('--json',action='store_true',help='Stream telemetry/proposals as JSON; no controls')
     parser.add_argument('--seconds',type=float,default=0,help='Stop after this many seconds; 0 means until quit')
     args=parser.parse_args()
+    if args.control and (args.calibrate or args.json or not sys.stdin.isatty() or not sys.stdout.isatty()):
+        parser.error('--control needs an interactive terminal and cannot combine with --calibrate or --json')
     if args.calibrate and (not sys.stdin.isatty() or not sys.stdout.isatty() or args.json):
         parser.error("--calibrate needs an interactive terminal for deliberately starting each trial")
     if not math.isfinite(args.seconds) or args.seconds<0:parser.error('--seconds must be finite and nonnegative')
     (ROOT/'logs').mkdir(exist_ok=True)
     with (ROOT/'logs/vexo-motion-view.lock').open('w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        try:asyncio.run(main(args))
+        if args.control:
+            from motion_control import main as control_main
+        try:asyncio.run(control_main(args) if args.control else main(args))
         except KeyboardInterrupt:pass

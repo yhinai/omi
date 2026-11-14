@@ -12,7 +12,8 @@ built-in gestures (tap, double-tap, tilt, orientation and motion start/stop).
 A three-reversal gyro heuristic displays a wave candidate. It has not been trained
 or validated as an intentional gesture classifier.
 
-This version only displays motion; it contains no Mac event-posting implementation.
+The default viewer only displays motion. Actual Mac controls are explicitly available
+with `./omi motion --control`, as described below.
 
 - Hold your wrist comfortably and press `c` to calibrate its neutral orientation.
 - Use `+`/`-` to adjust preview sensitivity (0.1–3x).
@@ -32,6 +33,37 @@ Closing/replacing the source invalidates its generation and calibration; stale s
 are marked unavailable. Optional telemetry disk errors do not prevent microphone cleanup.
 The viewer and capture each retain a process lock to avoid duplicate owners.
 
+## Control the actual Mac
+
+```sh
+./omi motion --control
+```
+
+The control window starts paused. Allow the launching terminal (normally Terminal)
+in macOS Privacy & Security → Accessibility and Input Monitoring. These permissions
+are needed for pointer input and the global Escape pause key; the window reports
+whether each is available.
+
+Press C holding your left wrist neutral, then tilt comfortably right and press X,
+then tilt comfortably down and press Y. Return to neutral and press Space to engage.
+Tilt moves the actual pointer; neutral stops. M switches between pointer and scroll,
+pausing until you return to neutral and press Space again. P toggles precision;
++/- changes gain. Enter clicks while this window has focus. T optionally enables
+single-band-tap clicking; a double-tap pauses and cancels a pending single click.
+Tap reliability on the wearer remains unmeasured.
+
+In another app, Control+Option+Command with Space toggles engagement, M changes mode,
+P changes precision and Enter clicks. Escape pauses globally. Q quits from the control
+window. Reconnects require a new neutral/right/down setup; stale data and control-loop
+stalls pause immediately. The same lock prevents simultaneous preview/control viewers.
+
+Motion sampling currently stays at 25 Hz alongside captions. Control snapshots publish
+at up to 25 Hz and the control loop polls around 50 Hz. A live attempt at 50 Hz sensor
+sampling showed repeated packet gaps, so that rate was rolled back pending diagnosis.
+These rates are not a physical latency or accuracy measurement. The saved left-wrist
+noise reference supplies the initial 5.52-degree dead zone; fresh axes adapt to current
+posture. See [the research and training plan](VEXO_CONTROL_RESEARCH.md).
+
 ## Expand control deliberately
 
 Next steps are hypotheses to test with normal wearing position and repeated motions:
@@ -45,12 +77,12 @@ Next steps are hypotheses to test with normal wearing position and repeated moti
 4. Discrete tap/select, swipe/previous-next, and wave/Escape candidates, with cooldown,
    hysteresis and false-activation tests during ordinary conversation/walking.
 5. Measure repeatability, target acquisition, fine corrections and command-to-screen
-   delay alongside unchanged audio health before enabling real Mac controls.
+   delay alongside audio health while validating real Mac controls.
 
 The accelerometer/gyro cannot establish finger-pinching or hand tracking accuracy.
 Learn intentional wrist movements from this device's data, rather than importing accuracy
 claims from other wearable sensor types. The separate memory-timeline research remains
-a proposal; this monitor does not implement that application.
+a proposal; these motion tools do not implement that application.
 
 ## Guided left-wrist reference
 

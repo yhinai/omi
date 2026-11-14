@@ -55,6 +55,20 @@ class ControllerTests(unittest.TestCase):
 
 
 class TelemetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_control_lease_publishes_faster_without_raising_sensor_rate_or_changing_audio(self):
+        with tempfile.TemporaryDirectory() as d:
+            lease=Path(d)/'lease';output=Path(d)/'state.json'
+            lease.write_text('control');telemetry=motion.MotionTelemetry();band=mock.Mock()
+            with mock.patch.object(motion,'LEASE',lease),mock.patch.object(motion,'STATE',output):
+                await telemetry.tick(band)
+                band.configure.assert_called_once_with(motion=25,events=True)
+                self.assertEqual(telemetry.rate,25)
+                self.assertTrue(telemetry.controlling)
+                lease.write_text('preview');telemetry.last_poll=0
+                await telemetry.tick(band)
+                band.configure.assert_called_with(motion=25,events=True)
+                self.assertFalse(telemetry.controlling)
+
     async def test_lease_controls_only_motion_and_events(self):
         with tempfile.TemporaryDirectory() as d:
             lease=Path(d)/'lease';output=Path(d)/'state.json'

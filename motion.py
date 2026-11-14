@@ -34,6 +34,8 @@ class MotionTelemetry:
         self.events = deque(maxlen=30)
         self.count = 0
         self.enabled = False
+        self.rate = 0
+        self.controlling = False
         self.error = None
         self.last_poll = self.last_publish = 0
 
@@ -63,16 +65,22 @@ class MotionTelemetry:
             self.last_poll = now
             try:
                 wanted = 0 <= time.time() - LEASE.stat().st_mtime < 3
-            except FileNotFoundError:
+                rate = 25 if wanted else 0
+                controlling = wanted and LEASE.read_text() == 'control'
+            except (OSError, UnicodeError):
                 wanted = False
-            if wanted != self.enabled:
+                rate = 0
+                controlling = False
+            self.controlling = controlling
+            if wanted != self.enabled or rate != self.rate:
                 try:
-                    await asyncio.to_thread(band.configure, motion=25 if wanted else False, events=wanted)
+                    await asyncio.to_thread(band.configure, motion=rate if wanted else False, events=wanted)
                     self.enabled = wanted
+                    self.rate = rate
                     self.error = None
                 except Exception as error:
                     self.error = type(error).__name__
-        if now - self.last_publish >= (.1 if self.enabled else 1):
+        if now - self.last_publish >= (.04 if self.enabled and self.controlling else .1 if self.enabled else 1):
             self.last_publish = now
             await asyncio.to_thread(self.publish)
 
