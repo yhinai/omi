@@ -16,6 +16,7 @@ import signal
 import re
 import sys
 import termios
+import tempfile
 import time
 import unicodedata
 from pathlib import Path
@@ -238,6 +239,9 @@ class Viewer:
     turn_close_p50: float | None = None
     connect_p50: float | None = None
     persist_p50: float | None = None
+    word_draft_p50: float | None = None
+    word_final_p50: float | None = None
+    word_packet_final_p50: float | None = None
     bookmarks: set = field(default_factory=set)
     duty: float | None = None
     workers_alive: bool | None = None
@@ -304,7 +308,10 @@ class Viewer:
                     value = event[source]
                     setattr(self, target, clean(value)[:120] if isinstance(value, str) else "")
             for source, target in (("latency_provider_connect_p50_sec", "connect_p50"),
-                                   ("latency_final_to_persist_p50_sec", "persist_p50")):
+                                   ("latency_final_to_persist_p50_sec", "persist_p50"),
+                                   ("latency_provider_word_end_to_partial_p50_sec", "word_draft_p50"),
+                                   ("latency_provider_word_end_to_final_p50_sec", "word_final_p50"),
+                                   ("latency_final_word_packet_to_result_p50_sec", "word_packet_final_p50")):
                 if source in event:
                     value = event[source]
                     setattr(self, target, float(value) if isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -740,7 +747,6 @@ def export_session(viewer, directory):
     if not text:
         return "Nothing to export"
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = Path(directory) / f"omi-captions-{stamp}.md"
     header = f"# Omi captions — {datetime.now():%Y-%m-%d %H:%M}\n\n"
     marked = [c for c in viewer.captions if c.kind == "transcript" and c.key in viewer.bookmarks]
     if marked:
@@ -750,7 +756,15 @@ def export_session(viewer, directory):
         body = text + "\n"
     try:
         Path(directory).mkdir(parents=True, exist_ok=True)
-        path.write_text(header + body, encoding="utf-8")
+        # Reserve a unique file atomically; mkstemp creates it with mode 0600.
+        descriptor, filename = tempfile.mkstemp(prefix=f"omi-captions-{stamp}-", suffix=".md", dir=directory)
+        path = Path(filename)
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+                output.write(header + body)
+        except OSError:
+            path.unlink(missing_ok=True)
+            raise
     except OSError as error:
         return f"Export failed: {error.__class__.__name__}"
     return f"Exported {path.name}"
@@ -1256,33 +1270,34 @@ def paint(screen, viewer, palette, measure: int | None = READING_MEASURE):
             viewer.anchor = (rows[0].key, rows[0].offset) if rows else None
             viewer.notify("Earlier text has left the reading history")
         if viewer.diagnostics:
-            details = ["Live connection", "", "Viewer: " + viewer.status(time.monotonic()),
-                       "Retained passages: " + str(len(viewer.captions)),
-                       "Bookmarks: " + str(len(viewer.bookmarks)),
+            details = ["Live connection", "Viewer: " + viewer.status(time.monotonic())
+                       + f" · passages: {len(viewer.captions)} · bookmarks: {len(viewer.bookmarks)}",
                        "Replay: " + ("available" if viewer.replay_supported else "not negotiated")]
-            for key, label in (("buffer_sec", "Buffer (seconds)"), ("queue_depth", "Queued packets"),
-                               ("stt_in_flight", "Transcribing"), ("last_packet_age_sec", "Last packet age (seconds)")):
-                value = viewer.pipeline.get(key, "unavailable")
-                if key == "last_packet_age_sec" and isinstance(value, (int, float)):
-                    value = round(value + max(0, time.monotonic() - viewer.last_status), 1)
-                details.append(f"{label}: {value}")
+            age = viewer.pipeline.get("last_packet_age_sec")
+            if isinstance(age, (int, float)):
+                age = round(age + max(0, time.monotonic() - viewer.last_status), 1)
+            details.append(f"Buffer: {viewer.pipeline.get('buffer_sec', 'unavailable')}s · queued: {viewer.pipeline.get('queue_depth', 'unavailable')}")
+            details.append(f"Transcribing: {viewer.transcribing} · packet age: {age}s")
             details.append("Recognizer: " + (viewer.backend or "unknown") + " · " + (viewer.provider_state or "unknown"))
             if viewer.orchestration:
                 details.append("Pipeline: " + viewer.orchestration)
             details.append("Model: " + (viewer.model or "unknown")
                            + (" (" + viewer.resolved_model + ")" if viewer.resolved_model else ""))
-            for label, value in (("Receipt → final p50", viewer.p50),
+            workers = "alive" if viewer.workers_alive else "down" if viewer.workers_alive is False else "unknown"
+            details.append("Workers: " + workers + " · Last error: " + (viewer.bridge_error or "none"))
+            for label, value in (("Word end → draft p50*", viewer.word_draft_p50),
+                                 ("Word end → final p50*", viewer.word_final_p50),
+                                 ("Word packet → final p50", viewer.word_packet_final_p50),
+                                 ("Receipt → final p50", viewer.p50),
                                  ("Speech → draft p50", viewer.speech_draft_p50),
                                  ("Speech end → final p50", viewer.speech_final_p50),
                                  ("Turn close → final p50", viewer.turn_close_p50),
                                  ("Cloud connect p50", viewer.connect_p50),
                                  ("Final → saved p50", viewer.persist_p50)):
                 details.append(label + ": " + (f"{value:.2f}s" if value is not None else "unavailable"))
+            details.append("* Estimates from Mac receipt; exclude wearable lag")
             details.append("Audio duty: " + (f"{viewer.duty:.3f}" if viewer.duty is not None else "unavailable"))
-            details.append("Workers: " + ("alive" if viewer.workers_alive else
-                                          "down" if viewer.workers_alive is False else "unknown"))
-            details.append("Last error: " + (viewer.bridge_error or "none"))
-            details += ["", "d / Esc to return"]
+            details.append("d / Esc to return")
             for y, line in enumerate(details[:available], top):
                 put(screen, y, left, line, palette["muted"])
         elif viewer.help_open:

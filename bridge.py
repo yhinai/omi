@@ -148,6 +148,7 @@ def new_metrics():
         "lost_audio_sec_queue_evicted": 0.0,
         "output_errors": 0, "last_output_error": None,
         "source_identity": None, "source_loss": {}, "audio_source": None, "direct_ws_remote": None, "direct_ws_packets": 0,
+        "phone_delivery_errors": 0,
         "session_started_at": None, "session_ended_at": None, "stream_audio_bytes": 0,
     }
 
@@ -156,6 +157,7 @@ def new_metrics():
 class PhoneStream:
     queue: asyncio.Queue
     start_sample: int
+    delivery_failed: bool = False
 
 
 @dataclass
@@ -193,6 +195,9 @@ class BridgeState:
             "turn_close_to_final_sec",
             "turn_boundary_wait_sec",
             "local_decode_sec",
+            "provider_word_end_to_final_sec",
+            "provider_word_end_to_partial_sec",
+            "final_word_packet_to_result_sec",
         )})
 
 
@@ -334,6 +339,9 @@ def caption_status():
             "latency_turn_close_to_final_p50_sec": latency_summary(state.latency_samples.get("turn_close_to_final_sec"))["p50"],
             "latency_provider_connect_p50_sec": latency_summary(state.latency_samples.get("provider_connect_sec"))["p50"],
             "latency_final_to_persist_p50_sec": latency_summary(state.latency_samples.get("final_to_persist_sec"))["p50"],
+            "latency_provider_word_end_to_partial_p50_sec": latency_summary(state.latency_samples.get("provider_word_end_to_partial_sec"))["p50"],
+            "latency_provider_word_end_to_final_p50_sec": latency_summary(state.latency_samples.get("provider_word_end_to_final_sec"))["p50"],
+            "latency_final_word_packet_to_result_p50_sec": latency_summary(state.latency_samples.get("final_word_packet_to_result_sec"))["p50"],
             "audio_duty": duty,
             "workers_alive": workers_alive(),
             "last_error": state.metrics["last_error"],
@@ -379,7 +387,9 @@ def publish_saved(event):
     if event.get("type") == "transcript" and event.get("text"):
         text_val = event["text"]
         start, end = event.get("sample_offset"), event.get("sample_end_offset")
-        for client in list(state.stream_clients.values()):
+        for ws, client in list(state.stream_clients.items()):
+            if client.delivery_failed:
+                continue
             # A late final from the previous phone connection belongs to its
             # old timeline, not the replacement connection's recording.
             if start is not None and start < client.start_sample:
@@ -393,7 +403,26 @@ def publish_saved(event):
             try:
                 client.queue.put_nowait(reply)
             except asyncio.QueueFull:
-                pass
+                fail_phone_delivery(ws, client, "queue_full")
+
+
+def fail_phone_delivery(ws, client, reason):
+    """Fail a one-way phone connection explicitly; journal/viewer delivery continues."""
+    if client.delivery_failed:
+        return
+    client.delivery_failed = True
+    state.metrics["phone_delivery_errors"] += 1
+    logger.warning("Phone caption delivery failed (%s); closing for reconnect", reason)
+
+    async def close_failed_phone():
+        try:
+            await asyncio.wait_for(ws.close(code=1013, message=b"Caption delivery stalled; reconnect", drain=False), 2)
+        except (OSError, asyncio.TimeoutError):
+            pass
+
+    # Closing from a separate task lets the receive handler unwind without
+    # waiting on the sender it is about to cancel/drain.
+    asyncio.create_task(close_failed_phone())
 
 
 def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=None,
@@ -473,7 +502,8 @@ def build_health_dict():
     stream_audio_sec, stream_wall_sec, audio_duty = stream_audio_duty()
     ready = (workers and backend_ready and not state.stopping and not overloaded
              and not stalled and not getattr(stream, "save_error", None)
-             and not state.metrics["last_error"] and not state.metrics["last_output_error"])
+             and not state.metrics["last_error"] and not state.metrics["last_output_error"]
+             and not any(client.delivery_failed for client in state.stream_clients.values()))
     return {
         "status": "ok" if ready else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
@@ -514,6 +544,7 @@ def build_health_dict():
         "audio_quality": state.audio_quality.snapshot(now),
         "audio_capture": {**state.audio_capture.snapshot(), "supported": state.capture_signal_ready},
         "direct_ws_connected": bool(state.stream_clients),
+        "phone_delivery_errors": state.metrics["phone_delivery_errors"],
         "caption_clients": len(state.caption_listeners), "caption_client_limit": MAX_CAPTION_CLIENTS,
         **{key: state.metrics[key] for key in ("utterances_processed", "audio_gaps", "queue_evictions", "last_error",
                                         "transcripts_emitted", "audio_source", "source_identity", "source_loss", "direct_ws_remote",
@@ -601,7 +632,8 @@ async def handle_omi_ws(request):
         state.metrics["session_ended_at"] = None
         state.metrics["stream_audio_bytes"] = 0
         state.audio_quality = AudioQualityMeter()
-        state.stream_clients[ws] = PhoneStream(queue, start_sample)
+        client = PhoneStream(queue, start_sample)
+        state.stream_clients[ws] = client
         state.metrics["direct_ws_remote"] = remote_ip
         state.metrics["audio_source"] = "vexo" if source_kind == "vexo" else "direct_ws"
     logger.info("Direct phone WebSocket connected from %s", remote_ip)
@@ -614,7 +646,7 @@ async def handle_omi_ws(request):
                     return
                 await asyncio.wait_for(ws.send_str(msg), timeout=5)
         except (OSError, asyncio.TimeoutError):
-            pass
+            fail_phone_delivery(ws, client, "send_failed")
 
     task = asyncio.create_task(sender())
     source_closed_cleanly = False
@@ -622,7 +654,7 @@ async def handle_omi_ws(request):
         async for message in ws:
             # A replaced socket may still have buffered frames while close is
             # pending. It no longer owns the new session's audio or controls.
-            if ws not in state.stream_clients or state.stopping:
+            if ws not in state.stream_clients or state.stopping or client.delivery_failed:
                 break
             if message.type == aiohttp.WSMsgType.BINARY:
                 raw = message.data

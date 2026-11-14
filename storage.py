@@ -9,7 +9,6 @@ import hashlib
 import json
 import logging
 import os
-import re
 import sys
 from logging.handlers import RotatingFileHandler
 
@@ -131,7 +130,9 @@ class TranscriptStore:
             self.notes.close_paragraph()
 
     def final(self, text, **timing):
-        text = re.sub(r"(?<![A-Z])([.?!])([A-Z])", r"\1 \2", " ".join(text.split()).strip())
+        # Provider punctuation may be part of URLs, email addresses, or code.
+        # Normalize whitespace without inventing sentence boundaries.
+        text = " ".join(text.split())
         if not text:
             return False
         identity = (timing.get("session_id"), timing.get("utterance_id"))

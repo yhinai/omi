@@ -38,6 +38,41 @@ class NotesTests(unittest.TestCase):
             self.assertIn("continued after restart", updated)
 
 
+class LiteralTextTests(unittest.TestCase):
+    def test_provider_punctuation_survives_journal_delivery_and_markdown(self):
+        samples = (
+            "Visit https://docs.Pipecat.ai/Foo.Bar?lang=enUS#API.",
+            "Contact jane.Doe@Example.COM.",
+            "Use namespace.Widget.run() and camelCase.Flag.",
+            "U.S.A. uses v1.2.3-RC1.",
+            "Literal hello.World?Yes!Please remains literal.",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            appended, delivered, errors = [], [], []
+            store = storage.TranscriptStore(directory=directory, append=appended.append,
+                create_event=lambda kind, text, **timing: {"type": kind, "text": text,
+                    "timestamp": "2026-11-14 12:00:00", **timing},
+                on_commit=delivered.append, on_error=lambda *error: errors.append(error), on_recovered=lambda: None)
+            store.notes = storage.DailyNotes(directory)
+            for index, text in enumerate(samples):
+                with self.subTest(index=index):
+                    self.assertTrue(store.final(text, utterance_id=str(index)))
+                    self.assertEqual(json.loads(appended[-1])["text"], text)
+                    self.assertEqual(delivered[-1]["text"], text)
+                    self.assertIn(text, Path(directory, "2026-11-14.md").read_text())
+            self.assertFalse(errors)
+
+    def test_whitespace_is_normalized_without_sentence_edits(self):
+        delivered = []
+        store = storage.TranscriptStore(directory="unused", append=lambda encoded: None,
+            create_event=lambda kind, text, **timing: {"type": kind, "text": text},
+            on_commit=delivered.append, on_error=lambda *args: None, on_recovered=lambda: None)
+        self.assertTrue(store.final("  docs.Pipecat.ai\t\n stays\r\n literal.  "))
+        self.assertEqual(delivered[-1]["text"], "docs.Pipecat.ai stays literal.")
+        self.assertFalse(store.final(" \r\n\t "))
+        self.assertEqual(len(delivered), 1)
+
+
 class JournalRetryTests(unittest.TestCase):
     def test_flush_failure_after_complete_write_does_not_duplicate_the_journal(self):
         import bridge

@@ -133,6 +133,74 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(client.close)
         return client
 
+    async def test_phone_overflow_closes_for_retry_without_losing_journal_or_viewer_finals(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        async with client.ws_connect("/listen?replay=0") as captions, client.ws_connect("/v1/listen") as phone:
+            await captions.receive_json(timeout=1)  # replay start
+            await captions.receive_json(timeout=1)  # replay end
+            await captions.receive_json(timeout=1)  # status
+            with mock.patch.object(bridge, "event_logger") as journal:
+                for index in range(40):
+                    self.assertTrue(bridge.record_transcript_line(f"Synthetic final {index}.", utterance_id=f"delivery-{index}"))
+                self.assertEqual(journal.info.call_count, 40)
+            async with asyncio.timeout(2):
+                while True:
+                    message = await phone.receive()
+                    if message.type == bridge.aiohttp.WSMsgType.CLOSE:
+                        self.assertEqual(message.data, 1013)
+                        break
+            finals = []
+            while len(finals) < 40:
+                event = await captions.receive_json(timeout=1)
+                if event.get("type") == "transcript":
+                    finals.append(event)
+            self.assertEqual([event["text"] for event in finals], [f"Synthetic final {index}." for index in range(40)])
+            self.assertEqual(len(bridge.state.recent_events), 40)
+            self.assertFalse(captions.closed)
+            self.assertEqual(bridge.build_health_dict()["phone_delivery_errors"], 1)
+            self.assertEqual(bridge.state.metrics["last_output_error"], None)
+        # Reconnection gets a clean delivery state rather than the old stalled queue.
+        async with client.ws_connect("/v1/listen") as replacement:
+            with mock.patch.object(bridge, "event_logger"):
+                bridge.record_transcript_line("Delivery recovered.", utterance_id="recovered")
+            self.assertEqual((await replacement.receive_json(timeout=1))["text"], "Delivery recovered.")
+            self.assertEqual(bridge.state.metrics["phone_delivery_errors"], 1)
+
+    async def test_phone_sender_failures_close_the_one_way_connection(self):
+        client = await self.client_for(bridge.create_app(start_workers=False))
+        for count, error in enumerate((TimeoutError(), OSError()), 1):
+            with self.subTest(error=type(error).__name__):
+                async with client.ws_connect("/v1/listen") as phone:
+                    server = next(iter(bridge.state.stream_clients))
+                    with mock.patch.object(server, "send_str", side_effect=error), \
+                         mock.patch.object(bridge, "event_logger") as journal:
+                        self.assertTrue(bridge.record_transcript_line("Synthetic delivery check.", utterance_id=f"send-{count}"))
+                        message = await phone.receive(timeout=1)
+                        self.assertEqual(message.type, bridge.aiohttp.WSMsgType.CLOSE)
+                        self.assertEqual(message.data, 1013)
+                        self.assertEqual(journal.info.call_count, 1)
+                    self.assertEqual(bridge.state.metrics["phone_delivery_errors"], count)
+
+    async def test_phone_delivery_failure_is_counted_once_and_degrades_active_health(self):
+        phone = mock.Mock()
+        phone.close = mock.AsyncMock(return_value=True)
+        stream = bridge.PhoneStream(asyncio.Queue(maxsize=1), 0)
+        bridge.state.stream_clients[phone] = stream
+        worker = mock.Mock()
+        worker.done.return_value = False
+        bridge.state.background_tasks["test"] = worker
+        bridge.state.live_stt.connected = True
+        self.assertEqual(bridge.build_health_dict()["status"], "ok")
+        bridge.fail_phone_delivery(phone, stream, "queue_full")
+        bridge.fail_phone_delivery(phone, stream, "send_failed")
+        self.assertEqual(bridge.build_health_dict()["status"], "degraded")
+        self.assertEqual(bridge.state.metrics["phone_delivery_errors"], 1)
+        async with asyncio.timeout(1):
+            while not phone.close.await_count:
+                await asyncio.sleep(0)
+        phone.close.assert_awaited_once_with(code=1013, message=b"Caption delivery stalled; reconnect", drain=False)
+        bridge.state.stream_clients.clear()
+
     async def test_retired_webhook_routes_return_404(self):
         client = await self.client_for(bridge.create_app(start_workers=False))
         for path in ("/omi", "/omi/ws"):
@@ -315,8 +383,8 @@ class RouteTests(unittest.IsolatedAsyncioTestCase):
                 with mock.patch.object(bridge, "event_logger"):
                     bridge.record_transcript_line("Direct phone transcript.Second sentence.")
                 msg = await asyncio.wait_for(ws.receive_json(), timeout=1)
-                self.assertEqual(msg["text"], "Direct phone transcript. Second sentence.")
-                self.assertEqual(msg["segments"][0]["text"], "Direct phone transcript. Second sentence.")
+                self.assertEqual(msg["text"], "Direct phone transcript.Second sentence.")
+                self.assertEqual(msg["segments"][0]["text"], "Direct phone transcript.Second sentence.")
                 # Diagnostic text without source timing must not invent timestamps.
                 self.assertNotIn("start", msg["segments"][0])
                 self.assertNotIn("end", msg["segments"][0])
@@ -453,6 +521,16 @@ class LatencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(health["oldest_pending_audio_age_sec"])
         for summary in health["latency"].values():
             self.assertEqual(summary, {"samples": 0, "last": None, "p50": None, "p95": None})
+
+    def test_caption_status_exposes_provider_word_and_packet_timing(self):
+        for metric, value in (("provider_word_end_to_partial_sec", .2),
+                              ("provider_word_end_to_final_sec", .6),
+                              ("final_word_packet_to_result_sec", .4)):
+            bridge.record_latency(metric, value)
+        status = bridge.caption_status()
+        self.assertEqual(status["latency_provider_word_end_to_partial_p50_sec"], .2)
+        self.assertEqual(status["latency_provider_word_end_to_final_p50_sec"], .6)
+        self.assertEqual(status["latency_final_word_packet_to_result_p50_sec"], .4)
 
     def test_live_queue_age_uses_receipt_clock(self):
         bridge.ingest_raw_pcm(SPEECH)

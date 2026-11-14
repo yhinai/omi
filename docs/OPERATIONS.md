@@ -78,6 +78,8 @@ Pipecat is pinned to 1.16.0 and Deepgram SDK to 7.19.0. The worker uses a small 
 
 `check` reads configuration, package metadata and local health without sending audio. `verify` observes authenticated captions and packet progress; `--public` checks that unauthenticated public caption access is denied. Its report distinguishes observed, failed and untested stages.
 
+Viewer diagnostics (`d`) distinguish segment receipt age from estimated word-end delay. The starred word-end values use the bridge receipt clock and exclude upstream wearable delay. A growing `phone_delivery_errors` health counter means phone replies stalled; that connection closes for reconnection while the journal and caption viewers retain their own delivery path.
+
 For a deliberate phrase check:
 
 ```bash

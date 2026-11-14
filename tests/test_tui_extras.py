@@ -3,6 +3,8 @@ import asyncio
 from collections import deque
 import curses
 import io
+import stat
+from datetime import datetime
 import tempfile
 import time
 import unittest
@@ -136,10 +138,26 @@ class SessionTests(unittest.TestCase):
         viewer.add(event("exported words", event_id="a"))
         with tempfile.TemporaryDirectory() as directory:
             message = tui.export_session(viewer, Path(directory))
-            self.assertRegex(message, r"Exported omi-captions-\d{8}-\d{6}\.md")
+            self.assertRegex(message, r"Exported omi-captions-\d{8}-\d{6}-.+\.md")
             written = list(Path(directory).glob("omi-captions-*.md"))
             self.assertEqual(len(written), 1)
             self.assertIn("exported words", written[0].read_text())
+
+    def test_exports_in_the_same_second_are_distinct_and_private(self):
+        viewer = tui.Viewer()
+        viewer.add(event("first export", event_id="first"))
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(tui, "datetime") as clock:
+            clock.now.return_value = datetime(2026, 11, 14, 12, 0, 0)
+            first = tui.export_session(viewer, directory)
+            viewer.add(event("second export", event_id="second", session=2))
+            second = tui.export_session(viewer, directory)
+            self.assertNotEqual(first, second)
+            paths = list(Path(directory).glob("omi-captions-20261114-120000-*.md"))
+            self.assertEqual(len(paths), 2)
+            contents = [path.read_text() for path in paths]
+            self.assertEqual(sum("second export" in text for text in contents), 1)
+            self.assertTrue(all("first export" in text for text in contents))
+            self.assertTrue(all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in paths))
 
     def test_empty_session_exports_nothing(self):
         self.assertEqual(tui.export_session(tui.Viewer(), Path("/tmp")), "Nothing to export")
@@ -151,6 +169,28 @@ class SessionTests(unittest.TestCase):
 
 
 class DiagnosisTests(unittest.TestCase):
+    def test_word_timing_metrics_are_labeled_by_their_observed_stage(self):
+        viewer = tui.Viewer(connected=True, diagnostics=True)
+        viewer.add({"type": "status", "stt_pipeline": "pipecat", "workers_alive": True,
+                    "latency_provider_word_end_to_partial_p50_sec": .234,
+                    "latency_provider_word_end_to_final_p50_sec": .567,
+                    "latency_final_word_packet_to_result_p50_sec": .456})
+        screen = Screen()
+        with mock.patch.object(tui.curses, "doupdate"):
+            tui.paint(screen, viewer, {"text": 0, "muted": 1, "accent": 2})
+        self.assertIn("Word end → draft p50*: 0.23s", screen.text)
+        self.assertIn("Word end → final p50*: 0.57s", screen.text)
+        self.assertIn("Word packet → final p50: 0.46s", screen.text)
+        self.assertIn("Estimates from Mac receipt; exclude wearable lag", screen.text)
+        self.assertIn("Last error: none", screen.text)
+        for invalid in (True, -1, float("inf"), float("nan"), "0.3", None):
+            viewer.add({"type": "status", "latency_provider_word_end_to_partial_p50_sec": invalid,
+                        "latency_provider_word_end_to_final_p50_sec": invalid,
+                        "latency_final_word_packet_to_result_p50_sec": invalid})
+            self.assertIsNone(viewer.word_draft_p50)
+            self.assertIsNone(viewer.word_final_p50)
+            self.assertIsNone(viewer.word_packet_final_p50)
+
     def test_status_event_feeds_the_diagnostics_page(self):
         viewer = tui.Viewer(connected=True, diagnostics=True)
         viewer.add({"type": "status", "stt_in_flight": False, "last_packet_age_sec": 0.1,

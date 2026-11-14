@@ -45,9 +45,13 @@ The journal commits before publication and Markdown projection. Recognition resu
 
 Caption clients have bounded queues. Slow readers reconnect and replay reliable events rather than silently losing finals. Viewer replay uses the same paragraph rules as live consumption. Source offsets prevent duplicate finals across supported worker recovery paths.
 
+Phone reply overflow or send failure closes that connection with code 1013 and increments `phone_delivery_errors`; journal and caption-viewer delivery continue. Reconnecting the official phone app does not guarantee replay of every missed phone reply.
+
 The Whisper fallback uses a separate Python 3.14 process and one prewarmed MLX GPU model. Its eight-second turn cap can split a word. Speculative quiet-settle decoding is reused only after the turn closes with matching speech bounds and no resumed voice. Both recognizers retain pending state in RAM; full bridge crashes can lose unsaved work.
 
 Operational status separates service availability, phone connectivity, audio freshness, provider readiness and saving. Latencies distinguish provider connection, partial/final arrival and persistence. They start from observable Mac/provider stages and exclude unknown wearable/BLE/phone/tunnel delays.
+
+`receipt_to_final_sec` includes segment duration. Provider word-end metrics estimate delay using the original packet receipt clock; `final_word_packet_to_result_sec` measures the containing packet's observed receipt to result handling. None establishes acoustic-to-screen latency. See the [stage audit](OPTIMIZATION.md) for measurements and limits.
 
 ## Verification and change process
 

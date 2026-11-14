@@ -30,12 +30,13 @@ PHRASES = (
     ("hackathon", "Omi hackathon check. Blue lantern seven."),
     ("technical_numbers", "The API returned status two hundred after three requests in one point five seconds."),
 )
-CHUNK_BYTES = 3200
 LATENCY_NAMES = {
     "receipt_to_send_sec", "receipt_to_first_partial_sec", "receipt_to_transcript_sec",
     "receipt_to_final_sec", "turn_close_to_final_sec", "speech_end_to_final_sec",
     "local_decode_sec", "turn_boundary_wait_sec", "speech_onset_to_first_partial_sec",
     "speech_onset_to_final_sec",
+    "provider_word_end_to_final_sec", "provider_word_end_to_partial_sec",
+    "final_word_packet_to_result_sec", "pipeline_start_sec", "provider_connect_sec",
 }
 SMALL_NUMBERS = ("zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
                  "fifteen sixteen seventeen eighteen nineteen").split()
@@ -130,8 +131,11 @@ def summary(values):
 
 
 async def trial(backend_name, clip, factory, *, startup_timeout=60, sleep=asyncio.sleep,
-                monotonic=time.monotonic, wall_time=time.time):
+                monotonic=time.monotonic, wall_time=time.time, chunk_ms=100):
     """One isolated backend instance; times end at callbacks, before delivery/UI."""
+    if isinstance(chunk_ms, bool) or not isinstance(chunk_ms, int) or not 10 <= chunk_ms <= 100:
+        raise ValueError("Use a feed chunk from 10 to 100 milliseconds")
+    chunk_bytes = BPS * chunk_ms // 1000
     started = None
     partial_times, final_times, finals = [], [], []
     first_prefix = None
@@ -202,9 +206,9 @@ async def trial(backend_name, clip, factory, *, startup_timeout=60, sleep=asynci
                     break
                 await sleep(.01)
         started = monotonic()
-        for offset in range(0, len(clip.pcm), CHUNK_BYTES):
+        for offset in range(0, len(clip.pcm), chunk_bytes):
             check_task()
-            raw = clip.pcm[offset:offset + CHUNK_BYTES]
+            raw = clip.pcm[offset:offset + chunk_bytes]
             backend.feed(raw, wall_time(), monotonic())
             sent_bytes += len(raw)
             await sleep(max(0, started + sent_bytes / BPS - monotonic()))
@@ -252,6 +256,9 @@ async def trial(backend_name, clip, factory, *, startup_timeout=60, sleep=asynci
         resolved = None
     return {"backend": backend_name, "clip": clip.name, "status": "failed" if failure else "passed",
             "failure": failure, "expected_text": clip.expected, "final_text": text,
+            "feed_chunk_ms": chunk_ms,
+            "pipeline": getattr(backend, "pipeline", "direct" if backend_name == "deepgram" else "local"),
+            "endpointing_ms": getattr(backend, "endpointing_ms", None),
             **word_error_rate(clip.expected, text), "sent_audio_sec": sent_bytes / BPS,
             "clip_duration_sec": clip_seconds, "appended_silence_sec": (len(clip.pcm) - clip.clip_bytes) / BPS,
             "first_partial_from_first_feed_sec": partial_times[0] if partial_times else None,
@@ -267,7 +274,7 @@ async def trial(backend_name, clip, factory, *, startup_timeout=60, sleep=asynci
 
 
 async def benchmark(clips, backends, *, environ, repeats=1, startup_timeout=60, factory=None,
-                    sleep=asyncio.sleep, monotonic=time.monotonic):
+                    sleep=asyncio.sleep, monotonic=time.monotonic, chunk_ms=100):
     results = []
     logger = logging.getLogger("bridge")
     was_disabled = logger.disabled
@@ -281,7 +288,7 @@ async def benchmark(clips, backends, *, environ, repeats=1, startup_timeout=60, 
                                           "OMI_LANGUAGES": "en", "OMI_HOTWORDS": ""})
                         create = factory if factory is not None else bridge.create_transcription_backend
                         result = await trial(name, clip, create, startup_timeout=startup_timeout,
-                                             sleep=sleep, monotonic=monotonic)
+                                             sleep=sleep, monotonic=monotonic, chunk_ms=chunk_ms)
                         result["requested_model"] = bridge.MODEL_LABEL
                     except Exception:
                         result = {"backend": name, "clip": clip.name, "status": "failed", "failure": "ConfigurationFailure"}
@@ -339,13 +346,22 @@ def main(argv=None):
                         help="Default whisper; explicitly adding deepgram permits paid upload of synthetic clips only")
     parser.add_argument("--repeats", type=int, default=1, help="Fresh trials per clip/backend (1..3)")
     parser.add_argument("--startup-timeout", type=float, default=60, help="Backend startup timeout in seconds (1..120)")
+    parser.add_argument("--pipeline", choices=("direct", "pipecat"), help="Override Deepgram orchestration for this benchmark only")
+    parser.add_argument("--endpointing-ms", type=int, help="Override Deepgram pause threshold for this benchmark only (1..5000)")
+    parser.add_argument("--chunk-ms", type=int, default=100, help="Paced input packet duration (10..100; Vexo uses 20)")
     parser.add_argument("--report", type=Path, help="Write redacted JSON results")
     args = parser.parse_args(argv)
     if not 1 <= args.repeats <= 3 or not math.isfinite(args.startup_timeout) or not 1 <= args.startup_timeout <= 120:
         parser.error("Use repeats 1..3 and startup timeout 1..120 seconds.")
+    if not 10 <= args.chunk_ms <= 100 or args.endpointing_ms is not None and not 1 <= args.endpointing_ms <= 5000:
+        parser.error("Use chunk 10..100 and endpointing 1..5000 milliseconds.")
     try:
         bridge.require_python315()
         env = load_env()
+        if args.pipeline:
+            env["OMI_DEEPGRAM_PIPELINE"] = args.pipeline
+        if args.endpointing_ms is not None:
+            env["OMI_DEEPGRAM_ENDPOINTING_MS"] = str(args.endpointing_ms)
         secrets = [secret for key, value in env.items()
                    if any(word in key.upper() for word in ("TOKEN", "KEY", "SECRET", "PASSWORD"))
                    for secret in (value, value.strip()) if secret]
@@ -354,7 +370,7 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="omi-benchmark-") as directory:
             clips = synthetic_clips(directory)
             report = asyncio.run(benchmark(clips, args.backends, environ=env, repeats=args.repeats,
-                                          startup_timeout=args.startup_timeout))
+                                          startup_timeout=args.startup_timeout, chunk_ms=args.chunk_ms))
         report = redacted(report, secrets)
         if args.report:
             args.report.write_text(json.dumps(report, indent=2) + "\n")

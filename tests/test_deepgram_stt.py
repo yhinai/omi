@@ -257,6 +257,57 @@ class DeepgramTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(words), 1)
         self.assertEqual(words[0]["sample_end_offset"], 1600)
         self.assertTrue(all(word["sample_offset"] < word["sample_end_offset"] for word in words))
+        self.assertFalse(any(call.args[0].startswith("provider_word_end_to_") for call in self.latency.call_args_list))
+
+    def test_word_end_latency_preserves_original_packet_clock_across_splits_and_epoch_offsets(self):
+        for offset in (0, RATE*7):
+            for committed_prefix in (0, 1600):
+                with self.subTest(offset=offset, committed_prefix=committed_prefix):
+                    latency, final = mock.Mock(), mock.Mock(return_value=True)
+                    stream = deepgram.DeepgramSTT(api_key="synthetic", on_partial=mock.Mock(),
+                        on_final=final, on_gap=mock.Mock(), on_latency=latency, on_connection=mock.Mock())
+                    stream.total_input_samples = offset
+                    stream.feed(bytes(6400), received_at=200, received_mono=100)
+                    original = stream.queue.popleft()
+                    stream.pending_bytes = 0
+                    stream.retained.extend((original.slice(offset, offset+1600), original.slice(offset+1600)))
+                    if committed_prefix:
+                        stream._release(offset+committed_prefix)
+                    epoch = deepgram._Epoch(start=offset, end=offset+3200, session=stream.session_id)
+                    payload = result("Word.", start=.1, duration=.1,
+                        words=[{"word": "word", "start": .15, "end": .18}])
+                    clock = mock.Mock(wraps=time)
+                    clock.monotonic.return_value = 100.5
+                    with mock.patch.object(deepgram, "time", clock):
+                        stream._handle_result({**payload, "is_final": False}, epoch)
+                        stream._handle_result(payload, epoch)
+                        # A duplicate final must not add another word-lag sample.
+                        stream._handle_result(payload, epoch)
+                    metrics = {call.args[0]: call.args[1] for call in latency.call_args_list}
+                    self.assertAlmostEqual(metrics["provider_word_end_to_partial_sec"], .52)
+                    self.assertAlmostEqual(metrics["provider_word_end_to_final_sec"], .52)
+                    self.assertAlmostEqual(metrics["final_word_packet_to_result_sec"], .5)
+                    self.assertEqual(sum(call.args[0] == "provider_word_end_to_final_sec"
+                                         for call in latency.call_args_list), 1)
+                    self.assertEqual(final.call_args.kwargs["sample_offset"], offset+1600)
+                    self.assertFalse(stream.retained)
+
+    def test_results_without_complete_word_timing_do_not_invent_word_lag_metrics(self):
+        for text, words in (("Word.", None), ("", []),
+                            ("Word.", [{"word": "word", "start": 0, "end": .05}]*513)):
+            with self.subTest(text=bool(text), word_count=None if words is None else len(words)):
+                latency = mock.Mock()
+                stream = deepgram.DeepgramSTT(api_key="synthetic", on_partial=mock.Mock(),
+                    on_final=mock.Mock(return_value=True), on_gap=mock.Mock(),
+                    on_latency=latency, on_connection=mock.Mock())
+                stream.feed(bytes(3200), time.time(), time.monotonic())
+                stream.retained.append(stream.queue.popleft())
+                stream.pending_bytes = 0
+                epoch = deepgram._Epoch(start=0, end=1600, session=stream.session_id)
+                stream._handle_result(result(text, words=words), epoch)
+                self.assertFalse(any(call.args[0].startswith("provider_word_end_to_")
+                                     or call.args[0] == "final_word_packet_to_result_sec"
+                                     for call in latency.call_args_list))
 
     async def test_failed_output_callback_cannot_mutate_retry_provenance(self):
         socket = Socket()

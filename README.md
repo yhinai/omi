@@ -59,3 +59,5 @@ This sends synthesized test audio through a real Pipecat pipeline and Deepgram o
 [Operations](docs/OPERATIONS.md) covers use and recovery. [Architecture](docs/ARCHITECTURE.md) defines ownership and guarantees. [Recovery archive](docs/archive/README.md) preserves retired research, experiments and the hackathon packet; [evidence](docs/evidence/README.md) records verification scope and limits.
 
 For Vexo band 43 over USB, see [Vexo setup and operation](docs/VEXO.md).
+
+[Wearable optimization audit](docs/OPTIMIZATION.md) traces the Vexo/Omi stages, measured latency, deployment boundaries and remaining validation for multiple devices.

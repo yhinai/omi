@@ -150,6 +150,22 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         result, _ = await self.run_trial(early_final=True)
         self.assertAlmostEqual(result["last_final_relative_to_clip_end_sec"], -.2)
 
+    async def test_twenty_ms_frames_preserve_realtime_pacing_and_short_tail(self):
+        clock = Clock()
+        backend = FakeBackend({})
+        def factory(callbacks):
+            backend.callbacks = callbacks
+            return backend
+        clip = benchmark.Clip("speech", "Test phrase.", b"\x00\x10" * 2000, 4000)
+        result = await benchmark.trial("deepgram", clip, factory, chunk_ms=20,
+                                       sleep=clock.sleep, monotonic=clock.now)
+        self.assertEqual(result["status"], "passed")
+        self.assertEqual(backend.feed_sizes, [640] * 6 + [160])
+        self.assertAlmostEqual(result["sent_audio_sec"], .125)
+        self.assertAlmostEqual(result["final_callbacks_from_first_feed_sec"][0], .125)
+        self.assertEqual(result["feed_chunk_ms"], 20)
+        self.assertTrue(backend.closed)
+
     async def test_silence_has_no_wer_and_rejects_any_partial_or_final_text(self):
         clip = benchmark.Clip("silence", "", bytes(3200), 3200)
         result, _ = await self.run_trial(clip, text="")

@@ -271,6 +271,26 @@ class DeepgramSTT:
                 return packet.slice(start)
         raise ValueError("Deepgram result did not match retained source audio")
 
+    def _word_end_latency(self, end, received_mono, *, final):
+        """Provider-word timing mapped to bridge receipt; not acoustic hardware lag.
+
+        The interpolated estimate assumes a packet's last sample corresponds to
+        its receipt. The separate packet metric uses the observed receipt only,
+        and both include any provider, orchestration and return-transport delay.
+        """
+        if end is None:
+            return
+        try:
+            packet = self._source(end-1)
+        except ValueError:
+            return  # Missing timing authority is unknown, never a fabricated zero.
+        word_end_mono = (packet.received_mono + packet.audio_start_at-packet.received_at
+                         + (end-packet.sample_offset)/RATE)
+        name = "provider_word_end_to_final_sec" if final else "provider_word_end_to_partial_sec"
+        self._latency(name, received_mono-word_end_mono)
+        if final:
+            self._latency("final_word_packet_to_result_sec", received_mono-packet.received_mono)
+
     @staticmethod
     def _seconds(value):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
@@ -316,7 +336,8 @@ class DeepgramSTT:
             self._speech_final(event, end)
             return
         words = []
-        for word in alternative.get("words", [])[:512]:
+        provider_words = alternative.get("words", [])
+        for word in provider_words[:512]:
             word_start = epoch.start + round(self._seconds(word.get("start"))*RATE)
             word_end = epoch.start + round(self._seconds(word.get("end"))*RATE)
             if not epoch.start <= word_start <= word_end <= epoch.end + RATE//100:
@@ -338,6 +359,11 @@ class DeepgramSTT:
             if isinstance(word.get("speaker"), int) and not isinstance(word["speaker"], bool) and word["speaker"] >= 0:
                 item["speaker"] = word["speaker"]
             words.append(item)
+        last_word_end = None
+        if provider_words and len(provider_words) <= 512:
+            reported_end = epoch.start + round(self._seconds(provider_words[-1].get("end"))*RATE)
+            if watermark < reported_end <= epoch.end:
+                last_word_end = reported_end
         if start < watermark:
             if text and not alternative.get("words"):
                 raise ValueError("Overlapping Deepgram text requires word timing")
@@ -363,6 +389,7 @@ class DeepgramSTT:
                     "received_at": source.received_at, "audio_start_at": source.audio_start_at,
                     "_received_mono": source.received_mono, "_final_received_mono": received_mono,
                     "recognition": recognition})
+                self._word_end_latency(last_word_end, received_mono, final=True)
                 self._release(end)
                 self._latency("receipt_to_final_sec", received_mono-source.received_mono)
                 self.retry_saves()
@@ -379,6 +406,7 @@ class DeepgramSTT:
             self.last_partial = partial
             self.partial_updates += 1
             self._speech_pending = True
+            self._word_end_latency(last_word_end, received_mono, final=False)
             if first:
                 self._latency("receipt_to_first_partial_sec", received_mono-source.received_mono)
             self.on_partial(partial)
