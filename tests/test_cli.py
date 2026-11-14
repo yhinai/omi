@@ -62,5 +62,5 @@ class CliTests(unittest.TestCase):
 
     def test_vexo_bluetooth_selection_reaches_capture_worker(self):
         executable, arguments = self.dispatch(['source','vexo','--band','43','--transport','ble'])
-        self.assertEqual(executable,str(cli.ROOT/'.venv-vexo/bin/python'))
+        self.assertEqual(executable,str(cli.ROOT/'.venv-capture/bin/python'))
         self.assertEqual(arguments[-4:],['--band','43','--transport','ble'])

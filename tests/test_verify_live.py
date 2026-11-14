@@ -150,7 +150,7 @@ class VerificationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(private, json.dumps(report))
             self.assertFalse(session.options["trust_env"])
             ws_call = next(call for call in session.calls if call[0] == "ws")
-            self.assertEqual(ws_call[1], "ws://127.0.0.1:8787/listen?replay=0")
+            self.assertEqual(ws_call[1], "ws://127.0.0.1:8797/listen?replay=0")
             self.assertEqual(ws_call[2]["headers"], {"Authorization": "Bearer " + TOKEN})
             self.assertEqual(ws_call[2]["max_msg_size"], verify_live.MAX_MESSAGE)
             self.assertTrue(session.socket.closed)

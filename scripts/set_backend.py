@@ -159,7 +159,7 @@ def health_snapshot(root, *, timeout=2):
         pid = int((root / "logs/omi_bridge.pid").read_text().strip())
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         try:
-            response = opener.open("http://127.0.0.1:8788/health", timeout=timeout)
+            response = opener.open("http://127.0.0.1:8798/health", timeout=timeout)
         except urllib.error.HTTPError as error:
             if error.code != 503:
                 return None

@@ -65,8 +65,9 @@ def main(argv=None):
                             ("verify", "Observe new live captions and optionally a specific test phrase")):
         commands.add_parser(name, help=help_text, add_help=False)
     source = commands.add_parser("source", help="Run a wearable input in the foreground; Ctrl+C drains")
-    source.add_argument("name", choices=("vexo",))
-    source.add_argument("--band", type=int, choices=(VEXO_BAND,), required=True)
+    source.add_argument("name", choices=("vexo", "omi"))
+    source.add_argument("--device", help="Configured Omi BLE UUID")
+    source.add_argument("--band", type=int, choices=(VEXO_BAND,), default=VEXO_BAND)
     source.add_argument("--transport", choices=("serial", "ble"), default="serial")
     dev = commands.add_parser("dev", help="Explicit development, demo and diagnostic tools")
     dev.add_argument("tool", choices=("test", "smoke", "benchmark", "faults", "demo", "capture"))
@@ -87,8 +88,13 @@ def main(argv=None):
                 print("Service health does not establish microphone quality or recognition accuracy.")
         return 0 if report["service"] == "healthy" else 1
     if args.command == "source":
-        executable = str(ROOT / ".venv-vexo/bin/python")
+        executable = str(ROOT / ".venv-capture/bin/python")
         arguments = [str(ROOT / "vexo_source.py"), "--band", str(args.band), "--transport", args.transport]
+        if args.name == "omi":
+            from config import load_env
+            device = args.device or load_env().get("OMI_DEVICE_ID")
+            if not device:parser.error("Omi needs --device UUID or OMI_DEVICE_ID in private .env")
+            arguments=[str(ROOT/"vexo_source.py"),"--device",device,"--transport","ble"]
     elif args.command in {"start", "stop", "restart"}:
         executable, arguments = str(ROOT / "run.sh"), [args.command]
     else:

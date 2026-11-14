@@ -53,7 +53,7 @@ WHISPER_ENV = {}
 IDLE_FLUSH_SEC = 8.0
 MAX_INPUT_BYTES = BYTES_PER_SECOND * 300
 HOST = "0.0.0.0"
-PORT, HEALTH_PORT = 8787, 8788
+PORT, HEALTH_PORT = 8797, 8798
 STREAM_TOKEN = ""
 CAPTION_TOKEN = ""
 MAX_CAPTION_CLIENTS = 16
@@ -600,7 +600,7 @@ async def handle_omi_ws(request):
     if sr != SAMPLE_RATE or channels != 1:
         raise web.HTTPBadRequest(text="sample_rate=16000 and channels=1 required")
     source_kind = request.headers.get("X-Audio-Source", "omi")
-    if source_kind not in {"omi", "vexo"}:
+    if source_kind not in {"omi", "vexo", "omi_ble"}:
         raise web.HTTPBadRequest(text="Unknown audio source")
     source = {"kind": source_kind}
     if source_kind == "vexo":
@@ -610,6 +610,13 @@ async def handle_omi_ws(request):
         if transport not in {"serial", "ble"}:
             raise web.HTTPBadRequest(text="Expected serial or ble Vexo transport")
         source.update(band=VEXO_BAND, name=f"Vexo-HACK-{VEXO_BAND:02}", transport=transport)
+    if source_kind == "omi_ble":
+        device_id=request.headers.get("X-Omi-Device", "")
+        try: uuid.UUID(device_id)
+        except ValueError: raise web.HTTPBadRequest(text="Expected configured Omi device UUID")
+        expected=load_env().get("OMI_DEVICE_ID")
+        if expected and expected!=device_id:raise web.HTTPForbidden(text="Wrong Omi device")
+        source.update(device_id=device_id, name="Omi", transport="ble")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_INPUT_BYTES + 1)
     queue = asyncio.Queue(maxsize=32)
     # Serialize admission across the handshake so concurrent attempts cannot
@@ -617,7 +624,7 @@ async def handle_omi_ws(request):
     async with state.stream_admission_lock:
         if state.stopping:
             raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
-        if state.stream_clients and (source_kind == "vexo" or state.metrics.get("audio_source") == "vexo" or remote_ip != state.metrics.get("direct_ws_remote")):
+        if state.stream_clients and (source_kind in {"vexo","omi_ble"} or state.metrics.get("audio_source") in {"vexo","omi_ble"} or remote_ip != state.metrics.get("direct_ws_remote")):
             raise web.HTTPConflict(text="Another direct audio stream is already active")
         await ws.prepare(request)
         if state.stopping:
@@ -638,7 +645,7 @@ async def handle_omi_ws(request):
         client = PhoneStream(queue, start_sample)
         state.stream_clients[ws] = client
         state.metrics["direct_ws_remote"] = remote_ip
-        state.metrics["audio_source"] = "vexo" if source_kind == "vexo" else "direct_ws"
+        state.metrics["audio_source"] = source_kind if source_kind in {"vexo","omi_ble"} else "direct_ws"
     logger.info("Direct phone WebSocket connected from %s", remote_ip)
 
     async def sender():
@@ -666,7 +673,7 @@ async def handle_omi_ws(request):
                     break
                 state.metrics["direct_ws_packets"] += 1
                 state.metrics["stream_audio_bytes"] += len(raw)
-                state.metrics["audio_source"] = "vexo" if source_kind == "vexo" else "direct_ws"
+                state.metrics["audio_source"] = source_kind if source_kind in {"vexo","omi_ble"} else "direct_ws"
                 ingest_raw_pcm(raw, sr)
                 if state.live_stt is not None:
                     state.source_sessions[state.live_stt.session_id] = dict(source)
@@ -675,16 +682,16 @@ async def handle_omi_ws(request):
                     ctrl = json.loads(message.data)
                 except ValueError:
                     continue
-                if source_kind == "vexo" and isinstance(ctrl, dict) and ctrl.get("type") == "SourceStatus":
+                if source_kind in {"vexo","omi_ble"} and isinstance(ctrl, dict) and ctrl.get("type") == "SourceStatus":
                     counters = ctrl.get("counters", {})
                     if not isinstance(counters, dict):
                         continue
                     state.metrics["source_loss"] = {k: v for k, v in counters.items()
-                        if k in {"lost_packets", "old_packets", "queue_overflows", "discarded_packets", "corrupt_packets"}
+                        if k in {"lost_packets", "old_packets", "queue_overflows", "discarded_packets", "corrupt_packets", "device_lost_notifications", "device_old_notifications"}
                         and isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**53}
                     if ctrl.get("discontinuity"):
                         # Unknown duration is explicit; never invent received samples.
-                        write_event(make_event("source-discontinuity", "[Vexo source session interrupted]",
+                        write_event(make_event("source-discontinuity", "[Wearable source session interrupted]",
                             session_id=state.live_stt.session_id if state.live_stt else None))
                 if isinstance(ctrl, dict) and ctrl.get("type") == "CloseStream":
                     source_closed_cleanly = True
@@ -698,8 +705,8 @@ async def handle_omi_ws(request):
                 break
     finally:
         active = state.stream_clients.pop(ws, None) is not None
-        if active and source_kind == "vexo" and not source_closed_cleanly and not state.stopping:
-            write_event(make_event("source-discontinuity", "[Vexo input connection lost]",
+        if active and source_kind in {"vexo","omi_ble"} and not source_closed_cleanly and not state.stopping:
+            write_event(make_event("source-discontinuity", "[Wearable input connection lost]",
                 session_id=state.live_stt.session_id if state.live_stt else None))
         if active and state.metrics["session_started_at"] is not None:
             state.metrics["session_ended_at"] = time.monotonic()

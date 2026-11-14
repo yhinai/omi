@@ -1,3 +1,29 @@
+# Omi DevKit captions
+
+This independent checkout lives at `/Users/alhinai/omi-captions` and uses local ports
+**8797/8798**, separate from the running Vexo deployment.
+
+```sh
+cd ~/omi-captions
+./omi start
+./omi source omi --device YOUR_VERIFIED_BLUETOOTH_UUID
+# In another terminal:
+./omi captions
+./omi status
+```
+
+Configure `OMI_DEVICE_ID` in private `.env` to omit `--device` on later runs.
+Disconnect Omi from its phone app before connecting directly to this Mac.
+Ctrl+C stops capture and drains accepted audio. Stop capture before `./omi stop`
+or `./omi backend whisper|deepgram`.
+
+See [Omi DevKit setup, protocol and verification limits](docs/OMI-DEVKIT.md).
+DevKit 1 was verified over Bluetooth with a deliberately spoken sentence saved through
+Pipecat/Deepgram into authenticated captions, JSONL and daily Markdown. See the
+verification limits and initial queue-pressure correction in the device guide.
+
+---
+
 # Omi live captions
 
 Wearable speech becomes live terminal captions and saved notes. One bridge accepts audio from the Omi phone app, sends it to the selected recognizer, and saves finalized transcripts before publishing them.
@@ -10,7 +36,7 @@ This Mac uses **Deepgram Nova-3 English**. Local Whisper remains an explicit fal
 
 ## Daily use
 
-From `/Users/alhinai/vexo-captions` on the Mac:
+From `/Users/alhinai/omi-captions` on the Mac:
 
 ```bash
 ./omi start

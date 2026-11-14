@@ -618,7 +618,7 @@ class CaptionTokenTests(unittest.TestCase):
         import config
         with mock.patch.object(config, "load_env", side_effect=AssertionError("read local credentials")):
             for url in ("wss://example.com/listen", "ws://127.0.0.1:9999/listen",
-                        "ws://localhost:8787/another-app", "wss://localhost:8787/listen"):
+                        "ws://localhost:8797/another-app", "wss://localhost:8797/listen"):
                 with self.subTest(url=url):
                     self.assertEqual(tui.caption_token(url, environ={"OMI_STREAM_TOKEN": "private"}), "")
             self.assertEqual(tui.caption_token("wss://example.com/listen",
@@ -652,7 +652,7 @@ class CaptionTokenTests(unittest.TestCase):
                 tui.caption_token("wss://example.com/listen", token_file, environ={})
 
     def test_standalone_local_viewer_can_use_process_credentials(self):
-        with mock.patch.dict(tui.sys.modules, {"bridge": None}):
+        with mock.patch.dict(tui.sys.modules, {"config": None}):
             self.assertEqual(tui.caption_token(tui.DEFAULT_CAPTION_URL,
                 environ={"OMI_STREAM_TOKEN": "standalone-token"}), "standalone-token")
 

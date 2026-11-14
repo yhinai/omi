@@ -32,7 +32,7 @@ PAUSE_SECONDS = 2.0             # a silence at least this long starts a new para
 NO_TIMING_CONTINUE_SEC = 16.0   # fallback window when a final carries no sample offsets
 DRAFT_NO_TIMING_SEC = 8.0
 READING_MEASURE = 72            # Bringhurst: 45-75 characters, 66 ideal
-DEFAULT_CAPTION_URL = "ws://127.0.0.1:8787/listen"
+DEFAULT_CAPTION_URL = "ws://127.0.0.1:8797/listen"
 
 
 def clean(text):
@@ -798,7 +798,7 @@ def caption_token(url, token_file=None, environ=None):
         if query.get("token") or query.get("key"):
             return ""  # Preserve explicitly supplied URL credentials.
         local = (parts.scheme == "ws" and parts.hostname in {"127.0.0.1", "localhost", "::1"}
-                 and parts.port == 8787 and parts.path == "/listen"
+                 and parts.port == 8797 and parts.path == "/listen"
                  and parts.username is None and parts.password is None)
         if not local:
             return ""

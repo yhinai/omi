@@ -15,7 +15,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from config import load_env, read_env_file
-HEALTH_URL = "http://127.0.0.1:8788/health"
+HEALTH_URL = "http://127.0.0.1:8798/health"
 LIMITATIONS = [
     "Package metadata and asset readability only; no model or native dependency is imported.",
     "Does not verify inference accuracy, wearable/BLE, phone configuration, public tunnel or terminal rendering.",
@@ -35,6 +35,7 @@ print(json.dumps(dict(implementation=sys.implementation.name, version=list(sys.v
 
 KNOWN_OMI_KEYS = frozenset({
     "OMI_HOST",
+    "OMI_DEVICE_ID",
     "OMI_STT_BACKEND",
     "OMI_DEEPGRAM_PIPELINE",
     "OMI_PIPECAT_PYTHON",
@@ -244,7 +245,7 @@ def inspect(root=ROOT, *, environ=None, live=False):
                 phone = health.get("direct_ws_connected") is True
                 add("live_phone", "pass" if phone else "warn", "Phone audio stream connected." if phone else "No phone stream; healthy idle state does not verify recognition.")
         except (OSError, ValueError, TypeError):
-            add("live_health", "fail", "Cannot read bounded JSON health from http://127.0.0.1:8788/health.")
+            add("live_health", "fail", "Cannot read bounded JSON health from http://127.0.0.1:8798/health.")
     return {"status": "failed" if any(c["status"] == "fail" for c in checks) else "passed",
             "backend": backend if backend in ("whisper", "deepgram") else "invalid",
             "checks": checks, "limitations": LIMITATIONS + (

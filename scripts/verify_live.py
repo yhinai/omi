@@ -23,8 +23,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.doctor import environment
 import tui
 
-HEALTH_URL = "http://127.0.0.1:8788/health"
-CAPTION_URL = "ws://127.0.0.1:8787/listen?replay=0"
+HEALTH_URL = "http://127.0.0.1:8798/health"
+CAPTION_URL = "ws://127.0.0.1:8797/listen?replay=0"
 PUBLIC_URL = "https://omi.alhinai.dev/listen"
 MAX_BODY = 65536
 MAX_MESSAGE = 262144

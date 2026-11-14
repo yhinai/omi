@@ -54,13 +54,16 @@ def find_port():
     return ports[0]
 
 
-async def capture(session, env, stop, band_number, stats, transport="serial"):
+async def capture(session, env, stop, band_number, stats, transport="serial", device_id=None):
     # Decoder import and initialization complete BEFORE enabling microphone.
     decoder = PcmDecoder(conceal=False)
     validator = av.CodecContext.create('opus', 'r')
     validator.extradata = b'OpusHead' + struct.pack('<BBHIhB', 1, 1, 0, 16000, 0, 0)
     sequence = Sequence()
-    opus, pcm = queue.Queue(50), queue.Queue(50)
+    # DevKit 1 uses 10 ms frames (twice Vexo's cadence). Bound by a comparable
+    # audio duration rather than giving the faster device half the jitter budget.
+    queue_frames = 100 if device_id else 50
+    opus, pcm = queue.Queue(queue_frames), queue.Queue(queue_frames)
     failed, decode_stop = threading.Event(), threading.Event()
     reason = ['']
     closing = threading.Event()
@@ -88,11 +91,11 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
                     continue
                 # Feed without seq: Sequence ends sessions on ANY loss. No PLC/gap fill.
                 try:
-                    validator.decode(av.Packet(packet))
+                    if not device_id or band.codec!=0:validator.decode(av.Packet(packet))
                 except Exception:
                     stats['corrupt_packets'] += 1
                     raise Discontinuity('corrupt_opus') from None
-                raw = decoder.feed(packet)
+                raw = packet if device_id and band.codec==0 else decoder.feed(packet)
                 if not 0 < len(raw) <= 640 or len(raw) % 2:
                     raise Discontinuity('unexpected_pcm_duration')
                 pcm.put((raw, received), timeout=1)
@@ -105,8 +108,8 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
     token = env.get('OMI_STREAM_TOKEN', '')
     if not token:
         raise ValueError('OMI_STREAM_TOKEN required')
-    async with session.ws_connect('http://127.0.0.1:8787/v1/listen?encoding=linear16&sample_rate=16000&channels=1',
-            headers={'Authorization': 'Bearer ' + token, 'X-Audio-Source': 'vexo', 'X-Vexo-Band': str(band_number), 'X-Vexo-Transport': transport},
+    async with session.ws_connect('http://127.0.0.1:8797/v1/listen?encoding=linear16&sample_rate=16000&channels=1',
+            headers={'Authorization': 'Bearer ' + token, 'X-Audio-Source': 'omi_ble' if device_id else 'vexo', 'X-Omi-Device': device_id or '', 'X-Vexo-Band': str(band_number), 'X-Vexo-Transport': transport},
             heartbeat=20) as ws:
         async def receive_results():
             async for _ in ws:
@@ -117,15 +120,19 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
         band = None
         worker = None
         try:
-            band = await asyncio.to_thread(Band.connect, band_number, transport=transport, **options)
-            if band.number != band_number:
+            if device_id:
+                from omi_device import OmiBand
+                band = await asyncio.to_thread(OmiBand.connect, device_id)
+            else:
+                band = await asyncio.to_thread(Band.connect, band_number, transport=transport, **options)
+            if not device_id and band.number != band_number:
                 raise Discontinuity('wrong_band')
             band.on('audio', on_audio)
             band.on('disconnect', lambda _: None if closing.is_set() else fail('device_disconnected'))
             band.on('stream-taken', lambda _: fail('source_taken'))
             worker = threading.Thread(target=decode)
             worker.start()
-            print(f'MICROPHONE ON: Vexo-HACK-{band_number:02}; audio goes to the selected bridge recognizer.', flush=True)
+            print('MICROPHONE ON:', ('Omi '+device_id+' '+str(band.info)) if device_id else f'Vexo-HACK-{band_number:02}', '; audio goes to the selected bridge recognizer.',flush=True)
             await asyncio.to_thread(band.configure, audio=True)
             deadline = time.monotonic()
             last = deadline
@@ -145,9 +152,14 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
                 await asyncio.wait_for(ws.send_bytes(raw), 2)
                 stats['sent_samples'] += len(raw)//2
                 if time.monotonic() - report_at >= 1:
+                    if device_id:stats.update(band.loss_counters)
                     await ws.send_json({'type': 'SourceStatus', 'counters': stats})
                     report_at = time.monotonic()
-                deadline = max(deadline + len(raw)/32000, time.monotonic())
+                # BLE arrives in bursts. Allow at most 20% catch-up once more than
+                # five Omi frames wait; retain every PCM sample and all source counters.
+                # Otherwise strict nominal pacing can leave a persistent queue behind.
+                pace = 1.2 if device_id and pcm.qsize() > 5 else 1.0
+                deadline = max(deadline + len(raw)/32000/pace, time.monotonic())
             if failed.is_set():
                 raise Discontinuity(reason[0])
         finally:
@@ -172,6 +184,7 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
                     await asyncio.sleep(len(raw)/32000)
                     await asyncio.wait_for(ws.send_bytes(raw), 2)
                     stats['sent_samples'] += len(raw)//2
+            if device_id:stats.update(band.loss_counters)
             if stop.is_set() and not failed.is_set():
                 tail = decoder.flush()
                 if tail:
@@ -188,10 +201,10 @@ async def capture(session, env, stop, band_number, stats, transport="serial"):
                 await asyncio.gather(receiver, return_exceptions=True)
             if ws.close_code != 1000:
                 raise Discontinuity('bridge_drain_unconfirmed')
-            print('MICROPHONE OFF; bridge drain completed.', flush=True)
+            print('MAC CAPTURE STOPPED; Bluetooth disconnected and bridge drained.' if device_id else 'MICROPHONE OFF; bridge drain completed.',flush=True)
 
 
-async def run(number, transport="serial"):
+async def run(number, transport="serial", device_id=None):
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
@@ -202,7 +215,7 @@ async def run(number, transport="serial"):
         while not stop.is_set():
             stats['sessions'] += 1
             try:
-                await capture(session, env, stop, number, stats, transport)
+                await capture(session, env, stop, number, stats, transport, device_id)
             except Exception as error:
                 # No provider bodies, tokens or microphone content in diagnostics.
                 print('Source session ended:', str(error) if isinstance(error, Discontinuity) else type(error).__name__, flush=True)
@@ -215,10 +228,11 @@ async def run(number, transport="serial"):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--band', type=int, choices=(VEXO_BAND,), required=True)
+    parser.add_argument('--band', type=int, choices=(VEXO_BAND,), default=VEXO_BAND)
+    parser.add_argument('--device')
     parser.add_argument("--transport", choices=("serial", "ble"), default="serial")
     args = parser.parse_args()
     (ROOT/'logs').mkdir(exist_ok=True)
-    with (ROOT/'logs/vexo-source.lock').open('w') as lock:
+    with (ROOT/'logs/omi-device-source.lock' if args.device else ROOT/'logs/vexo-source.lock').open('w') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        asyncio.run(run(args.band, args.transport))
+        asyncio.run(run(args.band, 'ble' if args.device else args.transport, args.device))

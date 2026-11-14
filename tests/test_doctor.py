@@ -222,7 +222,7 @@ class DoctorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 doctor.live_health()
             proxy.assert_called_once_with({})
-            opener.open.assert_called_once_with("http://127.0.0.1:8788/health", timeout=3)
+            opener.open.assert_called_once_with("http://127.0.0.1:8798/health", timeout=3)
             response.read.assert_called_once_with(65537)
 
     def test_probe_reads_metadata_without_importing_packages(self):

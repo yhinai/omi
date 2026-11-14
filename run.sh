@@ -135,7 +135,7 @@ import sys
 import urllib.request
 try:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    with opener.open("http://127.0.0.1:8788/health", timeout=0.5) as response:
+    with opener.open("http://127.0.0.1:8798/health", timeout=0.5) as response:
         health = json.load(response)
     healthy = (health.get("pid") == int(sys.argv[1]) and health.get("status") == "ok"
                and str(health.get("python_version", "")).startswith("3.15."))
@@ -148,7 +148,7 @@ PY
 check_ports() {
   local allowed_pid="${1:-}" port listener listeners
   command -v lsof >/dev/null || { echo "lsof is required to check bridge ports safely." >&2; return 1; }
-  for port in 8787 8788; do
+  for port in 8797 8798; do
     listeners="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)"
     for listener in $listeners; do
       if [ "$listener" != "$allowed_pid" ]; then
@@ -304,7 +304,7 @@ for _ in {1..30}; do
   if health_matches "$PID"; then
     echo "Omi bridge started and healthy (PID $PID)."
     echo "Runtime:        $RUNTIME_INFO"
-    echo "Health:         http://127.0.0.1:8788/health"
+    echo "Health:         http://127.0.0.1:8798/health"
     echo "Transcript events: $DIR/logs/omi_transcript_events.jsonl"
     echo "Bridge log:     $DIR/logs/omi_bridge.log"
     echo "Console log:    $CONSOLE_LOG"

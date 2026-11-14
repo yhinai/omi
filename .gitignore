@@ -20,3 +20,5 @@ docs/evidence/*.json
 !docs/evidence/pipecat-whisper-fallback.json
 
 .venv-vexo/
+
+.venv-capture/
