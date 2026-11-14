@@ -89,9 +89,11 @@ def key_from_file(path):
     raise ValueError('No Gemini key found; no request sent')
 
 
-def decide(key, text):
+def decide(key, text, *, criteria=None, instructions=None):
+    criteria = CRITERIA if criteria is None else criteria
+    instructions = INSTRUCTIONS if instructions is None else instructions
     payload=dict(model=MODEL,input=text,questions=dict(movement=dict(type='choice',
-        instructions=INSTRUCTIONS,criteria=CRITERIA)))
+        instructions=instructions,criteria=criteria)))
     request=urllib.request.Request(ENDPOINT,data=json.dumps(payload).encode(),
         headers={'x-goog-api-key':key,'Content-Type':'application/json'})
     start=time.monotonic()
@@ -104,9 +106,9 @@ def decide(key, text):
     elapsed=1000*(time.monotonic()-start)
     answer=result.get('answers',{}).get('movement',{})
     choice=answer.get('choice');confidence=answer.get('confidence');probabilities=answer.get('probabilities')
-    if (choice not in CRITERIA or not isinstance(confidence,(int,float)) or isinstance(confidence,bool)
+    if (choice not in criteria or not isinstance(confidence,(int,float)) or isinstance(confidence,bool)
             or not math.isfinite(confidence) or not 0<=confidence<=1 or not isinstance(probabilities,dict)
-            or set(probabilities)!=set(CRITERIA)
+            or set(probabilities)!=set(criteria)
             or any(not isinstance(p,(int,float)) or isinstance(p,bool) or not math.isfinite(p) or not 0<=p<=1
                    for p in probabilities.values()) or abs(sum(probabilities.values())-1)>.01):
         raise RuntimeError('Invalid Gemini decision response; no action available')

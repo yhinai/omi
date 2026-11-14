@@ -2,6 +2,8 @@
 
 Checked on this Mac on 14 November 2026. This is an account-access check and a small recorded-data experiment, not a production gesture-accuracy claim.
 
+**Current live experiment:** the user requested reference-free classification after this benchmark. [The raw live preview](GEMINI_RAW_LIVE.md) sends all received six-axis samples in each window directly to Gemini, without reading this calibration. The reference-backed results below are historical comparisons, not a required input or an endorsement of that calibration's correctness.
+
 ## Model discovery and access
 
 The credential supplied by the user was read from its existing private environment file, using only the Google/Gemini key variable. It was sent in the official API header, never printed or copied into project configuration. The paginated `v1beta/models` endpoint returned **64 models**. The complete private inventory is `logs/gemini-models-20261114.md`, with JSON metadata beside it.
