@@ -1,0 +1,3 @@
+[submodule "vendor/vexo-open-kit"]
+	path = vendor/vexo-open-kit
+	url = https://github.com/VexoAI-Org/vexo-open-kit.git

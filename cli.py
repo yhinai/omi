@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 import sys
 
+from config import VEXO_BAND
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -36,6 +38,7 @@ def status_report():
         age = health.get("last_transcript_age_sec")
         pid = health.get("pid")
         return {"service": "healthy" if healthy else "degraded", "pid": pid if isinstance(pid, int) and not isinstance(pid, bool) else None,
+                "source": health.get("source_identity"), "source_loss": health.get("source_loss", {}),
                 "backend": backend, "phone": "connected" if phone else "disconnected",
                 "pipeline": health.get("stt_pipeline") if health.get("stt_pipeline") in {"direct", "pipecat", "local"}
                             else "direct" if backend == "deepgram" else "local",
@@ -61,6 +64,10 @@ def main(argv=None):
                             ("captions", "Open the terminal viewer"),
                             ("verify", "Observe new live captions and optionally a specific test phrase")):
         commands.add_parser(name, help=help_text, add_help=False)
+    source = commands.add_parser("source", help="Run a wearable input in the foreground; Ctrl+C drains")
+    source.add_argument("name", choices=("vexo",))
+    source.add_argument("--band", type=int, choices=(VEXO_BAND,), required=True)
+    source.add_argument("--transport", choices=("serial",), default="serial")
     dev = commands.add_parser("dev", help="Explicit development, demo and diagnostic tools")
     dev.add_argument("tool", choices=("test", "smoke", "benchmark", "faults", "demo", "capture"))
     args, extra = parser.parse_known_args(argv)
@@ -74,11 +81,15 @@ def main(argv=None):
         else:
             for key, value in report.items():
                 if value is not None:
-                    print(f"{key.replace('_', ' ').capitalize()}: {value}")
+                    label = "Input connection" if key == "phone" else key.replace("_", " ").capitalize()
+                    print(f"{label}: {value}")
             if report["service"] == "healthy":
                 print("Service health does not establish microphone quality or recognition accuracy.")
         return 0 if report["service"] == "healthy" else 1
-    if args.command in {"start", "stop", "restart"}:
+    if args.command == "source":
+        executable = str(ROOT / ".venv-vexo/bin/python")
+        arguments = [str(ROOT / "vexo_source.py"), "--band", str(args.band)]
+    elif args.command in {"start", "stop", "restart"}:
         executable, arguments = str(ROOT / "run.sh"), [args.command]
     else:
         executable = sys.executable

@@ -18,3 +18,5 @@ node_modules/
 docs/evidence/*.json
 !docs/evidence/pipecat-smoke.json
 !docs/evidence/pipecat-whisper-fallback.json
+
+.venv-vexo/

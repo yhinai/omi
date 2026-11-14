@@ -57,3 +57,5 @@ To test Pipecat without interrupting the live stream, install its optional Pytho
 This sends synthesized test audio through a real Pipecat pipeline and Deepgram on temporary ports, verifies saved output and reports actual frame counts/provenance. It does not switch or restart the running service.
 
 [Operations](docs/OPERATIONS.md) covers use and recovery. [Architecture](docs/ARCHITECTURE.md) defines ownership and guarantees. [Recovery archive](docs/archive/README.md) preserves retired research, experiments and the hackathon packet; [evidence](docs/evidence/README.md) records verification scope and limits.
+
+For Vexo band 43 over USB, see [Vexo setup and operation](docs/VEXO.md).

@@ -35,7 +35,7 @@ if __name__ == "__main__":
 import aiohttp
 from aiohttp import web
 
-from config import load_env
+from config import load_env, VEXO_BAND
 from backend_settings import DeepgramConfig, TranscriptionBackend
 from diagnostics import AudioCapture
 from storage import TranscriptStore, DailyNotes
@@ -147,7 +147,7 @@ def new_metrics():
         "lost_audio_sec_failed": 0.0, "lost_audio_sec_stale": 0.0,
         "lost_audio_sec_queue_evicted": 0.0,
         "output_errors": 0, "last_output_error": None,
-        "audio_source": None, "direct_ws_remote": None, "direct_ws_packets": 0,
+        "source_identity": None, "source_loss": {}, "audio_source": None, "direct_ws_remote": None, "direct_ws_packets": 0,
         "session_started_at": None, "session_ended_at": None, "stream_audio_bytes": 0,
     }
 
@@ -170,6 +170,7 @@ class BridgeState:
         on_commit=lambda event: publish_saved(event),
         on_error=lambda target, error: output_failed(target, error),
         on_recovered=lambda: state.metrics.update(last_output_error=None)))
+    source_sessions: dict = field(default_factory=dict)
     caption_listeners: dict = field(default_factory=dict)
     caption_admission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stream_clients: dict = field(default_factory=dict)
@@ -406,6 +407,9 @@ def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=N
             "processed_at": processed_at, "session_id": session_id, "sample_offset": sample_offset,
             "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time",
             "stt_backend": STT_BACKEND, "model": MODEL_LABEL}
+    source = state.source_sessions.get(session_id)
+    if source is not None:
+        event["source"] = dict(source)
     if recognition is not None:
         event["recognition"] = recognition
     if utterance_id is not None:
@@ -512,7 +516,7 @@ def build_health_dict():
         "direct_ws_connected": bool(state.stream_clients),
         "caption_clients": len(state.caption_listeners), "caption_client_limit": MAX_CAPTION_CLIENTS,
         **{key: state.metrics[key] for key in ("utterances_processed", "audio_gaps", "queue_evictions", "last_error",
-                                        "transcripts_emitted", "audio_source", "direct_ws_remote",
+                                        "transcripts_emitted", "audio_source", "source_identity", "source_loss", "direct_ws_remote",
                                         "direct_ws_packets")},
     }
 
@@ -564,6 +568,14 @@ async def handle_omi_ws(request):
         raise web.HTTPBadRequest(text="sample_rate=16000 and channels=1 required")
     if sr != SAMPLE_RATE or channels != 1:
         raise web.HTTPBadRequest(text="sample_rate=16000 and channels=1 required")
+    source_kind = request.headers.get("X-Audio-Source", "omi")
+    if source_kind not in {"omi", "vexo"}:
+        raise web.HTTPBadRequest(text="Unknown audio source")
+    source = {"kind": source_kind}
+    if source_kind == "vexo":
+        if request.headers.get("X-Vexo-Band") != str(VEXO_BAND):
+            raise web.HTTPBadRequest(text="Expected Vexo band 43")
+        source.update(band=VEXO_BAND, name=f"Vexo-HACK-{VEXO_BAND:02}", transport="serial")
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=MAX_INPUT_BYTES + 1)
     queue = asyncio.Queue(maxsize=32)
     # Serialize admission across the handshake so concurrent attempts cannot
@@ -571,7 +583,7 @@ async def handle_omi_ws(request):
     async with state.stream_admission_lock:
         if state.stopping:
             raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
-        if state.stream_clients and remote_ip != state.metrics.get("direct_ws_remote"):
+        if state.stream_clients and (source_kind == "vexo" or state.metrics.get("audio_source") == "vexo" or remote_ip != state.metrics.get("direct_ws_remote")):
             raise web.HTTPConflict(text="Another direct audio stream is already active")
         await ws.prepare(request)
         if state.stopping:
@@ -583,13 +595,15 @@ async def handle_omi_ws(request):
         start_sample = state.live_stt.total_input_samples if state.live_stt is not None else 0
         if state.live_stt is not None:
             state.live_stt.new_session()
+            state.source_sessions[state.live_stt.session_id] = dict(source)
+        state.metrics["source_identity"] = dict(source)
         state.metrics["session_started_at"] = time.monotonic()
         state.metrics["session_ended_at"] = None
         state.metrics["stream_audio_bytes"] = 0
         state.audio_quality = AudioQualityMeter()
         state.stream_clients[ws] = PhoneStream(queue, start_sample)
         state.metrics["direct_ws_remote"] = remote_ip
-        state.metrics["audio_source"] = "direct_ws"
+        state.metrics["audio_source"] = "vexo" if source_kind == "vexo" else "direct_ws"
     logger.info("Direct phone WebSocket connected from %s", remote_ip)
 
     async def sender():
@@ -603,6 +617,7 @@ async def handle_omi_ws(request):
             pass
 
     task = asyncio.create_task(sender())
+    source_closed_cleanly = False
     try:
         async for message in ws:
             # A replaced socket may still have buffered frames while close is
@@ -616,14 +631,28 @@ async def handle_omi_ws(request):
                     break
                 state.metrics["direct_ws_packets"] += 1
                 state.metrics["stream_audio_bytes"] += len(raw)
-                state.metrics["audio_source"] = "direct_ws"
+                state.metrics["audio_source"] = "vexo" if source_kind == "vexo" else "direct_ws"
                 ingest_raw_pcm(raw, sr)
+                if state.live_stt is not None:
+                    state.source_sessions[state.live_stt.session_id] = dict(source)
             elif message.type == aiohttp.WSMsgType.TEXT:
                 try:
                     ctrl = json.loads(message.data)
                 except ValueError:
                     continue
+                if source_kind == "vexo" and isinstance(ctrl, dict) and ctrl.get("type") == "SourceStatus":
+                    counters = ctrl.get("counters", {})
+                    if not isinstance(counters, dict):
+                        continue
+                    state.metrics["source_loss"] = {k: v for k, v in counters.items()
+                        if k in {"lost_packets", "old_packets", "queue_overflows", "discarded_packets", "corrupt_packets"}
+                        and isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2**53}
+                    if ctrl.get("discontinuity"):
+                        # Unknown duration is explicit; never invent received samples.
+                        write_event(make_event("source-discontinuity", "[Vexo source session interrupted]",
+                            session_id=state.live_stt.session_id if state.live_stt else None))
                 if isinstance(ctrl, dict) and ctrl.get("type") == "CloseStream":
+                    source_closed_cleanly = True
                     if state.live_stt is not None:
                         completed = await state.live_stt.flush_now()
                         if completed is False:
@@ -634,6 +663,9 @@ async def handle_omi_ws(request):
                 break
     finally:
         active = state.stream_clients.pop(ws, None) is not None
+        if active and source_kind == "vexo" and not source_closed_cleanly and not state.stopping:
+            write_event(make_event("source-discontinuity", "[Vexo input connection lost]",
+                session_id=state.live_stt.session_id if state.live_stt else None))
         if active and state.metrics["session_started_at"] is not None:
             state.metrics["session_ended_at"] = time.monotonic()
             if state.live_stt is not None and not state.stopping:
@@ -714,6 +746,7 @@ async def handle_listen(request):
             await ws.close()
 
     task = asyncio.create_task(sender())
+    source_closed_cleanly = False
     try:
         async for _ in ws:
             pass

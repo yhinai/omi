@@ -5,6 +5,7 @@ import re
 import shlex
 
 ROOT = Path(__file__).resolve().parent
+VEXO_BAND = 43
 
 
 def read_env_file(path):
