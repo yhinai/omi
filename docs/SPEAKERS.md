@@ -103,13 +103,22 @@ The wearer has not been enrolled or measured by these synthetic tests.
 
 ## Caption layout
 
-The terminal viewer places anonymous `Speaker N` in the left gutter immediately before
-the existing recording timestamp; timestamp and transcript columns stay fixed. It splits
-multi-speaker finals into separate display turns and can join adjacent chunks of the same
-scoped speaker. It does not insert bracketed speaker tags into sentence text or attach
-an unattributed partial to the preceding labeled speaker. Session export/bookmarks retain
-speaker-before-time formatting. In a narrow window, `S1` may replace `Speaker 1` so the
-timestamp column stays fixed.
+The terminal viewer uses a separate header for each speaker turn:
+
+```text
+12:00:00  Speaker 1
+          Demo's in prison.
+
+12:00:03  Speaker 2
+          Another reply.
+```
+
+The recording timestamp keeps its existing horizontal position. The speaker starts
+at the transcript column, with the spoken text directly below and a blank line
+between turns. The viewer splits multi-speaker finals into separate display turns
+and can join adjacent chunks of the same scoped speaker. It does not insert bracketed
+speaker tags into sentence text or attach an unattributed partial to the preceding
+labeled speaker. Session export/bookmarks retain the timestamp/speaker header layout.
 
 These labels are anonymous provider groups, not verified identities. Local verification
 uncertainty remains in the saved metadata; the reading margin omits the repeated

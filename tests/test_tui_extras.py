@@ -838,20 +838,23 @@ class SpeakerGutterTests(unittest.TestCase):
             speaker_turns=[dict(speaker_id=0,speaker_key='epoch:0',text='First voice.',sample_offset=0,sample_end_offset=16000,voice_identity={'status':'uncertain'}),
                            dict(speaker_id=1,speaker_key='epoch:1',text='Second voice.',sample_offset=16000,sample_end_offset=32000)])
 
-    def test_labels_precede_fixed_timestamp_and_never_enter_sentence_text(self):
+    def test_speaker_header_keeps_timestamp_column_and_indents_body_below(self):
         viewer=tui.Viewer(connected=True);viewer.add(self.speaker_event())
         screen=Screen(26,100)
         with mock.patch.object(tui.curses,'doupdate'),mock.patch.object(tui,'battery_label',return_value=''):
             tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
         _,left,_,_=tui.geometry(26,100)
         for caption in viewer.captions:
-            line=next(''.join(row) for row in screen.lines if caption.text in ''.join(row))
-            self.assertEqual(line.index(caption.timestamp),left-10)
-            self.assertEqual(line.index(caption.text),left)
-            self.assertLess(line.index(caption.speaker_label),left-10)
-            self.assertNotIn('uncertain',line);self.assertNotIn('[Speaker',line)
+            y=next(y for y,row in enumerate(screen.lines) if caption.speaker_label in ''.join(row))
+            header=''.join(screen.lines[y]);body=''.join(screen.lines[y+1])
+            self.assertEqual(header.index(caption.timestamp),left-10)
+            self.assertEqual(header.index(caption.speaker_label),left)
+            self.assertEqual(body.index(caption.text),left)
+            self.assertFalse(''.join(screen.lines[y+2]).strip())
+            self.assertNotIn('uncertain',header);self.assertNotIn('[Speaker',header)
         self.assertEqual(viewer.last_event_id,'original')
         viewer.add(self.speaker_event());self.assertEqual(len(viewer.captions),2)
+        self.assertIn('Speaker 1\n          First voice.',tui.session_text(viewer))
 
     def test_adjacent_same_speaker_chunks_join_and_different_speakers_do_not(self):
         viewer=tui.Viewer();e=self.speaker_event();e['speaker_turns']=e['speaker_turns'][:1]
@@ -868,11 +871,13 @@ class SpeakerGutterTests(unittest.TestCase):
         viewer.add(event('Provisional words',type='partial',stream_id='stream',utterance_id='draft'))
         self.assertNotEqual(viewer.draft_target_key,viewer.captions[-1].key)
 
-    def test_small_window_keeps_timestamp_column_and_compacts_speaker(self):
+    def test_small_window_keeps_timestamp_column_and_full_speaker_header(self):
         viewer=tui.Viewer();viewer.add(self.speaker_event())
         screen=Screen(12,40)
         with mock.patch.object(tui.curses,'doupdate'):
             tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
-        line=next(''.join(row) for row in screen.lines if 'First voice.' in ''.join(row))
-        self.assertEqual(line.index(viewer.captions[0].timestamp),3)
-        self.assertTrue(line.startswith('S1 '))
+        y=next(y for y,row in enumerate(screen.lines) if 'Speaker 1' in ''.join(row))
+        header=''.join(screen.lines[y]);body=''.join(screen.lines[y+1])
+        self.assertEqual(header.index(viewer.captions[0].timestamp),3)
+        self.assertEqual(header.index('Speaker 1'),13)
+        self.assertEqual(body.index('First voice.'),13)

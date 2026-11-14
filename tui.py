@@ -192,6 +192,7 @@ class Row:
     timestamp: str = ""
     bookmarked: bool = False
     speaker_label: str = ""
+    speaker_header: bool = False
 
 
 @dataclass
@@ -595,16 +596,18 @@ def rows_for(viewer, width):
             full_text = text
         lines = wrap(full_text, width) if draft_start is not None else cached_lines(caption, width)
         is_bookmarked = caption.key in viewer.bookmarks
+        if caption.speaker_label:
+            rows.append(Row(caption.key,0,"","muted",timestamp=caption.timestamp if viewer.show_times else "",
+                            bookmarked=is_bookmarked,speaker_label=caption.speaker_label,speaker_header=True))
         for line in lines:
             offset = full_text.find(line, offset)
             muted = caption.kind == "gap" or (viewer.focus and caption.key != focused) or (draft_start is not None and offset >= draft_start)
             soft = caption.soft_from if not muted and draft_start is None and now < caption.soft_until else None
             if not muted and draft_start is not None and offset + len(line) > draft_start:
                 soft = draft_start
-            stamp = caption.timestamp if viewer.show_times and (caption.show_stamp or is_bookmarked) and offset == 0 else ""
+            stamp = caption.timestamp if not caption.speaker_label and viewer.show_times and (caption.show_stamp or is_bookmarked) and offset == 0 else ""
             rows.append(Row(caption.key, offset, line, "muted" if muted else "text", soft,
-                            timestamp=stamp, bookmarked=is_bookmarked and offset == 0,
-                            speaker_label=caption.speaker_label if offset == 0 else ""))
+                            timestamp=stamp, bookmarked=is_bookmarked and offset == 0 and not caption.speaker_label))
             offset += len(line)
         rows.append(Row(caption.key, len(full_text) + 1, ""))
     if viewer.draft and not draft_inlined:
@@ -725,7 +728,7 @@ def jump_bookmark(viewer, rows, available, backwards=False):
 
 def caption_text(caption, stamp=False):
     if caption.speaker_label:
-        return f"{caption.speaker_label} {caption.timestamp} {caption.text}"
+        return f"{caption.timestamp}  {caption.speaker_label}\n          {caption.text}"
     return f"[{caption.timestamp}] {caption.text}" if stamp else caption.text
 
 
@@ -1393,13 +1396,9 @@ def paint(screen, viewer, palette, measure: int | None = READING_MEASURE):
                         put(screen, y, left - (12 if left >= 12 else 10), mark, palette["accent"])
                     else:
                         put(screen, y, left - 10, row.timestamp, palette["muted"])
-                if row.speaker_label and row.timestamp:
-                    end=max(0,left-(13 if row.bookmarked else 11))
-                    label=row.speaker_label
-                    if cells(label)>end:
-                        label='S'+label.split()[-1] if label.split()[-1].isdigit() else '?'
-                    label=fit(label,end)
-                    if label:put(screen,y,end-cells(label),label,palette['muted'],reserve=0)
+                if row.speaker_header:
+                    put(screen,y,left,row.speaker_label,palette['muted'])
+                    continue
                 put(screen, y, left, row.text, palette[row.style])
                 if row.soft_from is not None:
                     start_soft = max(0, row.soft_from - row.offset)
