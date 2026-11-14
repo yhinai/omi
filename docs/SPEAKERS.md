@@ -116,10 +116,11 @@ recording timestamp beside the spoken text in its original column:
 ```
 
 From the first partial, the speaker row is already reserved but blank. Confirmation
-fills that row instead of moving the sentence. Provisional continuation text flows
-in muted style after the preceding turn; it remains unconfirmed until a final arrives.
-A final with the same scoped speaker joins the existing sentence. A confirmed different
-speaker starts a separate block. Two blank lines separate turns, and the original
+fills that row instead of moving the sentence. A new segment without a speaker ID
+starts its own block, with a blank speaker row, instead of borrowing the previous
+speaker. When identified, it stays in that block. A provisional segment can continue
+the preceding turn only when it already carries the same scoped speaker ID; a
+different ID starts a separate block immediately. Two blank lines separate turns, and the original
 recording-start timestamp is retained. Session export/bookmarks use the same layout.
 No bracketed speaker tags are inserted into sentence text.
 

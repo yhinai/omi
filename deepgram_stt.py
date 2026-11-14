@@ -29,6 +29,15 @@ MAX_PENDING_FINALS = 128
 DRAIN_TIMEOUT = 15.0
 RECONNECT_INITIAL_SECONDS = 1.0
 PROVIDER_CODES = {"DATA-0000", "NET-0000", "NET-0001", "NET-0002"}
+RESULT_FAILURES = {
+    "Invalid Deepgram result timing": "invalid_result_timing",
+    "Deepgram result outside source timeline": "result_outside_timeline",
+    "Deepgram word outside source timeline": "word_outside_timeline",
+    "Deepgram result did not match retained source audio": "missing_source_audio",
+    "Invalid Deepgram transcript": "invalid_transcript",
+    "Invalid Deepgram word": "invalid_word",
+    "Overlapping Deepgram text requires word timing": "overlap_without_word_timing",
+}
 
 
 @dataclass
@@ -602,6 +611,7 @@ class DeepgramSTT:
                         continue
                     try:
                         self._connecting = True
+                        progress = (self.partial_updates, self.final_count)
                         await self._epoch(session)
                         delay = RECONNECT_INITIAL_SECONDS
                     except asyncio.CancelledError:
@@ -609,13 +619,19 @@ class DeepgramSTT:
                     except Exception as error:
                         self._connecting = False
                         self._retrying = True
+                        if progress != (self.partial_updates, self.final_count):
+                            # A productive connection breaks the sequence of failed
+                            # attempts. Occasional interruptions must not inherit a
+                            # 15-second retry from earlier, recovered failures.
+                            delay = RECONNECT_INITIAL_SECONDS
                         # Exception messages and provider payloads may contain secrets/text.
                         status = error.status if isinstance(error, aiohttp.WSServerHandshakeError) and error.status in {
                             400, 401, 402, 403, 408, 413, 429, 500, 502, 503, 504} else None
                         code = getattr(error, "provider_code", None)
                         code = code if isinstance(code, str) and code in PROVIDER_CODES else None
-                        logger.warning("Deepgram stream failure: %s; http_status=%s; provider_code=%s",
-                                       type(error).__name__, status, code)
+                        reason = RESULT_FAILURES.get(str(error)) if isinstance(error, ValueError) else None
+                        logger.warning("Deepgram stream failure: %s; http_status=%s; provider_code=%s; reason=%s",
+                                       type(error).__name__, status, code, reason)
                         self.on_connection(False, type(error).__name__ + (f": HTTP {status}" if status else "")
                                            + (f": {code}" if code else ""))
                         self.reconnects += 1

@@ -552,6 +552,53 @@ class DeepgramTests(unittest.IsolatedAsyncioTestCase):
         self.connection.assert_called_with(False, "WSServerHandshakeError: HTTP 401")
         self.assertEqual(stream.connection_state, "reconnecting")
 
+    async def test_result_failure_logs_only_allowlisted_reason(self):
+        for message, expected in (("Deepgram word outside source timeline", "word_outside_timeline"),
+                                  ("private speech and synthetic-private-key", "None")):
+            with self.subTest(message=expected):
+                stream = self.make([Socket()])
+                with mock.patch.object(stream, "_epoch", side_effect=ValueError(message)):
+                    with self.assertLogs("bridge", level="WARNING") as logs:
+                        self.feed()
+                        await until(lambda: stream.reconnects == 1)
+                output = " ".join(logs.output)
+                self.assertIn("reason=" + expected, output)
+                self.assertNotIn("private speech", output)
+                self.assertNotIn("synthetic-private-key", output)
+                await self.stop()
+
+    async def test_successful_recognition_resets_reconnect_wait(self):
+        for productive, expected in ((False, [1, 2, 4]), (True, [1, 1, 1])):
+            with self.subTest(productive=productive):
+                stream = self.make()
+                waits = []
+                attempts = 0
+                original_wait_for = asyncio.wait_for
+
+                async def fail_epoch(session):
+                    nonlocal attempts
+                    attempts += 1
+                    if attempts == 4:
+                        stream.stopping = True
+                    if productive:
+                        stream.partial_updates += 1
+                    raise ConnectionError("synthetic interruption")
+
+                async def fast_wait(awaitable, timeout):
+                    if (getattr(awaitable, "cr_frame", None) is not None
+                            and awaitable.cr_frame.f_locals.get("self") is stream.stop_event):
+                        waits.append(timeout)
+                        awaitable.close()
+                        raise TimeoutError
+                    return await original_wait_for(awaitable, timeout)
+
+                with mock.patch.object(stream, "_epoch", side_effect=fail_epoch), \
+                        mock.patch.object(asyncio, "wait_for", side_effect=fast_wait):
+                    self.feed()
+                    with self.assertLogs("bridge", level="WARNING"):
+                        await self.task
+                self.assertEqual(waits, expected)
+
     async def test_constructor_rejects_unsupported_model_language_and_invalid_policy(self):
         for settings in ({"language": "ar"}, {"model": "nova-2"}, {"endpointing_ms": 0},
                          {"endpointing_ms": True}, {"diarize": "true"}, {"max_age": float("nan")}):

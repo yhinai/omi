@@ -210,6 +210,8 @@ class Viewer:
     draft_source_at: float | None = None
     draft_timestamp: str = ""
     draft_target_key: int | None = None
+    draft_speaker_label: str = ""
+    draft_speaker_key: object = None
     finalized: deque = field(default_factory=lambda: deque(maxlen=200))
     following: bool = True
     anchor: tuple[int, int] | None = None
@@ -273,6 +275,7 @@ class Viewer:
     def clear_draft(self):
         self.draft, self.draft_identity, self.draft_revision = "", None, 0
         self.draft_source_at, self.draft_timestamp, self.draft_target_key = None, "", None
+        self.draft_speaker_label, self.draft_speaker_key = "", None
 
     def add(self, event):
         turns = event.get('speaker_turns') if isinstance(event,dict) else None
@@ -388,6 +391,17 @@ class Viewer:
                     or (not text and identity != self.draft_identity)
                     or (identity == self.draft_identity and text and revision and revision <= self.draft_revision)):
                 return
+            speaker_label, speaker_key = "", None
+            partial_turns = event.get('speaker_turns')
+            if isinstance(partial_turns,list) and partial_turns:
+                candidates=[t for t in partial_turns if isinstance(t,dict)]
+                ids={t.get('speaker_id') for t in candidates if isinstance(t.get('speaker_id'),int) and not isinstance(t.get('speaker_id'),bool) and t['speaker_id']>=0}
+                if len(ids)==1 and len(candidates)==len(partial_turns) and all(t.get('speaker_id') in ids for t in candidates):
+                    number=next(iter(ids));speaker_label=f'Speaker {number+1}'
+                    speaker_key=(candidates[0].get('speaker_key'),number)
+            if (self.draft and identity==self.draft_identity and speaker_key is not None
+                    and self.draft_speaker_key is not None and speaker_key!=self.draft_speaker_key):
+                self.next_key+=1;self.draft_target_key=self.next_key
             if text and (not self.draft or identity != self.draft_identity):
                 source = event.get("audio_start_at")
                 self.draft_source_at = (source if isinstance(source, (int, float))
@@ -402,6 +416,7 @@ class Viewer:
                 previous = self.captions[-1] if self.captions else None
                 same_session = bool(previous is not None and session is not None and session == previous.session)
                 continuous = (previous is not None and previous.kind == "transcript"
+                    and (not self.turn_headers or (speaker_key is not None and speaker_key == previous.speaker_key))
                     and (session is None or session == previous.session)
                     and within_paragraph(self.draft_source_at, previous, DRAFT_NO_TIMING_SEC,
                                          speech_start_offset=event.get("speech_start_offset"),
@@ -413,6 +428,7 @@ class Viewer:
                 else:
                     self.next_key += 1
                     self.draft_target_key = self.next_key
+            self.draft_speaker_label,self.draft_speaker_key=speaker_label,speaker_key
             self.draft = text
             self.draft_identity = identity if text else None
             self.draft_revision = revision if text else 0
@@ -475,7 +491,7 @@ class Viewer:
                                            same_session=same_session))
         reserved_key = None
         if matching_draft:
-            continuous = continuous or (previous is not None and previous.key == self.draft_target_key)
+            continuous = previous is not None and previous.key == self.draft_target_key
             if not continuous:
                 reserved_key = self.draft_target_key
                 stamp = self.draft_timestamp
@@ -616,7 +632,7 @@ def rows_for(viewer, width):
             rows.append(Row(caption.key, len(full_text) + 2, ""))
     if viewer.draft and not draft_inlined:
         if viewer.turn_headers:
-            rows.append(Row(viewer.draft_target_key,0,"","muted",timestamp="",speaker_header=True))
+            rows.append(Row(viewer.draft_target_key,0,"","muted",timestamp="",speaker_label=viewer.draft_speaker_label,speaker_header=True))
         offset = 0
         for line in wrap(viewer.draft, width):
             offset = viewer.draft.find(line, offset)

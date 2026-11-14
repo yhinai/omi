@@ -909,21 +909,33 @@ class StableSpeakerStreamingTests(unittest.TestCase):
         self.assertEqual(after[0].speaker_label,'Speaker 1')
         self.assertEqual(len(before),len(after))
 
-    def test_partial_tail_and_same_speaker_final_complete_same_sentence(self):
+    def test_unknown_new_segment_is_not_attached_or_moved_after_identification(self):
         viewer=tui.Viewer(turn_headers=True)
         prefix='So what do I do to distinguish between'
         viewer.add(self.draft(prefix));viewer.add(self.final(prefix))
-        key=viewer.captions[-1].key
+        previous_key=viewer.captions[-1].key
         viewer.add(self.draft('the two speakers?',source=102.1,identity='u2',offset=33600))
-        self.assertEqual(viewer.draft_target_key,key)
-        rows=tui.rows_for(viewer,90)
-        self.assertEqual([r.text for r in rows if r.text],[prefix+' the two speakers?'])
+        pending_key=viewer.draft_target_key
+        self.assertNotEqual(pending_key,previous_key)
+        before=tui.rows_for(viewer,90)
+        pending_row=next(i for i,r in enumerate(before) if r.text=='the two speakers?')
+        self.assertEqual(before[pending_row-1].speaker_label,'')
         viewer.add(self.final('the two speakers?',source=102.1,identity='u2',offset=33600,end=64000))
-        self.assertEqual(len(viewer.captions),1)
-        self.assertEqual(viewer.captions[0].key,key)
-        self.assertEqual(viewer.captions[0].text,prefix+' the two speakers?')
-        self.assertEqual(sum(r.speaker_header for r in tui.rows_for(viewer,90)),1)
+        self.assertEqual(len(viewer.captions),2)
+        self.assertEqual(viewer.captions[-1].key,pending_key)
+        after=tui.rows_for(viewer,90)
+        self.assertEqual(next(i for i,r in enumerate(after) if r.text=='the two speakers?'),pending_row)
+        self.assertEqual(after[pending_row-1].speaker_label,'Speaker 1')
         self.assertEqual(viewer.last_event_id,'u2')
+
+    def test_available_partial_speaker_change_starts_a_new_block_immediately(self):
+        viewer=tui.Viewer(turn_headers=True)
+        viewer.add(self.final('First speaker.'))
+        draft=self.draft('Reply.',source=102.1,identity='u2',offset=33600)
+        draft['speaker_turns']=[dict(speaker_id=1,speaker_key='epoch:1',text='Reply.')]
+        viewer.add(draft)
+        self.assertNotEqual(viewer.draft_target_key,viewer.captions[-1].key)
+        self.assertEqual(tui.rows_for(viewer,90)[-4].speaker_label,'Speaker 2')
 
     def test_confirmed_speaker_change_still_starts_a_new_block(self):
         viewer=tui.Viewer(turn_headers=True)
