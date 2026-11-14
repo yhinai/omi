@@ -6,6 +6,7 @@ import struct
 import subprocess
 import sys
 import time
+import tempfile
 import unittest
 from unittest import mock
 
@@ -15,7 +16,7 @@ from aiohttp.test_utils import TestServer
 import tui
 
 
-def event(text, session=1, source=100, **kwargs):
+def event(text, session=1, source: float = 100, **kwargs):
     return {"text": text, "session_id": session, "audio_start_at": source,
             "timestamp": "2026-10-24 12:00:00", **kwargs}
 
@@ -250,10 +251,12 @@ class StreamOrderingTests(unittest.TestCase):
         viewer = tui.Viewer()
         viewer.add(event("Long utterance.", stream_id="s", source=100,
                          sample_offset=0, sample_end_offset=320000))
+        # 1.9 s of real silence: inside the new two-second paragraph boundary, but
+        # 21.9 s from the utterance's start, so this still proves the end is used.
         viewer.add({"type": "partial", "stream_id": "s", "session_id": 1,
-                    "utterance_id": "next", "text": "Continuation", "audio_start_at": 122})
+                    "utterance_id": "next", "text": "Continuation", "audio_start_at": 121.9})
         self.assertEqual(tui.rows_for(viewer, 80)[0].text, "Long utterance. Continuation")
-        viewer.add(event("Continuation", stream_id="s", utterance_id="next", source=122))
+        viewer.add(event("Continuation", stream_id="s", utterance_id="next", source=121.9))
         self.assertEqual(len(viewer.captions), 1)
         self.assertEqual(tui.rows_for(viewer, 80)[0].text, "Long utterance. Continuation")
 
@@ -388,7 +391,7 @@ class LayoutTests(unittest.TestCase):
     def test_wide_layout_has_half_width_transcript_and_equal_margins(self):
         for width in (80, 100, 160, 240):
             column, left, top, available = tui.geometry(40, width)
-            self.assertEqual(column, width // 2)
+            self.assertEqual(column, min(width // 2, tui.READING_MEASURE))
             self.assertLessEqual(abs(left - (width - left - column)), 1)
             self.assertEqual(top + available, 36)
 
@@ -415,7 +418,8 @@ class LayoutTests(unittest.TestCase):
         viewer = tui.Viewer(connected=True)
         viewer.add(event("A calm page of words, with enough room to read."))
         screen = Screen()
-        with mock.patch.object(tui.curses, "doupdate"):
+        with mock.patch.object(tui.curses, "doupdate"), \
+             mock.patch.object(tui, "wall_clock", return_value="00:00:00"):
             tui.paint(screen, viewer, {"text": 0, "muted": 0, "accent": 0})
         self.assertNotIn("omi", screen.text)
         self.assertNotIn("Ready", screen.text)
@@ -439,6 +443,100 @@ class LayoutTests(unittest.TestCase):
 
 
 class ConnectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_caption_token_is_sent_as_a_bearer_header(self):
+        requests = []
+        async def endpoint(request):
+            requests.append((request.headers.get("Authorization"), dict(request.query)))
+            if request.headers.get("Authorization") != "Bearer private-caption-token":
+                raise web.HTTPUnauthorized()
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_json({"type": "transcript", "event_id": "authorized", "text": "Private captions."})
+            async for _ in ws:
+                pass
+            return ws
+
+        app = web.Application()
+        app.router.add_get("/listen", endpoint)
+        server = TestServer(app)
+        await server.start_server()
+        viewer = tui.Viewer()
+        task = asyncio.create_task(tui.receive(viewer,
+            str(server.make_url("/listen")).replace("http://", "ws://"), "private-caption-token"))
+        try:
+            async with asyncio.timeout(2):
+                while not viewer.captions:
+                    await asyncio.sleep(.01)
+            self.assertEqual(viewer.captions[-1].text, "Private captions.")
+            self.assertEqual(requests, [("Bearer private-caption-token", {"replay": "100"})])
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await server.close()
+
+    async def test_repeated_handshake_failures_notify_once_without_leaking_credentials(self):
+        attempts = 0
+        async def endpoint(request):
+            nonlocal attempts
+            attempts += 1
+            raise web.HTTPUnauthorized(text="private error body")
+
+        app = web.Application()
+        app.router.add_get("/listen", endpoint)
+        server = TestServer(app)
+        await server.start_server()
+        viewer = tui.Viewer()
+        task = asyncio.create_task(tui.receive(viewer,
+            str(server.make_url("/listen")).replace("http://", "ws://"), "private-caption-token"))
+        try:
+            with mock.patch.object(viewer, "notify", wraps=viewer.notify) as notify:
+                async with asyncio.timeout(3):
+                    while attempts < 2:
+                        await asyncio.sleep(.01)
+                self.assertEqual(notify.call_count, 1)
+                self.assertEqual(viewer.toast, "Caption access denied · check token")
+                self.assertNotIn("private", viewer.toast)
+                self.assertFalse(viewer.connected)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await server.close()
+
+    async def test_closed_connection_shows_reconnecting_until_useful_data_returns(self):
+        connections = []
+        async def endpoint(request):
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            connections.append(ws)
+            await ws.send_json({"type": "replay", "phase": "start", "reset": False})
+            await ws.send_json({"type": "replay", "phase": "end"})
+            async for _ in ws:
+                pass
+            return ws
+
+        app = web.Application()
+        app.router.add_get("/listen", endpoint)
+        server = TestServer(app)
+        await server.start_server()
+        viewer = tui.Viewer()
+        task = asyncio.create_task(tui.receive(viewer,
+            str(server.make_url("/listen")).replace("http://", "ws://")))
+        try:
+            async with asyncio.timeout(3):
+                while not viewer.replay_supported or viewer.replaying:
+                    await asyncio.sleep(.01)
+                await connections[0].close()
+                while viewer.connected:
+                    await asyncio.sleep(.01)
+                self.assertEqual(viewer.toast, "Reconnecting · waiting for captions")
+                while len(connections) < 2 or viewer.replaying or not viewer.connected:
+                    await asyncio.sleep(.01)
+                self.assertEqual(viewer.toast_until, 0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            await server.close()
+
     async def test_receives_existing_transcripts_without_sending_audio_or_api_calls(self):
         received = []
         async def endpoint(request):
@@ -507,6 +605,66 @@ class ConnectionTests(unittest.IsolatedAsyncioTestCase):
 
 @unittest.skipUnless(os.name == "posix", "The viewer uses POSIX curses terminals")
 class TerminalTests(unittest.TestCase):
+    def test_complex_graphemes_reach_real_terminal_bytes_and_repaint_cleanly(self):
+        import fcntl
+        import pty
+        import select
+        import termios
+        script = r'''
+import curses, locale, tui
+locale.setlocale(locale.LC_ALL, "")
+def show(screen):
+    viewer = tui.Viewer(connected=True)
+    text = "Joined 👨‍👩‍👧 flag 🇩🇪 tone 👋🏽 Persian می\u200cروم."
+    viewer.add({"type": "transcript", "event_id": "one", "text": text})
+    viewer.captions[-1].soft_until = 0
+    key = viewer.captions[-1].key
+    viewer.selection = ((key, len("Joined ")), (key, len("Joined 👨‍👩‍👧")))
+    palette = {"text": 0, "muted": curses.A_DIM, "accent": curses.A_BOLD}
+    tui.paint(screen, viewer, palette)
+    screen.get_wch()
+    viewer.captions.clear()
+    viewer.selection = None
+    viewer.add({"type": "transcript", "event_id": "two", "text": "After complex glyphs"})
+    tui.paint(screen, viewer, palette)
+    screen.get_wch()
+curses.wrapper(show)
+'''
+        master, slave = pty.openpty()
+        process = None
+        try:
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 25, 100, 0, 0))
+            before = termios.tcgetattr(slave)
+            process = subprocess.Popen([sys.executable, "-B", "-c", script],
+                cwd=Path(tui.__file__).resolve().parent, stdin=slave, stdout=slave, stderr=slave,
+                env={**os.environ, "TERM": "xterm-256color"})
+            output, stage = bytearray(), 0
+            deadline = time.monotonic() + 5
+            while process.poll() is None and time.monotonic() < deadline:
+                if select.select([master], [], [], .05)[0]:
+                    output.extend(os.read(master, 65536))
+                if stage == 0 and "👨‍👩‍👧".encode() in output:
+                    os.write(master, b"x")
+                    stage = 1
+                elif stage == 1 and b"After complex glyphs" in output:
+                    os.write(master, b"q")
+                    stage = 2
+            self.assertEqual(stage, 2, output.decode("utf-8", errors="replace"))
+            self.assertEqual(process.poll(), 0, output.decode("utf-8", errors="replace"))
+            for text in ("👨‍👩‍👧", "🇩🇪", "👋🏽", "می\u200cروم"):
+                self.assertIn(text.encode(), output)
+            self.assertIn(b"\x1b[7m" + "👨‍👩‍👧".encode(), output, "Selection style was lost in grapheme overlay")
+            after = termios.tcgetattr(slave)
+            after[3] &= ~getattr(termios, "PENDIN", 0)
+            before[3] &= ~getattr(termios, "PENDIN", 0)
+            self.assertEqual(after, before)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
     def test_help_search_resize_and_quit_restore_original_terminal_settings(self):
         import fcntl
         import pty
@@ -712,8 +870,9 @@ class ReplayConnectionTests(unittest.IsolatedAsyncioTestCase):
 class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_actual_caption_endpoint_replays_without_pending_decoration(self):
         import bridge
+        import stt
         runtime = bridge.BridgeState()
-        runtime.live_stt = bridge.LocalWhisperSTT(python="python", model="test", vad="vad",
+        runtime.live_stt = stt.LocalWhisperSTT(python="python", model="test", vad="vad",
             on_partial=bridge.publish_partial, on_final=bridge.record_live_final,
             on_gap=bridge.record_live_gap, on_latency=bridge.record_latency,
             on_connection=bridge.live_connection_changed)
@@ -749,6 +908,156 @@ class CaptionPageIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 status_worker.cancel()
                 await asyncio.gather(reader, status_worker, return_exceptions=True)
                 await server.close()
+
+
+class SampleClockParagraphTests(unittest.TestCase):
+    def test_two_second_pause_with_preroll_and_postroll_matches_between_live_and_replay(self):
+        # Turn 1: pre-roll starts at 512, speech 16000..64000 (3.0s), post-roll ends at 72192
+        ev1 = {
+            "type": "transcript", "event_id": "e1", "utterance_id": "u1",
+            "stream_id": "s", "session_id": 1, "is_final": True,
+            "text": "First sentence before pause.",
+            "timestamp": "2026-11-14 03:10:01",
+            "audio_start_at": 1001.0,
+            "sample_offset": 512, "sample_end_offset": 72192,
+            "speech_start_offset": 16000, "voice_end_offset": 64000,
+        }
+        # Turn 2: 2.20s real silence after 64000 -> speech starts at 99200 (pre-roll starts at 83328)
+        partial2 = {
+            "type": "partial", "utterance_id": "u2", "revision": 1,
+            "stream_id": "s", "session_id": 1,
+            "text": "Second sentence",
+            "audio_start_at": 1006.2,
+            "sample_offset": 83328, "speech_start_offset": 99200,
+        }
+        ev2 = {
+            "type": "transcript", "event_id": "e2", "utterance_id": "u2",
+            "stream_id": "s", "session_id": 1, "is_final": True,
+            "text": "Second sentence after pause.",
+            "timestamp": "2026-11-14 03:10:06",
+            "audio_start_at": 1006.2,
+            "sample_offset": 83328, "sample_end_offset": 139392,
+            "speech_start_offset": 99200, "voice_end_offset": 131200,
+        }
+
+        live_viewer = tui.Viewer()
+        live_viewer.add(ev1)
+        live_viewer.add(partial2)
+        live_viewer.add(ev2)
+
+        replay_viewer = tui.Viewer()
+        replay_viewer.add({"type": "replay", "phase": "start", "reset": False, "count": 2})
+        replay_viewer.add(ev1)
+        replay_viewer.add(ev2)
+        replay_viewer.add({"type": "replay", "phase": "end"})
+
+        self.assertEqual([c.text for c in live_viewer.captions], [
+            "First sentence before pause.",
+            "Second sentence after pause.",
+        ])
+        self.assertEqual([c.text for c in replay_viewer.captions], [
+            "First sentence before pause.",
+            "Second sentence after pause.",
+        ])
+
+    def test_eight_second_max_turn_split_remains_single_paragraph_in_live_and_replay(self):
+        ev1 = {
+            "type": "transcript", "event_id": "s1", "utterance_id": "u1",
+            "stream_id": "s", "session_id": 1, "is_final": True,
+            "text": "Continuous speech across the eight second cap",
+            "timestamp": "2026-11-14 03:10:00",
+            "audio_start_at": 2000.0,
+            "sample_offset": 0, "sample_end_offset": 128000,
+            "speech_start_offset": 0, "voice_end_offset": 128000,
+        }
+        ev2 = {
+            "type": "transcript", "event_id": "s2", "utterance_id": "u2",
+            "stream_id": "s", "session_id": 1, "is_final": True,
+            "text": "keeps flowing in one paragraph.",
+            "timestamp": "2026-11-14 03:10:08",
+            "audio_start_at": 2008.0,
+            "sample_offset": 128000, "sample_end_offset": 176000,
+            "speech_start_offset": 128000, "voice_end_offset": 168000,
+        }
+        viewer = tui.Viewer()
+        viewer.add(ev1)
+        viewer.add(ev2)
+        self.assertEqual(len(viewer.captions), 1)
+        self.assertIn("cap keeps flowing", viewer.captions[0].text)
+
+
+
+class AmbientBookmarkTests(unittest.TestCase):
+    def _add_passage(self, viewer, idx, text, stamp):
+        viewer.add({
+            "type": "transcript",
+            "event_id": f"ev-{idx}",
+            "utterance_id": f"ut-{idx}",
+            "stream_id": "s",
+            "session_id": idx,
+            "text": text,
+            "timestamp": f"2026-11-14 {stamp}",
+            "audio_start_at": 1700000000.0 + idx * 10,
+        })
+
+    def test_bookmark_toggle_jump_copy_and_markdown_export(self):
+        viewer = tui.Viewer(connected=True)
+        self._add_passage(viewer, 1, "First architecture point.", "14:01:10")
+        self._add_passage(viewer, 2, "Second latency number.", "14:01:20")
+        self._add_passage(viewer, 3, "Third action item.", "14:01:30")
+
+        rows = tui.rows_for(viewer, 72)
+        # Following mode: 'b' bookmarks latest (3rd) passage
+        tui.handle_key(viewer, "b", rows, 10)
+        self.assertEqual(viewer.bookmarks, {viewer.captions[-1].key})
+        self.assertIn("Bookmarked · 14:01:30", viewer.toast)
+
+        # Scroll to top passage and bookmark 1st passage too
+        tui.move(viewer, rows, 10, -len(rows))
+        rows = tui.rows_for(viewer, 72)
+        tui.handle_key(viewer, "b", rows, 10)
+        self.assertEqual(len(viewer.bookmarks), 2)
+
+        # Jump next ']' -> goes from 1st bookmark to 3rd passage bookmark, then wraps back to 1st
+        rows = tui.rows_for(viewer, 72)
+        tui.handle_key(viewer, "]", rows, 10)
+        self.assertEqual(viewer.anchor[0], viewer.captions[2].key)
+        self.assertIn("Bookmark 2/2 · 14:01:30", viewer.toast)
+
+        tui.handle_key(viewer, "[", rows, 10)
+        self.assertEqual(viewer.anchor[0], viewer.captions[0].key)
+        self.assertIn("Bookmark 1/2 · 14:01:10", viewer.toast)
+
+        # Verify 'B' action and formatted bookmark text
+        self.assertEqual(tui.handle_key(viewer, "B", rows, 10), "copy_bookmarks")
+        self.assertEqual(
+            tui.bookmarked_text(viewer),
+            "[14:01:10] First architecture point.\n\n[14:01:30] Third action item.",
+        )
+
+        # Export includes Bookmarked Passages section
+        with tempfile.TemporaryDirectory() as directory:
+            msg = tui.export_session(viewer, Path(directory))
+            self.assertTrue(msg.startswith("Exported omi-captions-"))
+            exported = next(Path(directory).glob("omi-captions-*.md")).read_text(encoding="utf-8")
+            self.assertIn("## Bookmarked Passages", exported)
+            self.assertIn("- **[14:01:10]** First architecture point.", exported)
+            self.assertIn("## Full Transcript", exported)
+
+        # Toggle off removes bookmark
+        tui.handle_key(viewer, "b", rows, 10)
+        self.assertEqual(len(viewer.bookmarks), 1)
+        self.assertIn("Removed bookmark · 14:01:10", viewer.toast)
+
+    def test_bookmark_keys_prune_when_history_rolls_over(self):
+        viewer = tui.Viewer()
+        self._add_passage(viewer, 0, "Pinned early passage.", "14:00:00")
+        tui.handle_key(viewer, "b", tui.rows_for(viewer, 72), 10)
+        early_key = viewer.captions[0].key
+        self.assertIn(early_key, viewer.bookmarks)
+        for idx in range(1, 205):
+            self._add_passage(viewer, idx, f"Passage {idx}", "14:05:00")
+        self.assertNotIn(early_key, viewer.bookmarks)
 
 
 if __name__ == "__main__":

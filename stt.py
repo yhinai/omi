@@ -8,6 +8,7 @@ import base64
 from collections import deque
 import json
 import logging
+import os
 import re
 from pathlib import Path
 import time
@@ -22,17 +23,19 @@ logger = logging.getLogger("bridge")
 
 class LocalWhisperSTT:
     def __init__(self, *, python, model, vad, on_partial, on_final, on_gap,
-                 on_latency, on_connection, max_age=45, idle_flush=8):
+                 on_latency, on_connection, max_age=45, idle_flush=8, worker_env=None):
         self.command = [str(python), str(Path(__file__).with_name("whisper.py")),
                         "--model", str(model), "--vad", str(vad), "--idle-flush", str(idle_flush)]
         self.on_partial, self.on_final, self.on_gap = on_partial, on_final, on_gap
         self.on_latency, self.on_connection = on_latency, on_connection
         self.max_age, self.idle_flush = max_age, idle_flush
+        self.worker_env = dict(worker_env or {})
         self.queue, self.retained, self.controls = deque(), deque(), deque()
         self.pending_bytes = self.total_input_samples = self.session_id = 0
         self.connected = self.stopping = self._speech_pending = False
         self.last_packet_mono = None
         self.reconnects = self.partial_updates = self.final_count = self.turns_without_text = 0
+        self.no_text_causes = {}
         self.gap_causes = {}
         self.pending_final_count = 0
         self.wake, self.stop_event = asyncio.Event(), asyncio.Event()
@@ -68,7 +71,7 @@ class LocalWhisperSTT:
             return
         self.gap_causes[detail] = self.gap_causes.get(detail, 0) + 1
         self.on_gap(reason, seconds, session_id=packet.session_id, sample_offset=packet.sample_offset,
-            received_at=packet.received_at, audio_start_at=packet.received_at-len(packet.pcm)/BPS, detail=detail)
+            received_at=packet.received_at, audio_start_at=packet.audio_start_at, detail=detail)
 
     def feed(self, raw, received_at, received_mono):
         if self.stopping:
@@ -95,6 +98,7 @@ class LocalWhisperSTT:
             else:
                 packet.pcm = packet.pcm[count:]
                 packet.sample_offset += count//2
+                packet.audio_start_at += count/BPS
 
     def request_flush(self):
         identity = uuid.uuid4().hex
@@ -127,15 +131,18 @@ class LocalWhisperSTT:
                 queue.popleft()
             if queue and queue[0].sample_offset < end:
                 packet = queue[0]
-                packet.pcm = packet.pcm[(end-packet.sample_offset)*2:]
+                trimmed = (end-packet.sample_offset)*2
+                packet.pcm = packet.pcm[trimmed:]
                 packet.sample_offset = end
+                packet.audio_start_at += trimmed/BPS
 
     def retry_saves(self):
         """Commit in source order; failed saves keep both the final and its PCM."""
         while self.pending_finals:
             event = self.pending_finals[0]
             fields = {key: event[key] for key in ("utterance_id", "session_id", "sample_offset",
-                "sample_end_offset", "received_at", "audio_start_at")}
+                "sample_end_offset", "received_at", "audio_start_at",
+                "speech_start_offset", "voice_end_offset") if key in event}
             try:
                 saved = self.on_final(event["text"], **fields)
             except OSError as error:
@@ -185,6 +192,8 @@ class LocalWhisperSTT:
                 waiter.set()
         elif kind == "no_text":
             self.turns_without_text += 1
+            reason = event.get("reason") or "unknown"
+            self.no_text_causes[reason] = self.no_text_causes.get(reason, 0) + 1
         elif kind == "status":
             self.pending_final_count = event["pending_finals"]
             self._speech_pending = event["speech_pending"]
@@ -218,19 +227,21 @@ class LocalWhisperSTT:
                 size = min(PACKET_MAX_BYTES, len(packet.pcm))
                 if self.controls:
                     size = min(size, max(0, self.controls[0][1]-packet.sample_offset)*2)
-                chunk = Packet(packet.pcm[:size], packet.received_at, packet.received_mono, packet.sample_offset, packet.session_id)
+                chunk = Packet(packet.pcm[:size], packet.received_at, packet.received_mono,
+                               packet.sample_offset, packet.session_id, packet.audio_start_at)
                 # Retain before writing: a crash between write and acknowledgment
                 # is replayable; committed source offsets suppress duplicate finals.
                 self.retained.append(chunk)
                 packet.pcm = packet.pcm[size:]
                 packet.sample_offset += size//2
+                packet.audio_start_at += size/BPS
                 self.pending_bytes -= size
                 if not packet.pcm:
                     self.queue.popleft()
                 await self._write({"op": "packet", "pcm_base64": base64.b64encode(chunk.pcm).decode("ascii"),
                     "sample_offset": chunk.sample_offset, "session_id": chunk.session_id,
                     "received_at": chunk.received_at, "received_mono": chunk.received_mono,
-                    "audio_start_at": chunk.received_at-(len(packet.pcm)+size)/BPS})
+                    "audio_start_at": chunk.audio_start_at})
                 self.on_latency("receipt_to_send_sec", time.monotonic()-chunk.received_mono)
                 # A stalled worker must not build an unbounded replay copy.
                 if sum(len(item.pcm) for item in self.retained) > REPLAY_MAX_BYTES:
@@ -265,7 +276,8 @@ class LocalWhisperSTT:
                 try:
                     self.process = await asyncio.create_subprocess_exec(*self.command,
                         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE, limit=131072)
+                        stderr=asyncio.subprocess.PIPE, limit=131072,
+                        env={**os.environ, **self.worker_env})
                     self.worker_diagnostics.clear()
                     diagnostics = asyncio.create_task(self._read_diagnostics())
                     ready = json.loads(await asyncio.wait_for(self.process.stdout.readline(), 60))
@@ -319,10 +331,10 @@ class LocalWhisperSTT:
                         count = min(len(packet.pcm), max(0, recognized_end-packet.sample_offset)*2)
                         if count:
                             self.protected_pcm.append(Packet(packet.pcm[:count], packet.received_at,
-                                packet.received_mono, packet.sample_offset, packet.session_id))
+                                packet.received_mono, packet.sample_offset, packet.session_id, packet.audio_start_at))
                         if count < len(packet.pcm):
                             replay.append(Packet(packet.pcm[count:], packet.received_at, packet.received_mono,
-                                packet.sample_offset+count//2, packet.session_id))
+                                packet.sample_offset+count//2, packet.session_id, packet.audio_start_at+count/BPS))
                     self.queue.extendleft(reversed(replay))
                     self.retained.clear()
                     self.pending_bytes = sum(len(packet.pcm) for packet in self.queue)

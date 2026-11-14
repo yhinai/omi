@@ -1,0 +1,13 @@
+#!/bin/bash
+set -euo pipefail
+export PYTHONDONTWRITEBYTECODE=1
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+PYTHON="$DIR/.venv/bin/python3.15"
+if [ ! -x "$PYTHON" ]; then
+  if [ "$#" -eq 1 ] && [ "$1" = start ]; then
+    exec "$DIR/run.sh" start
+  fi
+  echo "Set up Omi first: $DIR/run.sh start" >&2
+  exit 1
+fi
+exec "$PYTHON" -B "$DIR/cli.py" "$@"

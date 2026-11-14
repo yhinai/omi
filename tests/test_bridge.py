@@ -2,7 +2,6 @@
 import asyncio
 from collections import namedtuple
 from datetime import datetime
-import importlib.util
 import json
 import logging
 import os
@@ -17,13 +16,8 @@ from unittest import mock
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-if os.environ.get("OMI_BRIDGE_PATH"):
-    spec = importlib.util.spec_from_file_location("bridge", os.environ["OMI_BRIDGE_PATH"])
-    bridge = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = bridge
-    spec.loader.exec_module(bridge)
-else:
-    import bridge
+import bridge
+import stt
 
 bridge.logger.addHandler(logging.NullHandler())
 bridge.logger.propagate = False
@@ -34,7 +28,7 @@ VersionInfo = namedtuple("VersionInfo", "major minor micro releaselevel serial")
 
 def live_state():
     runtime = bridge.BridgeState()
-    runtime.live_stt = bridge.LocalWhisperSTT(python="python", model="test", vad="vad",
+    runtime.live_stt = stt.LocalWhisperSTT(python="python", model="test", vad="vad",
         on_partial=bridge.publish_partial, on_final=bridge.record_live_final,
         on_gap=bridge.record_live_gap, on_latency=bridge.record_latency,
         on_connection=bridge.live_connection_changed)
@@ -98,8 +92,8 @@ assert dict(os.environ) == before, 'import changed environment'
         with tempfile.TemporaryDirectory() as directory:
             local = Path(directory)/"local.env"
             local.write_text("OMI_IDLE_FLUSH_SEC=6\n")
-            self.assertEqual(bridge._load_dotenv(local_path=local, environ={})["OMI_IDLE_FLUSH_SEC"], "6")
-            self.assertEqual(bridge._load_dotenv(local_path=local, environ={"OMI_IDLE_FLUSH_SEC":"5"})["OMI_IDLE_FLUSH_SEC"], "5")
+            self.assertEqual(bridge.load_env(local_path=local, environ={})["OMI_IDLE_FLUSH_SEC"], "6")
+            self.assertEqual(bridge.load_env(local_path=local, environ={"OMI_IDLE_FLUSH_SEC":"5"})["OMI_IDLE_FLUSH_SEC"], "5")
 
 
 class LiveConfigurationTests(unittest.TestCase):
@@ -432,11 +426,13 @@ class ReliabilityTests(unittest.IsolatedAsyncioTestCase):
 class OutputHandlerTests(unittest.TestCase):
 
     def test_invalid_live_audio_settings_fail_startup(self):
-        for name in ("OMI_MAX_AUDIO_AGE_SEC", "OMI_IDLE_FLUSH_SEC"):
-            for value in ("0", "-1", "nan", "inf"):
-                with self.subTest(name=name, value=value), self.assertRaises(ValueError):
-                    bridge.configure({name: value})
-        bridge.configure({})
+        with mock.patch.object(bridge.os.path, "isfile", return_value=True), \
+             mock.patch.object(bridge.os, "access", return_value=True):
+            for name in ("OMI_MAX_AUDIO_AGE_SEC", "OMI_IDLE_FLUSH_SEC"):
+                for value in ("0", "-1", "nan", "inf"):
+                    with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                        bridge.configure({name: value})
+            bridge.configure({})
 
 
 class LatencyTests(unittest.IsolatedAsyncioTestCase):

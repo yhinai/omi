@@ -13,6 +13,7 @@ import wave
 import sys
 
 import bridge
+import stt
 
 spec = importlib.util.spec_from_file_location("omi_smoke", Path(__file__).resolve().parents[1] / "scripts/smoke_test.py")
 smoke = importlib.util.module_from_spec(spec)
@@ -38,7 +39,7 @@ for line in sys.stdin:
   print(json.dumps({'type':'flushed','request_id':r.get('request_id')}),flush=True)
   if r['op']=='shutdown':break
 """
-        factory = bridge.LocalWhisperSTT
+        factory = stt.LocalWhisperSTT
         def make_worker(**kwargs):
             stream = factory(**kwargs)
             stream.command = [sys.executable, "-u", "-c", worker]
@@ -64,7 +65,7 @@ for line in sys.stdin:
                      mock.patch.object(bridge, "LOG_DIR", str(original)), \
                      mock.patch.object(bridge, "logger", diagnostics), \
                      mock.patch.object(bridge, "event_logger", events), \
-                     mock.patch.object(bridge, "LocalWhisperSTT", side_effect=make_worker), \
+                     mock.patch.object(stt, "LocalWhisperSTT", side_effect=make_worker), \
                      mock.patch.object(smoke, "verify_saved", side_effect=verify_outputs) as verification, \
                      mock.patch.object(smoke.logging, "shutdown"), redirect_stdout(io.StringIO()) as output:
                     await smoke.check(SimpleNamespace(wav=wav, expect="Test phrase", timeout=8))

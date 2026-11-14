@@ -1,0 +1,3 @@
+# Optional Python 3.14 Pipecat process; main bridge and Whisper environments stay separate.
+pipecat-ai[deepgram]==1.16.0
+deepgram-sdk==7.19.0

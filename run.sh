@@ -10,8 +10,8 @@ IDENTITY_FILE="$DIR/logs/omi_bridge.identity"
 CONSOLE_LOG="$DIR/logs/omi_bridge.console.log"
 ACTION="${1:-restart}"
 
-if [ "$#" -gt 1 ] || [[ ! "$ACTION" =~ ^(start|restart|stop|status|clear)$ ]]; then
-  echo "Usage: $0 [start|restart|stop|status|clear] (default: restart)" >&2
+if [ "$#" -gt 1 ] || [[ ! "$ACTION" =~ ^(start|restart|restart-clean|stop|status|clear)$ ]]; then
+  echo "Usage: $0 [start|restart|restart-clean|stop|status|clear] (default: restart)" >&2
   exit 2
 fi
 mkdir -p "$DIR/logs"
@@ -59,11 +59,34 @@ else
   CLI_PYTHON="$(bootstrap_python)"
 fi
 
-# The launcher holds this advisory lock until exit; crashes leave no stale lock.
-exec 9> "$DIR/logs/omi_bridge.launcher.lock"
-if ! "$CLI_PYTHON" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2>/dev/null; then
-  echo "Another launcher command is running." >&2
-  exit 1
+# The switcher may hand off its already-held lock; verify the descriptor rather
+# than trusting an environment flag. Ordinary commands keep the existing path.
+if [ -n "${OMI_LAUNCHER_LOCK_FD:-}" ]; then
+  if [[ ! "$OMI_LAUNCHER_LOCK_FD" =~ ^[0-9]{1,9}$ ]] || [ "$OMI_LAUNCHER_LOCK_FD" -lt 3 ]; then
+    echo "Invalid inherited launcher lock." >&2
+    exit 1
+  fi
+  if ! exec 9>&"$OMI_LAUNCHER_LOCK_FD"; then
+    echo "Invalid inherited launcher lock." >&2
+    exit 1
+  fi
+  if ! "$CLI_PYTHON" - "$DIR/logs/omi_bridge.launcher.lock" 2>/dev/null <<'PY_LOCK'
+import fcntl, os, stat, sys
+descriptor, path = os.fstat(9), os.stat(sys.argv[1], follow_symlinks=False)
+assert stat.S_ISREG(descriptor.st_mode) and stat.S_ISREG(path.st_mode)
+assert (descriptor.st_dev, descriptor.st_ino) == (path.st_dev, path.st_ino)
+fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)
+PY_LOCK
+  then
+    echo "Invalid or unavailable inherited launcher lock." >&2
+    exit 1
+  fi
+else
+  exec 9> "$DIR/logs/omi_bridge.launcher.lock"
+  if ! "$CLI_PYTHON" -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX | fcntl.LOCK_NB)' 2>/dev/null; then
+    echo "Another launcher command is running." >&2
+    exit 1
+  fi
 fi
 
 process_birth() { LC_ALL=C ps -p "$1" -o lstart= 2>/dev/null; }
@@ -124,6 +147,7 @@ PY
 
 check_ports() {
   local allowed_pid="${1:-}" port listener listeners
+  command -v lsof >/dev/null || { echo "lsof is required to check bridge ports safely." >&2; return 1; }
   for port in 8787 8788; do
     listeners="$(lsof -nP -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null || true)"
     for listener in $listeners; do
@@ -153,15 +177,22 @@ stop_bridge() {
 
 clear_data() {
   "$CLI_PYTHON" - "$DIR/logs" <<'PY_CLEAR'
+from datetime import datetime, timezone
 from pathlib import Path
 import re
 import shutil
 import sys
+import tempfile
 root = Path(sys.argv[1])
 if root.is_symlink():
     raise SystemExit("Refusing to clear a symlinked logs directory")
+stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+archive = None
+moved = 0
 for path in root.iterdir():
-    # Preserve the held launcher lock and files owned by separate services.
+    # Preserve the held launcher lock, files owned by separate services, and older archives.
+    if path.name == "archive":
+        continue
     owned = (path.name.startswith(("omi_bridge.log", "omi_bridge.console.log",
                                   "omi_live_transcript.log", "omi_transcript_events.jsonl"))
              or re.fullmatch(r"\d{4}-\d{2}-\d{2}\.md", path.name)
@@ -169,11 +200,18 @@ for path in root.iterdir():
              or path.suffix.lower() in {".wav", ".pcm"})
     if not owned:
         continue
-    if path.is_dir() and not path.is_symlink():
-        shutil.rmtree(path)
-    else:
+    if path.is_symlink():
         path.unlink()
-print("Cleared bridge transcripts, daily notes, editions, audio captures, and logs.")
+        continue
+    if archive is None:
+        parent = root / "archive"
+        if parent.is_symlink():
+            raise SystemExit("Refusing to archive into a symlinked archive directory")
+        parent.mkdir(exist_ok=True)
+        archive = Path(tempfile.mkdtemp(prefix=stamp + "-", dir=parent))
+    shutil.move(str(path), str(archive / path.name))
+    moved += 1
+print(f"Archived {moved} bridge history item(s) to {archive}" if moved else "No bridge history to archive.")
 PY_CLEAR
 }
 
@@ -215,17 +253,18 @@ if ! RUNTIME_INFO="$(runtime_info "$PYTHON" 2>/dev/null)"; then
   exit 1
 fi
 if ! "$PYTHON" -c 'import aiohttp; assert (3, 14, 5) <= tuple(map(int, aiohttp.__version__.split(".")[:3])) < (4, 0, 0)' >/dev/null 2>&1; then
-  "$PYTHON" -m pip install -r "$DIR/requirements.txt"
+  "$PYTHON" -m pip install -r "$DIR/requirements.txt" -c "$DIR/requirements.lock"
 fi
 "$PYTHON" "$SCRIPT" --check-config
-command -v lsof >/dev/null || { echo "lsof is required to check bridge ports safely." >&2; exit 1; }
 CURRENT_PID="$(tracked_pid || true)"
 check_ports "$CURRENT_PID"
 
-if [ "$ACTION" = restart ]; then
+if [ "$ACTION" = restart ] || [ "$ACTION" = restart-clean ]; then
   stop_bridge
   check_ports
-  clear_data
+  if [ "$ACTION" = restart-clean ]; then
+    clear_data
+  fi
 elif PID="$(tracked_pid)"; then
   if health_matches "$PID"; then
     echo "Omi bridge is already running and healthy (PID $PID)."

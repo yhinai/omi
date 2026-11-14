@@ -3,6 +3,7 @@ import json
 import logging
 from pathlib import Path
 import tempfile
+import storage
 import unittest
 from unittest import mock
 
@@ -84,6 +85,42 @@ class JournalRetryTests(unittest.TestCase):
 
 
 class OutputHandlerTests(unittest.TestCase):
+    def test_restart_separates_interrupted_tail_without_losing_the_next_final(self):
+        previous = {"type": "transcript", "event_id": "previous", "text": "Previous words."}
+        encoded = json.dumps(previous).encode()
+        for tail in (b"", encoded, encoded + b"\n", encoded + b'\n{"text": "\xf0\x9f'):
+            with self.subTest(tail=tail), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory, "omi_transcript_events.jsonl")
+                path.write_bytes(tail)
+                logger = logging.getLogger("omi-journal-restart-test")
+                runtime = bridge.BridgeState()
+                with mock.patch.object(bridge, "state", runtime), \
+                     mock.patch.object(bridge, "LOG_DIR", directory), \
+                     mock.patch.object(bridge, "event_logger", logger):
+                    try:
+                        runtime.storage.configure_logging(logger)
+                        self.assertTrue(bridge.record_live_final("After restart.", utterance_id="next"))
+                        # Existing bytes, including the broken record, stay intact.
+                        self.assertTrue(path.read_bytes().startswith(tail))
+                        replay = list(runtime.storage.recent_events())
+                        self.assertEqual(replay[-1]["text"], "After restart.")
+                        self.assertEqual(sum(event["text"] == "After restart." for event in replay), 1)
+                        self.assertEqual(sum(event["event_id"] == "previous" for event in replay), bool(tail))
+                    finally:
+                        for handler in logger.handlers[:]:
+                            logger.removeHandler(handler)
+                            handler.close()
+
+    def test_saved_gaps_survive_restart_between_transcripts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            events = [{"type": kind, "event_id": str(i), "text": kind}
+                      for i, kind in enumerate(("transcript", "gap", "transcript"))]
+            Path(directory, "omi_transcript_events.jsonl").write_text(
+                "".join(json.dumps(event) + "\n" for event in events))
+            runtime = bridge.BridgeState()
+            with mock.patch.object(bridge, "LOG_DIR", directory):
+                self.assertEqual(list(runtime.storage.recent_events()), events)
+
     def test_disk_write_error_is_raised_instead_of_swallowed_by_logging(self):
         with tempfile.TemporaryDirectory() as directory:
             handler = OutputFileHandler(str(Path(directory, "test.log")), maxBytes=1024, backupCount=1)
@@ -98,3 +135,29 @@ class OutputHandlerTests(unittest.TestCase):
             finally:
                 handler.stream = original
                 handler.close()
+
+
+class DailyNotesExternalTruncateTests(unittest.TestCase):
+    def test_external_empty_or_partial_truncate_never_writes_nul_bytes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            notes = storage.DailyNotes(directory, idle_flush=8)
+            notes.add("2026-11-14 03:00:00", "First paragraph words.")
+            notes.close_paragraph()
+            notes.add("2026-11-14 03:00:02", "Second paragraph starts past header.")
+            md_path = Path(directory, "2026-11-14.md")
+
+            # Case 1: truncated to 0 bytes externally
+            md_path.write_bytes(b"")
+            notes.add("2026-11-14 03:00:03", "Recovered cleanly after zero truncate.")
+            raw1 = md_path.read_bytes()
+            self.assertNotIn(b"\x00", raw1)
+            self.assertIn(b"Recovered cleanly after zero truncate.", raw1)
+
+            # Case 2: truncated to 12 bytes (< notes.offset) externally
+            notes.close_paragraph()
+            notes.add("2026-11-14 03:00:04", "Another paragraph.")
+            md_path.write_bytes(b"# Shortened\n")
+            notes.add("2026-11-14 03:00:05", "Appended after shortened file.")
+            raw2 = md_path.read_bytes()
+            self.assertNotIn(b"\x00", raw2)
+            self.assertIn(b"Appended after shortened file.", raw2)

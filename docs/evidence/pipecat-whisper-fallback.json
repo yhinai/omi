@@ -1,0 +1,68 @@
+{
+  "status": "passed",
+  "backend": "whisper",
+  "pipeline": "local",
+  "partial_updates": 8,
+  "finals": 1,
+  "first_partial_sec": 0.4050062919850461,
+  "latency": {
+    "receipt_to_transcript_sec": {
+      "samples": 1,
+      "last": 3.404,
+      "p50": 3.404,
+      "p95": 3.404
+    },
+    "receipt_to_first_partial_sec": {
+      "samples": 1,
+      "last": 0.404,
+      "p50": 0.404,
+      "p95": 0.404
+    },
+    "speech_start_to_first_partial_sec": {
+      "samples": 1,
+      "last": 0.404,
+      "p50": 0.404,
+      "p95": 0.404
+    },
+    "receipt_to_final_sec": {
+      "samples": 1,
+      "last": 3.403,
+      "p50": 3.403,
+      "p95": 3.403
+    },
+    "speech_end_to_final_sec": {
+      "samples": 1,
+      "last": 0.502,
+      "p50": 0.502,
+      "p95": 0.502
+    },
+    "receipt_to_send_sec": {
+      "samples": 52,
+      "last": 0.0,
+      "p50": 0.001,
+      "p95": 0.001
+    },
+    "turn_close_to_final_sec": {
+      "samples": 1,
+      "last": 0.0,
+      "p50": 0.0,
+      "p95": 0.0
+    },
+    "turn_boundary_wait_sec": {
+      "samples": 1,
+      "last": 0.501,
+      "p50": 0.501,
+      "p95": 0.501
+    },
+    "local_decode_sec": {
+      "samples": 12,
+      "last": 0.207,
+      "p50": 0.198,
+      "p95": 0.229
+    }
+  },
+  "pipeline_frames": {},
+  "recognition_provenance": {},
+  "jsonl_verified": true,
+  "markdown_verified": true
+}

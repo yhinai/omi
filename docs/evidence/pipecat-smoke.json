@@ -1,0 +1,92 @@
+{
+  "status": "passed",
+  "backend": "deepgram",
+  "pipeline": "pipecat",
+  "partial_updates": 3,
+  "finals": 1,
+  "first_partial_sec": 1.3461712920106947,
+  "latency": {
+    "receipt_to_transcript_sec": {
+      "samples": 1,
+      "last": 3.433,
+      "p50": 3.433,
+      "p95": 3.433
+    },
+    "receipt_to_first_partial_sec": {
+      "samples": 1,
+      "last": 1.346,
+      "p50": 1.346,
+      "p95": 1.346
+    },
+    "speech_start_to_first_partial_sec": {
+      "samples": 0,
+      "last": null,
+      "p50": null,
+      "p95": null
+    },
+    "receipt_to_final_sec": {
+      "samples": 1,
+      "last": 3.432,
+      "p50": 3.432,
+      "p95": 3.432
+    },
+    "speech_end_to_final_sec": {
+      "samples": 0,
+      "last": null,
+      "p50": null,
+      "p95": null
+    },
+    "receipt_to_send_sec": {
+      "samples": 52,
+      "last": 0.001,
+      "p50": 0.072,
+      "p95": 0.452
+    },
+    "turn_close_to_final_sec": {
+      "samples": 0,
+      "last": null,
+      "p50": null,
+      "p95": null
+    },
+    "turn_boundary_wait_sec": {
+      "samples": 0,
+      "last": null,
+      "p50": null,
+      "p95": null
+    },
+    "local_decode_sec": {
+      "samples": 0,
+      "last": null,
+      "p50": null,
+      "p95": null
+    },
+    "provider_connect_sec": {
+      "samples": 1,
+      "last": 0.484,
+      "p50": 0.484,
+      "p95": 0.484
+    },
+    "final_to_persist_sec": {
+      "samples": 1,
+      "last": 0.001,
+      "p50": 0.001,
+      "p95": 0.001
+    }
+  },
+  "pipeline_frames": {
+    "audio": 52,
+    "interim": 3,
+    "final": 1
+  },
+  "recognition_provenance": {
+    "provider": "deepgram",
+    "requested_model": "nova-3",
+    "resolved_model": "general-nova-3",
+    "model_version": "2025-04-17.21547",
+    "orchestration": "pipecat",
+    "pipecat_version": "1.16.0",
+    "deepgram_sdk_version": "7.19.0"
+  },
+  "jsonl_verified": true,
+  "markdown_verified": true
+}

@@ -16,6 +16,19 @@ from logging.handlers import RotatingFileHandler
 JOURNAL_MAX_BYTES = 5 * 1024 * 1024
 JOURNAL_BACKUPS = 3
 
+
+def separate_journal_tail(path):
+    """Preserve a crash's last bytes without letting them swallow the next event."""
+    try:
+        with open(path, "r+b") as journal:
+            if journal.seek(0, os.SEEK_END):
+                journal.seek(-1, os.SEEK_END)
+                if journal.read(1) != b"\n":
+                    journal.write(b"\n")
+    except FileNotFoundError:
+        pass
+
+
 class OutputFileHandler(RotatingFileHandler):
     def handleError(self, record):
         # Logging normally swallows disk errors; output health must see them.
@@ -40,10 +53,14 @@ class DailyNotes:
         if not os.path.exists(path) or os.path.getsize(path) == 0:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(f"# Omi Transcript — {day}\n\n")
+            self.words = []
         if day != self.day or (self.last_time and (dt - self.last_time).total_seconds() > self.idle_flush):
             self.words = []
+        size = os.path.getsize(path)
+        if self.words and getattr(self, "offset", 0) > size:
+            self.words = []
         if not self.words:
-            self.start, self.offset = timestamp[11:], os.path.getsize(path)
+            self.start, self.offset = timestamp[11:], size
         self.day, self.last_time = day, dt
         self.words.extend(text.split())
         # Offset comes from getsize (bytes); binary I/O keeps Unicode offsets correct.
@@ -73,7 +90,9 @@ class TranscriptStore:
         for handler in logger.handlers[:]:
             logger.removeHandler(handler)
             handler.close()
-        handler = OutputFileHandler(os.path.join(self.directory, "omi_transcript_events.jsonl"),
+        path = os.path.join(self.directory, "omi_transcript_events.jsonl")
+        separate_journal_tail(path)
+        handler = OutputFileHandler(path,
                                     maxBytes=JOURNAL_MAX_BYTES, backupCount=JOURNAL_BACKUPS)
         handler.setFormatter(logging.Formatter("%(message)s"))
         logger.addHandler(handler)
@@ -134,11 +153,7 @@ class TranscriptStore:
                                 persisted |= json.loads(line).get("event_id") == event["event_id"]
                             except (ValueError, AttributeError):
                                 continue
-                if not persisted and os.path.isfile(path) and os.path.getsize(path):
-                    with open(path, "rb+") as journal:
-                        journal.seek(-1, os.SEEK_END)
-                        if journal.read(1) != b"\n":
-                            journal.write(b"\n")  # Keep a partial failed line separate.
+                separate_journal_tail(path)
             except OSError as error:
                 self.on_error("jsonl", error)
                 return False
@@ -168,7 +183,7 @@ class TranscriptStore:
                     event = json.loads(line)
                 except (ValueError, UnicodeError):
                     continue
-                if not isinstance(event, dict) or event.get("type", "transcript") != "transcript" or not isinstance(event.get("text"), str):
+                if not isinstance(event, dict) or event.get("type", "transcript") not in ("transcript", "gap") or not isinstance(event.get("text"), str):
                     continue
                 event.setdefault("type", "transcript")
                 identity = event.get("event_id")

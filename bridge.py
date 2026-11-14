@@ -12,8 +12,6 @@ from logging.handlers import RotatingFileHandler
 import math
 import os
 import platform
-import re
-import shlex
 import signal
 import ssl
 import sys
@@ -37,75 +35,94 @@ if __name__ == "__main__":
 import aiohttp
 from aiohttp import web
 
-from stt import LocalWhisperSTT
+from config import load_env
+from backend_settings import DeepgramConfig, TranscriptionBackend
+from diagnostics import AudioCapture
 from storage import TranscriptStore, DailyNotes
-from common import RATE, BPS, QUEUE_AUDIO_SECONDS, QUEUE_MAX_BYTES, QUEUE_MAX_PACKETS
+from common import RATE, BPS, QUEUE_AUDIO_SECONDS, QUEUE_MAX_BYTES, QUEUE_MAX_PACKETS, AudioQualityMeter
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(BASE_DIR, "logs")
 SAMPLE_RATE, BYTES_PER_SECOND = RATE, BPS
 MAX_AUDIO_AGE_SEC = 45.0
 STT_BACKEND = "whisper"
+MODEL_LABEL = "whisper-large-v3-turbo-fp16"
+DEEPGRAM_CONFIG = None
 WHISPER_PYTHON = WHISPER_MODEL = WHISPER_VAD = ""
+WHISPER_ENV = {}
 IDLE_FLUSH_SEC = 8.0
 MAX_INPUT_BYTES = BYTES_PER_SECOND * 300
 HOST = "0.0.0.0"
 PORT, HEALTH_PORT = 8787, 8788
 STREAM_TOKEN = ""
+CAPTION_TOKEN = ""
+MAX_CAPTION_CLIENTS = 16
 logger = logging.getLogger("bridge")
 event_logger = logging.getLogger("omi_transcript_events")
 
 
-def _read_env_file(path):
-    values = {}
-    if os.path.isfile(path):
-        with open(path, encoding="utf-8") as f:
-            for number, line in enumerate(f, 1):
-                line = line.strip()
-                if line.startswith("export "):
-                    line = line[7:].strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key.strip()):
-                    continue
-                try:
-                    values[key.strip()] = " ".join(shlex.split(value, comments=True))
-                except ValueError:
-                    raise ValueError(f"Invalid quoted value in {path}:{number}") from None
-    return values
-
-
-def _load_dotenv(local_path=None, environ=None):
-    """Resolve process variables over the project .env."""
-    sources = [dict(os.environ if environ is None else environ),
-               _read_env_file(local_path or os.path.join(BASE_DIR, ".env"))]
-    values = {}
-    for source in reversed(sources):
-        values.update(source)
-    return values
-
-
 def configure(env=None):
     global MAX_AUDIO_AGE_SEC
-    global IDLE_FLUSH_SEC, HOST, STREAM_TOKEN
-    global WHISPER_PYTHON, WHISPER_MODEL, WHISPER_VAD
-    env = _load_dotenv() if env is None else env
+    global IDLE_FLUSH_SEC, HOST, STREAM_TOKEN, CAPTION_TOKEN, MAX_CAPTION_CLIENTS
+    global WHISPER_PYTHON, WHISPER_MODEL, WHISPER_VAD, WHISPER_ENV
+    global STT_BACKEND, MODEL_LABEL, DEEPGRAM_CONFIG
+    env = load_env() if env is None else env
+    backend = env.get("OMI_STT_BACKEND", "whisper").strip().lower()
+    if backend not in {"whisper", "deepgram"}:
+        raise ValueError("OMI_STT_BACKEND must be whisper or deepgram")
+    cloud_config = DeepgramConfig.from_env(env) if backend == "deepgram" else None
+    if cloud_config and cloud_config.pipeline == "pipecat" and (
+            not os.path.isfile(cloud_config.python) or not os.access(cloud_config.python, os.X_OK)):
+        raise ValueError("Install the optional Pipecat environment; see README.md")
     HOST = (env.get("OMI_HOST") or "0.0.0.0").strip()
     STREAM_TOKEN = (env.get("OMI_STREAM_TOKEN") or "").strip()
+    CAPTION_TOKEN = (env.get("OMI_CAPTION_TOKEN", STREAM_TOKEN) or "").strip()
+    WHISPER_ENV = {key: env[key] for key in ("OMI_LANGUAGE", "OMI_LANGUAGES", "OMI_HOTWORDS") if key in env}
+    language = env.get("OMI_LANGUAGE", "en").strip().lower()
+    languages = {item.strip().lower() for item in env.get("OMI_LANGUAGES", "en").split(",") if item.strip()}
+    if backend == "whisper" and (not languages or (language not in ("", "auto") and language not in languages)):
+        raise ValueError("Recognition language must be included in the nonempty OMI_LANGUAGES allowlist")
+    MAX_CAPTION_CLIENTS = int(env.get("OMI_MAX_CAPTION_CLIENTS", "16"))
+    if not 1 <= MAX_CAPTION_CLIENTS <= 1024:
+        raise ValueError("Caption client limit must be between 1 and 1024")
     assets = os.path.expanduser("~/Library/Application Support/OmiWhisper")
     WHISPER_PYTHON = os.path.expanduser(env.get("OMI_WHISPER_PYTHON", os.path.join(BASE_DIR, ".venv-whisper/bin/python")))
     WHISPER_MODEL = os.path.expanduser(env.get("OMI_WHISPER_MODEL", os.path.join(assets, "whisper-turbo")))
     WHISPER_VAD = os.path.expanduser(env.get("OMI_WHISPER_VAD", os.path.join(assets, "silero_vad.onnx")))
-    if not os.path.isfile(WHISPER_PYTHON) or not os.access(WHISPER_PYTHON, os.X_OK):
+    if backend == "whisper" and (not os.path.isfile(WHISPER_PYTHON) or not os.access(WHISPER_PYTHON, os.X_OK)):
         raise ValueError("Install the Python 3.14 Whisper worker environment; see README.md")
-    if not all(os.path.isfile(path) for path in (os.path.join(WHISPER_MODEL, "config.json"),
+    if backend == "whisper" and not all(os.path.isfile(path) for path in (os.path.join(WHISPER_MODEL, "config.json"),
             os.path.join(WHISPER_MODEL, "weights.safetensors"), WHISPER_VAD)):
         raise ValueError("Whisper or Silero model files are missing; see README.md")
     MAX_AUDIO_AGE_SEC = float(env.get("OMI_MAX_AUDIO_AGE_SEC", "45"))
     IDLE_FLUSH_SEC = float(env.get("OMI_IDLE_FLUSH_SEC", "8"))
     if not all(math.isfinite(v) and v > 0 for v in (MAX_AUDIO_AGE_SEC, IDLE_FLUSH_SEC)):
         raise ValueError("Maximum audio age and idle timeout must be finite and positive")
+    STT_BACKEND, DEEPGRAM_CONFIG = backend, cloud_config
+    MODEL_LABEL = cloud_config.model if cloud_config else "whisper-large-v3-turbo-fp16"
+
+
+def create_transcription_backend(callbacks):
+    """Keep phone, persistence and viewer contracts independent of recognition."""
+    callbacks = dict(callbacks)
+    callbacks.setdefault("max_age", MAX_AUDIO_AGE_SEC)
+    callbacks.setdefault("idle_flush", IDLE_FLUSH_SEC)
+    if STT_BACKEND == "deepgram":
+        if DEEPGRAM_CONFIG is None:
+            raise ValueError("Configure Deepgram before creating its backend")
+        config = DEEPGRAM_CONFIG
+        if config.pipeline == "pipecat":
+            from pipecat_stt import PipecatDeepgramSTT
+            factory = PipecatDeepgramSTT
+            callbacks["python"] = config.python
+        else:
+            from deepgram_stt import DeepgramSTT
+            factory = DeepgramSTT
+        return factory(api_key=config.api_key, model=config.model, language=config.language,
+                           endpointing_ms=config.endpointing_ms, diarize=config.diarize, **callbacks)
+    from stt import LocalWhisperSTT
+    return LocalWhisperSTT(python=WHISPER_PYTHON, model=WHISPER_MODEL,
+                           vad=WHISPER_VAD, worker_env=WHISPER_ENV, **callbacks)
 
 
 def configure_logging():
@@ -131,6 +148,7 @@ def new_metrics():
         "lost_audio_sec_queue_evicted": 0.0,
         "output_errors": 0, "last_output_error": None,
         "audio_source": None, "direct_ws_remote": None, "direct_ws_packets": 0,
+        "session_started_at": None, "session_ended_at": None, "stream_audio_bytes": 0,
     }
 
 
@@ -142,6 +160,9 @@ class PhoneStream:
 
 @dataclass
 class BridgeState:
+    audio_quality: AudioQualityMeter = field(default_factory=AudioQualityMeter)
+    audio_capture: AudioCapture = field(default_factory=AudioCapture)
+    capture_signal_ready: bool = False
     recognized_utterances: deque = field(default_factory=lambda: deque(maxlen=256))
     storage: TranscriptStore = field(default_factory=lambda: TranscriptStore(
         directory=lambda: LOG_DIR, append=lambda encoded: event_logger.info(encoded),
@@ -150,6 +171,7 @@ class BridgeState:
         on_error=lambda target, error: output_failed(target, error),
         on_recovered=lambda: state.metrics.update(last_output_error=None)))
     caption_listeners: dict = field(default_factory=dict)
+    caption_admission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     stream_clients: dict = field(default_factory=dict)
     stream_admission_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     recent_events: deque = field(default_factory=lambda: deque(maxlen=200))
@@ -157,12 +179,20 @@ class BridgeState:
     background_tasks: dict = field(default_factory=dict)
     stopping: bool = False
     metrics: dict = field(default_factory=new_metrics)
-    live_stt: LocalWhisperSTT | None = None
+    live_stt: TranscriptionBackend | None = None
     partial_caption: dict | None = None
     latency_samples: dict = field(default_factory=lambda: {
-        name: deque(maxlen=128) for name in ("receipt_to_transcript_sec",
-                                           "receipt_to_first_partial_sec", "receipt_to_final_sec",
-                                           "receipt_to_send_sec", "turn_close_to_final_sec", "turn_boundary_wait_sec")})
+        name: deque(maxlen=128) for name in (
+            "receipt_to_transcript_sec",
+            "receipt_to_first_partial_sec",
+            "speech_start_to_first_partial_sec",
+            "receipt_to_final_sec",
+            "speech_end_to_final_sec",
+            "receipt_to_send_sec",
+            "turn_close_to_final_sec",
+            "turn_boundary_wait_sec",
+            "local_decode_sec",
+        )})
 
 
 state = BridgeState()
@@ -186,6 +216,22 @@ def oldest_pending_audio_age():
     return round(age, 3) if age is not None else None
 
 
+def stream_audio_duty():
+    """Audio seconds received against the wall clock of the current or last session.
+
+    A duty well below 1.0 means the phone forwards in bursts, which is not loss:
+    the lost_audio_sec_* counters account for dropped audio separately. Wall time
+    freezes at disconnect so a stale session cannot dilute the ratio.
+    """
+    started = state.metrics["session_started_at"]
+    ended = state.metrics["session_ended_at"]
+    audio = state.metrics["stream_audio_bytes"] / BYTES_PER_SECOND
+    if started is None:
+        return audio, None, None
+    wall = max(0.0, (ended if ended is not None else time.monotonic()) - started)
+    return audio, wall, (round(audio / wall, 3) if wall > 0 else None)
+
+
 @dataclass
 class CaptionListener:
     queue: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=64))
@@ -205,11 +251,10 @@ def publish_caption(event):
     for listener in list(state.caption_listeners.values()):
         if clear:
             listener.partial = {"type": "partial", "utterance_id": identity or "", "text": ""} if is_gap else None
-        if not is_gap:
-            try:
-                listener.queue.put_nowait(event)
-            except asyncio.QueueFull:
-                listener.closed = True  # Reconnect can replay retained events.
+        try:
+            listener.queue.put_nowait(event)
+        except asyncio.QueueFull:
+            listener.closed = True  # Reconnect can replay retained events.
         listener.ready.set()
 
 
@@ -258,20 +303,41 @@ def current_stt_in_flight():
     return bool(state.live_stt is not None and state.live_stt.speech_pending)
 
 
+def workers_alive():
+    return bool(state.background_tasks) and all(not task.done() for task in state.background_tasks.values())
+
+
 def caption_status():
     now = time.monotonic()
     packet = state.metrics["last_packet_at"]
     age = max(0, now - packet) if packet is not None else None
     stream = state.live_stt
+    _, _, duty = stream_audio_duty()
     return {"type": "status", "stream_id": state.stream_id,
             "session_id": stream.session_id if stream is not None else None,
             "stt_mode": "live", "stt_backend": STT_BACKEND,
             "stream_connected": bool(stream is not None and stream.connected),
+            "backend_ready": bool(stream is not None and getattr(stream, "ready", stream.connected)),
+            "provider_connection_state": getattr(stream, "connection_state", "connected" if stream is not None and stream.connected else "disconnected"),
+            "provider_resolved_model": getattr(stream, "resolved_model", None),
+            "stt_pipeline": getattr(stream, "pipeline", "direct" if STT_BACKEND == "deepgram" else "local"),
             "audio_active": age is not None and age < 3,
             "last_packet_age_sec": round(age, 1) if age is not None else None,
             "buffer_sec": round(buffered_audio_bytes() / BYTES_PER_SECOND, 1),
             "stt_in_flight": current_stt_in_flight(),
-            "queue_depth": len(stream.queue) if stream is not None else 0}
+            "queue_depth": len(stream.queue) if stream is not None else 0,
+            "model": MODEL_LABEL,
+            "latency_final_p50_sec": latency_summary(state.latency_samples.get("receipt_to_final_sec"))["p50"],
+            "latency_speech_end_to_final_p50_sec": latency_summary(state.latency_samples.get("speech_end_to_final_sec"))["p50"],
+            "latency_speech_start_to_first_partial_p50_sec": latency_summary(state.latency_samples.get("speech_start_to_first_partial_sec"))["p50"],
+            "latency_turn_close_to_final_p50_sec": latency_summary(state.latency_samples.get("turn_close_to_final_sec"))["p50"],
+            "latency_provider_connect_p50_sec": latency_summary(state.latency_samples.get("provider_connect_sec"))["p50"],
+            "latency_final_to_persist_p50_sec": latency_summary(state.latency_samples.get("final_to_persist_sec"))["p50"],
+            "audio_duty": duty,
+            "workers_alive": workers_alive(),
+            "last_error": state.metrics["last_error"],
+            "save_error": getattr(stream, "save_error", None),
+            "transcripts_emitted": state.metrics["transcripts_emitted"]}
 
 
 async def caption_status_worker():
@@ -307,8 +373,7 @@ def write_event(event):
 
 
 def publish_saved(event):
-    if event.get("type") != "gap":
-        state.recent_events.append(dict(event))
+    state.recent_events.append(dict(event))
     publish_caption(event)
     if event.get("type") == "transcript" and event.get("text"):
         text_val = event["text"]
@@ -331,18 +396,26 @@ def publish_saved(event):
 
 
 def make_event(kind, text, audio_start_at=None, received_at=None, processed_at=None,
-               session_id=None, sample_offset=None, utterance_id=None, sample_end_offset=None):
+               session_id=None, sample_offset=None, utterance_id=None, sample_end_offset=None,
+               speech_start_offset=None, voice_end_offset=None, recognition=None):
     processed_at = time.time() if processed_at is None else processed_at
     source_at = audio_start_at if audio_start_at is not None else processed_at
     event = {"event_id": uuid.uuid4().hex, "stream_id": state.stream_id, "type": kind,
             "timestamp": datetime.fromtimestamp(source_at).strftime("%Y-%m-%d %H:%M:%S"),
             "text": text, "audio_start_at": audio_start_at, "received_at": received_at,
             "processed_at": processed_at, "session_id": session_id, "sample_offset": sample_offset,
-            "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time"}
+            "time_basis": "estimated_from_receipt" if audio_start_at is not None else "processing_time",
+            "stt_backend": STT_BACKEND, "model": MODEL_LABEL}
+    if recognition is not None:
+        event["recognition"] = recognition
     if utterance_id is not None:
         event.update(utterance_id=utterance_id, is_final=True, transcription_mode="live")
     if sample_end_offset is not None:
         event["sample_end_offset"] = sample_end_offset
+    if speech_start_offset is not None:
+        event["speech_start_offset"] = speech_start_offset
+    if voice_end_offset is not None:
+        event["voice_end_offset"] = voice_end_offset
     return event
 
 
@@ -376,28 +449,39 @@ def ingest_raw_pcm(raw, sr=SAMPLE_RATE):
     if not raw:
         return
     now, received_at = time.monotonic(), time.time()
+    start_sample = state.live_stt.total_input_samples
     state.live_stt.feed(raw, received_at, now)
+    state.audio_capture.feed(raw, sample_offset=start_sample,
+                             session_id=state.live_stt.session_id, now=now)
+    state.audio_quality.add(raw, now)
     state.metrics["last_packet_at"] = now
 
 
 def build_health_dict():
     now = time.monotonic()
     stream = state.live_stt
-    workers_alive = bool(state.background_tasks) and all(not task.done() for task in state.background_tasks.values())
+    workers = workers_alive()
     connected = bool(stream is not None and stream.connected)
+    backend_ready = bool(stream is not None and getattr(stream, "ready", connected))
     overloaded = bool(stream is not None and (stream.pending_bytes >= QUEUE_MAX_BYTES or len(stream.queue) >= QUEUE_MAX_PACKETS))
     pending_age = oldest_pending_audio_age()
     stalled = pending_age is not None and pending_age > MAX_AUDIO_AGE_SEC
-    ready = (workers_alive and connected and not state.stopping and not overloaded
+    stream_audio_sec, stream_wall_sec, audio_duty = stream_audio_duty()
+    ready = (workers and backend_ready and not state.stopping and not overloaded
              and not stalled and not getattr(stream, "save_error", None)
              and not state.metrics["last_error"] and not state.metrics["last_output_error"])
     return {
         "status": "ok" if ready else "degraded",
         "is_setup_completed": True, "message": "", "pid": os.getpid(),
         "stt_mode": "live", "stt_backend": STT_BACKEND,
-        "model": "whisper-large-v3-turbo-fp16",
+        "model": MODEL_LABEL,
         "worker_load_warm_sec": getattr(stream, "load_warm_sec", None),
         "stream_connected": connected,
+        "backend_ready": backend_ready,
+        "cloud_audio_processing": STT_BACKEND == "deepgram",
+        "provider_connection_state": getattr(stream, "connection_state", "connected" if connected else "disconnected"),
+        "provider_resolved_model": getattr(stream, "resolved_model", None),
+            "stt_pipeline": getattr(stream, "pipeline", "direct" if STT_BACKEND == "deepgram" else "local"),
         "stream_reconnects": stream.reconnects if stream is not None else 0,
         "partial_updates": stream.partial_updates if stream is not None else 0,
         "pending_finals": stream.pending_final_count if stream is not None else 0,
@@ -405,6 +489,7 @@ def build_health_dict():
         "save_error": getattr(stream, "save_error", None),
         "last_flush_completed": getattr(stream, "last_flush_completed", None),
         "turns_without_text": stream.turns_without_text if stream is not None else 0,
+        "no_text_causes": dict(stream.no_text_causes) if stream is not None else {},
         "gap_causes": dict(stream.gap_causes) if stream is not None else {},
         "stt_in_flight": current_stt_in_flight(), "max_audio_age_sec": MAX_AUDIO_AGE_SEC,
         "latency": {name: latency_summary(samples) for name, samples in state.latency_samples.items()},
@@ -412,14 +497,20 @@ def build_health_dict():
         **{k: round(v, 6) if isinstance(v, float) else v for k, v in state.metrics.items()
            if k.startswith("lost_audio_sec_") or k in ("output_errors", "last_output_error")},
         "python_version": platform.python_version(), "openssl_version": ssl.OPENSSL_VERSION,
-        "workers_alive": workers_alive, "stopping": state.stopping,
+        "workers_alive": workers, "stopping": state.stopping,
         "uptime_sec": round(now - state.metrics["started_at"], 1),
         "last_packet_age_sec": round(now - state.metrics["last_packet_at"], 1) if state.metrics["last_packet_at"] is not None else None,
         "last_stt_success_age_sec": round(now - state.metrics["last_stt_success_at"], 1) if state.metrics["last_stt_success_at"] is not None else None,
         "last_transcript_age_sec": round(now - state.metrics["last_transcript_at"], 1) if state.metrics["last_transcript_at"] is not None else None,
         "queue_depth": len(stream.queue) if stream is not None else 0, "queue_capacity_audio_sec": QUEUE_AUDIO_SECONDS,
         "overloaded": overloaded, "buffer_bytes": buffered_audio_bytes(),
+        "stream_audio_sec": round(stream_audio_sec, 1),
+        "stream_wall_sec": round(stream_wall_sec, 1) if stream_wall_sec is not None else None,
+        "audio_duty": audio_duty,
+        "audio_quality": state.audio_quality.snapshot(now),
+        "audio_capture": {**state.audio_capture.snapshot(), "supported": state.capture_signal_ready},
         "direct_ws_connected": bool(state.stream_clients),
+        "caption_clients": len(state.caption_listeners), "caption_client_limit": MAX_CAPTION_CLIENTS,
         **{key: state.metrics[key] for key in ("utterances_processed", "audio_gaps", "queue_evictions", "last_error",
                                         "transcripts_emitted", "audio_source", "direct_ws_remote",
                                         "direct_ws_packets")},
@@ -436,11 +527,12 @@ def _extract_stream_token(request):
     return (request.headers.get("X-Omi-Token") or request.query.get("token") or request.query.get("key") or "").strip()
 
 
-def _verify_stream_auth(request):
-    if not STREAM_TOKEN:
+def _verify_stream_auth(request, token=None):
+    token = STREAM_TOKEN if token is None else token
+    if not token:
         return
     candidate = _extract_stream_token(request)
-    if not candidate or not hmac.compare_digest(candidate, STREAM_TOKEN):
+    if not candidate or not hmac.compare_digest(candidate.encode("utf-8"), token.encode("utf-8")):
         raise web.HTTPUnauthorized(text="Valid stream token required")
 
 
@@ -477,15 +569,24 @@ async def handle_omi_ws(request):
     # Serialize admission across the handshake so concurrent attempts cannot
     # bypass the single-stream check. Failed upgrades leave the old stream alone.
     async with state.stream_admission_lock:
+        if state.stopping:
+            raise web.HTTPServiceUnavailable(text="Bridge is draining for shutdown")
         if state.stream_clients and remote_ip != state.metrics.get("direct_ws_remote"):
             raise web.HTTPConflict(text="Another direct audio stream is already active")
         await ws.prepare(request)
+        if state.stopping:
+            await ws.close(code=1012, message=b"Bridge is shutting down")
+            return ws
         for old_ws in list(state.stream_clients):
             state.stream_clients.pop(old_ws, None)
             asyncio.create_task(old_ws.close())
         start_sample = state.live_stt.total_input_samples if state.live_stt is not None else 0
         if state.live_stt is not None:
             state.live_stt.new_session()
+        state.metrics["session_started_at"] = time.monotonic()
+        state.metrics["session_ended_at"] = None
+        state.metrics["stream_audio_bytes"] = 0
+        state.audio_quality = AudioQualityMeter()
         state.stream_clients[ws] = PhoneStream(queue, start_sample)
         state.metrics["direct_ws_remote"] = remote_ip
         state.metrics["audio_source"] = "direct_ws"
@@ -504,12 +605,17 @@ async def handle_omi_ws(request):
     task = asyncio.create_task(sender())
     try:
         async for message in ws:
+            # A replaced socket may still have buffered frames while close is
+            # pending. It no longer owns the new session's audio or controls.
+            if ws not in state.stream_clients or state.stopping:
+                break
             if message.type == aiohttp.WSMsgType.BINARY:
                 raw = message.data
                 if raw.startswith(b"RIFF") or len(raw) % 2:
                     await ws.close(code=1003, message=b"Expected raw 16000 Hz mono PCM16")
                     break
                 state.metrics["direct_ws_packets"] += 1
+                state.metrics["stream_audio_bytes"] += len(raw)
                 state.metrics["audio_source"] = "direct_ws"
                 ingest_raw_pcm(raw, sr)
             elif message.type == aiohttp.WSMsgType.TEXT:
@@ -527,7 +633,11 @@ async def handle_omi_ws(request):
             elif message.type in (aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
                 break
     finally:
-        state.stream_clients.pop(ws, None)
+        active = state.stream_clients.pop(ws, None) is not None
+        if active and state.metrics["session_started_at"] is not None:
+            state.metrics["session_ended_at"] = time.monotonic()
+            if state.live_stt is not None and not state.stopping:
+                state.live_stt.request_flush()
         logger.info("Direct phone WebSocket disconnected from %s", remote_ip)
         try:
             queue.put_nowait(None)
@@ -541,6 +651,7 @@ async def handle_omi_ws(request):
 
 async def handle_listen(request):
     """Stream caption JSON, replay boundaries, and pipeline status to viewers."""
+    _verify_stream_auth(request, CAPTION_TOKEN)
     if request.query.get("mode", "captions") != "captions":
         raise web.HTTPBadRequest(text="Only captions are supported")
     try:
@@ -552,20 +663,26 @@ async def handle_listen(request):
     after = request.query.get("after")
     if after is not None and len(after) > 128:
         raise web.HTTPBadRequest(text="Invalid replay cursor")
-    ws = web.WebSocketResponse(heartbeat=20)
-    await ws.prepare(request)
-    listener = CaptionListener()
-    # Snapshot and subscribe without an await: no hole between replay and live delivery.
-    history = list(state.recent_events)
-    replay, reset = [], False
-    if after:
-        index = next((i for i, event in enumerate(history) if event.get("event_id") == after), None)
-        reset = index is None
-        replay = history[index + 1:] if index is not None else (history[-count:] if count else [])
-    elif count:
-        replay = history[-count:]
-    listener.partial = dict(state.partial_caption) if state.partial_caption else None
-    state.caption_listeners[ws] = listener
+    ws = web.WebSocketResponse(heartbeat=20, max_msg_size=4096)
+    async with state.caption_admission_lock:
+        if state.stopping or len(state.caption_listeners) >= MAX_CAPTION_CLIENTS:
+            raise web.HTTPServiceUnavailable(text="Caption service is at capacity or shutting down")
+        await ws.prepare(request)
+        if state.stopping:
+            await ws.close(code=1012, message=b"Bridge is shutting down")
+            return ws
+        listener = CaptionListener()
+        # Snapshot and subscribe without an await: no hole between replay and live delivery.
+        history = list(state.recent_events)
+        replay, reset = [], False
+        if after:
+            index = next((i for i, event in enumerate(history) if event.get("event_id") == after), None)
+            reset = index is None
+            replay = history[index + 1:] if index is not None else (history[-count:] if count else [])
+        elif count:
+            replay = history[-count:]
+        listener.partial = dict(state.partial_caption) if state.partial_caption else None
+        state.caption_listeners[ws] = listener
 
     async def send_json(event):
         await asyncio.wait_for(ws.send_json(event), timeout=5)
@@ -615,8 +732,7 @@ async def on_startup(app):
     callbacks = dict(on_partial=publish_partial, on_final=record_live_final,
         on_gap=record_live_gap, on_latency=record_latency, on_connection=live_connection_changed,
         max_age=MAX_AUDIO_AGE_SEC, idle_flush=IDLE_FLUSH_SEC)
-    state.live_stt = LocalWhisperSTT(python=WHISPER_PYTHON, model=WHISPER_MODEL,
-                                   vad=WHISPER_VAD, **callbacks)
+    state.live_stt = create_transcription_backend(callbacks)
     for name, factory in (("caption_status_task", caption_status_worker), ("live_stt_task", state.live_stt.run)):
         app[name] = asyncio.create_task(factory())
         state.background_tasks[name] = app[name]
@@ -624,6 +740,7 @@ async def on_startup(app):
 
 async def on_shutdown(app):
     state.stopping = True
+    state.audio_capture.close()
     await asyncio.gather(*(ws.close() for ws in list(state.caption_listeners) + list(state.stream_clients)), return_exceptions=True)
 
 
@@ -667,6 +784,8 @@ async def serve():
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(signum, finished.set)
+    loop.add_signal_handler(signal.SIGUSR1, state.audio_capture.start)
+    state.capture_signal_ready = True
     runner = web.AppRunner(create_app(), access_log=None)
     health_runner = web.AppRunner(create_health_app(), access_log=None)
     try:
@@ -677,17 +796,22 @@ async def serve():
         logger.info("Listening on %s:%d; local health on 127.0.0.1:%d", HOST, PORT, HEALTH_PORT)
         await finished.wait()
     finally:
-        await health_runner.cleanup()
-        await runner.cleanup()
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            loop.remove_signal_handler(signum)
+        try:
+            await health_runner.cleanup()
+            await runner.cleanup()
+        finally:
+            state.capture_signal_ready = False
+            loop.remove_signal_handler(signal.SIGUSR1)
+            state.audio_capture.close()
+            for signum in (signal.SIGINT, signal.SIGTERM):
+                loop.remove_signal_handler(signum)
 
 
 if __name__ == "__main__":
     try:
         configure()
     except (ValueError, OSError):
-        sys.exit("Invalid bridge configuration; check model paths and numeric settings in .env")
+        sys.exit("Invalid bridge configuration; check model paths, language allowlist and numeric settings in .env")
     if len(sys.argv) > 1:
         if sys.argv[1:] != ["--check-config"]:
             sys.exit("Usage: bridge.py [--check-config]")

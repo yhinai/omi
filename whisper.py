@@ -6,7 +6,7 @@ only an immutable, closed audio snapshot can produce a final event.
 import argparse
 import asyncio
 import base64
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 import json
@@ -17,10 +17,75 @@ import stat
 import time
 import types
 import uuid
+import zlib
 from common import RATE, WHISPER_POLICY, PACKET_MAX_BYTES
 
 FRAME = 512
 PRE_ROLL = 31  # 992 ms retained before the voice trigger; no extra waiting.
+
+DEFAULT_HOTWORDS = (
+    "A talk about AI infrastructure by Yahya Alhinai in Oman, mentioning Omi, MLX, "
+    "vLLM, SGLang, KV cache, Triton, Helion, Mojo, CUDA and GPU kernels."
+)
+HOTWORDS_MAX_CHARS = 800
+MAX_WORDS_PER_SECOND = 8.0
+DEFAULT = object()  # sentinel: "use the configured language"
+
+
+def degenerate(text, prompt="", seconds=None):
+    """True when a transcription cannot be trusted.
+
+    Whisper prepends initial_prompt to its decoder context, so on awkward audio it
+    can copy or loop the prompt instead of transcribing. Four independent tests,
+    each cheap and each sufficient on its own:
+
+      * physically impossible output (more words than could be spoken in the clip)
+      * a single 3-gram covering 40% of the words
+      * compression ratio >= 4.0 (normal speech sits near 2-2.6), including scripts without spaces
+      * most words coming straight from the prompt
+    """
+    if len(text) >= 48:
+        compressed = len(zlib.compress(text.encode("utf-8"), 6)) or 1
+        if len(text) / compressed >= 4.0:
+            return True
+    words = [word.strip(".,!?;:\"'").lower() for word in text.split()]
+    count = len(words)
+    if not count:
+        return False
+    if seconds is not None and count > max(8.0, seconds * MAX_WORDS_PER_SECOND):
+        return True
+    if count >= 8:
+        grams = Counter(tuple(words[index:index + 3]) for index in range(count - 2))
+        if grams and grams.most_common(1)[0][1] * 3 >= count * 0.4:
+            return True
+    if prompt and count >= 8:
+        prompt_words = {word.strip(".,!?;:\"'").lower() for word in prompt.split()}
+        if sum(1 for word in words if word in prompt_words) / count >= 0.6:
+            return True
+    return False
+
+
+def language_setting(raw=None):
+    """Target language, or None for per-utterance detection (OMI_LANGUAGE=auto)."""
+    value = (os.environ.get("OMI_LANGUAGE", "en") if raw is None else raw).strip().lower()
+    return None if value in ("", "auto") else value
+
+
+def language_allowlist(raw=None):
+    """Languages whose transcripts may be published (OMI_LANGUAGES, comma separated)."""
+    value = os.environ.get("OMI_LANGUAGES", "en") if raw is None else raw
+    return {part.strip().lower() for part in str(value).split(",") if part.strip()}
+
+
+def hotword_prompt(raw=None):
+    """Return the decoder prompt that biases spelling toward names and jargon.
+
+    Whisper keeps only the last 224 tokens of an initial_prompt, so a long prompt
+    silently drops its own beginning; the cap keeps the useful terms. Empty or
+    whitespace-only returns "" and disables biasing.
+    """
+    text = os.environ.get("OMI_HOTWORDS", DEFAULT_HOTWORDS) if raw is None else raw
+    return " ".join(str(text).split())[:HOTWORDS_MAX_CHARS].strip()
 
 
 def emit(event):
@@ -32,13 +97,35 @@ class Recognizer:
         import mlx.core as mx
         import numpy as np
         import onnxruntime as ort
+        from mlx_whisper.audio import N_FRAMES, log_mel_spectrogram, pad_or_trim
+        from mlx_whisper.decoding import DecodingOptions
+        from mlx_whisper.tokenizer import get_tokenizer
         from mlx_whisper.transcribe import ModelHolder
 
         self.mx, self.np, self.path = mx, np, str(model_path)
+        self._log_mel = log_mel_spectrogram
+        self._pad_or_trim = pad_or_trim
+        self._n_frames = N_FRAMES
+        self._decoding_options = DecodingOptions
+        self.hotwords = hotword_prompt()
+        self.language = language_setting()
+        self.languages = language_allowlist()
+        self._cached_features = (None, None)
+        self._prompt_token_cache = {}
+        self._last_no_speech = False
         mx.set_default_device(mx.gpu)
         if not mx.metal.is_available():
             raise RuntimeError("Metal GPU is unavailable")
         model = ModelHolder.get_model(self.path, mx.float16)
+        self.model = model
+        self._tokenizer = get_tokenizer(
+            model.is_multilingual,
+            num_languages=model.num_languages,
+            language=self.language or "en",
+            task="transcribe",
+        )
+        if self.hotwords:
+            self._prompt_token_cache[self.hotwords] = list(self._tokenizer.encode(" " + self.hotwords.strip()))
 
         def fused(attention, q, k, v, mask=None):
             batch, length, state = q.shape
@@ -75,15 +162,71 @@ class Recognizer:
         return float(result[0][0])
 
     def decode(self, pcm):
-        import mlx_whisper
-        self.mx.set_default_device(self.mx.gpu)
-        audio = self.np.frombuffer(pcm, dtype="<i2").astype(self.np.float32) / 32768
+        """Return (text, seconds, reason); reason names a silent drop when text is empty."""
+        seconds = len(pcm) / 2 / RATE
+        self._last_no_speech = False
+        text, language, elapsed = self._transcribe(pcm, self.hotwords, 0.0)
+        if language and language not in self.languages:
+            return "", elapsed, "language"
+        if text and degenerate(text, self.hotwords, seconds):
+            # Suspicious output: ask again without the prompt, slightly warmer, and
+            # with language detection on. That both breaks prompt-echo loops and
+            # tells us when the audio was never the target language to begin with.
+            self._last_no_speech = False
+            retry, retry_language, retry_elapsed = self._transcribe(pcm, "", 0.2, language=None)
+            elapsed += retry_elapsed
+            if retry_language and retry_language not in self.languages:
+                return "", elapsed, "language"
+            if degenerate(retry, "", seconds):
+                return "", elapsed, "degenerate"
+            if not retry and getattr(self, "_last_no_speech", False):
+                return "", elapsed, "no_speech"
+            return retry, elapsed, ""
+        if not text and getattr(self, "_last_no_speech", False):
+            return "", elapsed, "no_speech"
+        return text, elapsed, ""
+
+    def _transcribe(self, pcm, prompt, temperature, language=DEFAULT):
+        mx = self.mx
+        mx.set_default_device(mx.gpu)
+        target_language = self.language if language is DEFAULT else language
         start = time.monotonic()
-        result = mlx_whisper.transcribe(audio, path_or_hf_repo=self.path, language="en",
-            task="transcribe", temperature=0.0, condition_on_previous_text=False,
-            fp16=True, word_timestamps=False, verbose=None)
-        self.mx.synchronize()
-        return result["text"].strip(), time.monotonic() - start
+        cached_pcm, features = self._cached_features
+        if cached_pcm is not pcm or features is None:
+            audio = self.np.frombuffer(pcm, dtype="<i2").astype(self.np.float32) / 32768
+            mel = self._pad_or_trim(
+                self._log_mel(audio, n_mels=self.model.dims.n_mels),
+                self._n_frames,
+                axis=-2,
+            ).astype(mx.float16)
+            features = self.model.encoder(mel[None])[0]
+            self._cached_features = (pcm, features)
+        prompt_tokens = None
+        if prompt:
+            prompt_tokens = self._prompt_token_cache.get(prompt)
+            if prompt_tokens is None:
+                prompt_tokens = list(self._tokenizer.encode(" " + prompt.strip()))
+                if len(self._prompt_token_cache) < 8:
+                    self._prompt_token_cache[prompt] = prompt_tokens
+        seconds = max(0.25, len(pcm) / 2 / RATE)
+        max_tokens = min(224, max(56, int(seconds * 20) + 16))
+        options = self._decoding_options(
+            task="transcribe",
+            language=target_language,
+            temperature=temperature,
+            sample_len=max_tokens,
+            prompt=prompt_tokens,
+            fp16=True,
+            without_timestamps=False,
+        )
+        result = self.model.decode(features, options)
+        mx.synchronize()
+        elapsed = time.monotonic() - start
+        detected = result.language or target_language
+        if result.no_speech_prob > 0.6 and result.avg_logprob <= -1.0:
+            self._last_no_speech = True
+            return "", detected, elapsed
+        return result.text.strip(), detected, elapsed
 
 
 @dataclass
@@ -105,12 +248,23 @@ class Utterance:
     first: AudioFrame
     pcm: bytearray = field(default_factory=bytearray)
     identity: str = field(default_factory=lambda: uuid.uuid4().hex)
+    speech_start_offset: int = 0
+    speech_start_at: float = 0.0
+    speech_received_at: float = 0.0
+    confirm_count: int = 0
     confirmed: bool = False
     quiet_samples: int = 0
     last_voice_mono: float = 0.0
+    speech_started_mono: float | None = None
+    voice_end: int = 0
+    decoded_voice_end: int = 0
     end: int = 0
     closed_mono: float = 0.0
+    closed_by_pause: bool = False
     decoded_samples: int = 0
+    settled_result: tuple | None = None
+    settled_voice_end: int = 0
+    settled_max_prob_after: float = 0.0
     revision: int = 0
     text: str = ""
     first_partial: bool = False
@@ -141,7 +295,8 @@ class Stream:
     def partial(self, turn, text):
         turn.revision += 1
         self.event("partial", utterance_id=turn.identity, session_id=turn.first.session_id,
-                   revision=turn.revision, text=text)
+                   revision=turn.revision, text=text, audio_start_at=turn.speech_start_at,
+                   sample_offset=turn.first.sample_offset, speech_start_offset=turn.speech_start_offset)
 
     def release(self):
         candidates = [t.first.sample_offset for t in self.closed]
@@ -159,9 +314,10 @@ class Stream:
             self.event("status", pending_finals=status[0], speech_pending=status[1])
             self.last_status = status
 
-    def close_turn(self):
+    def close_turn(self, *, by_pause=False):
         if self.active is not None:
             self.active.closed_mono = time.monotonic()
+            self.active.closed_by_pause = by_pause
             self.closed.append(self.active)
             self.active = None
             self.changed.set()
@@ -171,6 +327,7 @@ class Stream:
         if self.carry and self.active is not None:
             self.active.pcm.extend(self.carry)
             self.active.end = self.carry_meta.end
+            self.active.settled_result = None
         self.carry.clear()
         self.carry_meta = None
 
@@ -210,7 +367,14 @@ class Stream:
             self.pre_roll.append(frame)
             if probability < self.policy.start_probability:
                 return
-            self.active = Utterance(self.pre_roll[0])
+            self.active = Utterance(
+                self.pre_roll[0],
+                speech_start_offset=frame.sample_offset,
+                speech_start_at=frame.audio_start_at,
+                speech_received_at=frame.received_at,
+                speech_started_mono=frame.received_mono,
+                voice_end=frame.end,
+            )
             for previous in self.pre_roll:
                 self.active.pcm.extend(previous.pcm)
             self.pre_roll.clear()
@@ -218,14 +382,23 @@ class Stream:
             self.active.pcm.extend(frame.pcm)
         turn = self.active
         turn.end = frame.end
-        turn.confirmed |= probability >= self.policy.confirm_probability
+        if probability >= self.policy.confirm_probability:
+            turn.confirm_count += 1
+            if turn.confirm_count >= self.policy.confirm_frames:
+                turn.confirmed = True
         if probability >= self.policy.continue_probability:
             turn.quiet_samples = 0
             turn.last_voice_mono = frame.received_mono
+            turn.voice_end = frame.end
+            turn.settled_result = None
+            turn.settled_max_prob_after = 0.0
         else:
             turn.quiet_samples += len(frame.pcm) // 2
-        if turn.quiet_samples >= RATE*self.policy.pause_seconds or len(turn.pcm) >= RATE*self.policy.max_turn_seconds*2:
-            self.close_turn()
+            if turn.settled_voice_end:
+                turn.settled_max_prob_after = max(turn.settled_max_prob_after, probability)
+        paused = turn.quiet_samples >= RATE * self.policy.pause_seconds
+        if paused or len(turn.pcm) >= RATE * self.policy.max_turn_seconds * 2:
+            self.close_turn(by_pause=paused)
         self.changed.set()
 
     def flush(self, identity, end):
@@ -245,6 +418,13 @@ class Stream:
             self.barriers.popleft()
             self.event("flushed", request_id=identity)
 
+    def prefinal_due(self, turn):
+        if not self.policy.prefinal_quiet_seconds or not turn.confirmed:
+            return False
+        if turn.quiet_samples < RATE * self.policy.prefinal_quiet_seconds:
+            return False
+        return turn.settled_result is None or turn.settled_voice_end < turn.voice_end
+
     async def decode_loop(self):
         loop = asyncio.get_running_loop()
         while True:
@@ -257,42 +437,64 @@ class Stream:
                 self.idle_flushed = True
             turn = self.closed[0] if self.closed else self.active
             final = bool(self.closed)
-            eligible = turn is not None and (final or self.draft_due(turn, time.monotonic()))
+            prefinal = bool(not final and turn is not None and self.prefinal_due(turn))
+            eligible = turn is not None and (final or prefinal or self.draft_due(turn, time.monotonic()))
             if eligible:
                 if final:
                     self.closed.popleft()
                 self.inference_turn = turn
                 self.inference_final = final
                 self.release()
-                self.last_decode = time.monotonic()
                 pcm = bytes(turn.pcm)  # The decoder never reads a mutable buffer.
+                voice_end_snap = turn.voice_end
                 turn.decoded_samples = len(pcm) // 2
+                turn.decoded_voice_end = voice_end_snap
+                if prefinal:
+                    turn.settled_voice_end = voice_end_snap
+                    turn.settled_max_prob_after = 0.0
                 if final and not turn.confirmed:
-                    text, elapsed = "", 0.0
+                    text, elapsed, reason = "", 0.0, "unconfirmed"
+                elif (final and turn.settled_result is not None
+                      and turn.closed_by_pause
+                      and turn.settled_voice_end == turn.voice_end
+                      and turn.settled_max_prob_after < 0.15):
+                    text, elapsed, reason = turn.settled_result
                 else:
-                    text, elapsed = await loop.run_in_executor(None, self.recognizer.decode, pcm)
-                self.event("latency", name="local_decode_sec", seconds=elapsed)
+                    self.last_decode = time.monotonic()
+                    text, elapsed, reason = await loop.run_in_executor(
+                        None, self.recognizer.decode, pcm)
+                    self.event("latency", name="local_decode_sec", seconds=elapsed)
+                if prefinal and turn.voice_end == voice_end_snap:
+                    turn.settled_result = (text, elapsed, reason)
                 if final:
                     if text:
                         self.event("final", text=text, utterance_id=turn.identity,
                             session_id=turn.first.session_id, sample_offset=turn.first.sample_offset,
-                            sample_end_offset=turn.end, received_at=turn.first.received_at,
-                            audio_start_at=turn.first.audio_start_at)
-                        self.event("latency", name="receipt_to_final_sec", seconds=time.monotonic()-turn.first.received_mono)
-                        self.event("latency", name="turn_close_to_final_sec", seconds=time.monotonic()-turn.closed_mono)
+                            sample_end_offset=turn.end, speech_start_offset=turn.speech_start_offset,
+                            voice_end_offset=turn.voice_end, received_at=turn.first.received_at,
+                            audio_start_at=turn.speech_start_at)
+                        now_mono = time.monotonic()
+                        self.event("latency", name="receipt_to_final_sec", seconds=now_mono-turn.first.received_mono)
+                        self.event("latency", name="turn_close_to_final_sec", seconds=max(0.0, now_mono-turn.closed_mono))
                         if turn.last_voice_mono:
-                            self.event("latency", name="speech_end_to_final_sec", seconds=time.monotonic()-turn.last_voice_mono)
-                    elif turn.confirmed:
-                        self.event("gap", reason="failed", seconds=len(pcm)/(RATE*2),
-                            session_id=turn.first.session_id, sample_offset=turn.first.sample_offset,
-                            received_at=turn.first.received_at, audio_start_at=turn.first.audio_start_at,
-                            detail="local_confirmed_speech_without_text")
+                            self.event("latency", name="turn_boundary_wait_sec",
+                                seconds=max(0.0, turn.closed_mono-turn.last_voice_mono))
+                            self.event("latency", name="speech_end_to_final_sec", seconds=max(0.0, now_mono-turn.last_voice_mono))
                     else:
-                        self.event("no_text")
+                        self.event("no_text", reason=reason or "empty")
+                        if turn.confirmed and reason not in ("language", "no_speech"):
+                            voiced_sec = max(FRAME, turn.voice_end - turn.speech_start_offset) / RATE
+                            self.event("gap", reason="failed", seconds=voiced_sec,
+                                session_id=turn.first.session_id, sample_offset=turn.speech_start_offset,
+                                received_at=turn.speech_received_at, audio_start_at=turn.speech_start_at,
+                                detail="local_confirmed_speech_without_text")
                     self.partial(turn, "")
-                elif text and text != turn.text:
+                elif turn is self.active and text and text != turn.text:
                     if not turn.first_partial:
                         self.event("latency", name="receipt_to_first_partial_sec", seconds=time.monotonic()-turn.first.received_mono)
+                        if turn.speech_started_mono is not None:
+                            self.event("latency", name="speech_start_to_first_partial_sec",
+                                seconds=time.monotonic()-turn.speech_started_mono)
                         turn.first_partial = True
                     turn.text = text
                     self.partial(turn, text)
@@ -312,7 +514,12 @@ class Stream:
 
     def draft_due(self, turn, now):
         samples = len(turn.pcm)//2
-        if samples < RATE*self.policy.initial_seconds:
+        speech_samples = turn.end - turn.speech_start_offset if turn.end else samples
+        if speech_samples < RATE*self.policy.initial_seconds:
+            return False
+        # Appending only trailing silence does not add words. Save that GPU work
+        # for the settled pre-final or the next speech frame.
+        if turn.decoded_samples and turn.voice_end <= turn.decoded_voice_end:
             return False
         # A timer tick plus a few jittered samples does not justify decoding the
         # whole utterance again. Finals always bypass draft throttling.

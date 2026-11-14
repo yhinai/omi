@@ -14,6 +14,7 @@ import wave
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import bridge
+from config import load_env
 from aiohttp.test_utils import TestClient, TestServer
 
 PHRASE = "The bridge test is working. Blue lantern seven."
@@ -57,7 +58,12 @@ def verify_saved(directory, finals, expected):
 
 
 async def check(args):
-    bridge.configure()
+    env = load_env()
+    if getattr(args, "backend", None):
+        env["OMI_STT_BACKEND"] = args.backend
+    if getattr(args, "pipeline", None):
+        env["OMI_DEEPGRAM_PIPELINE"] = args.pipeline
+    bridge.configure(env)
     with tempfile.TemporaryDirectory(prefix="omi-smoke-") as directory:
         pcm = load_audio(args, directory)
         bridge.LOG_DIR = directory
@@ -65,12 +71,13 @@ async def check(args):
         reader = None
         try:
             async with asyncio.timeout(args.timeout), TestClient(TestServer(bridge.create_app())) as client:
-                while not bridge.state.live_stt.connected:
+                while not getattr(bridge.state.live_stt, "ready", bridge.state.live_stt.connected):
                     await asyncio.sleep(.05)
                 partials, finals = [], []
                 started = None
                 complete = asyncio.Event()
-                async with client.ws_connect("/listen?replay=0") as captions:
+                caption_headers = {"Authorization": "Bearer " + bridge.CAPTION_TOKEN} if bridge.CAPTION_TOKEN else {}
+                async with client.ws_connect("/listen?replay=0", headers=caption_headers) as captions:
                     async def receive():
                         async for message in captions:
                             if message.type != bridge.aiohttp.WSMsgType.TEXT:
@@ -98,9 +105,13 @@ async def check(args):
             # Also validate any final events emitted during graceful shutdown.
             verify_saved(directory, finals, args.expect)
             report = {"status": "passed", "backend": bridge.STT_BACKEND,
+                "pipeline": getattr(bridge.state.live_stt, "pipeline", "direct" if bridge.STT_BACKEND == "deepgram" else "local"),
                 "partial_updates": len(partials), "finals": len(finals),
                 "first_partial_sec": partials[0]["observed_sec"],
                 "latency": bridge.build_health_dict()["latency"],
+                "pipeline_frames": getattr(bridge.state.live_stt, "pipeline_frames", {}),
+                "recognition_provenance": {k:v for k,v in finals[0].get("recognition", {}).items()
+                    if k in {"provider", "orchestration", "pipecat_version", "deepgram_sdk_version", "requested_model", "resolved_model", "model_version"}},
                 "jsonl_verified": True, "markdown_verified": True}
             if getattr(args, "report", None):
                 args.report.write_text(json.dumps(report, indent=2)+"\n")
@@ -116,6 +127,9 @@ def main():
     bridge.require_python315()
     parser = argparse.ArgumentParser(description=__doc__ + " Runs locally; normal logs stay untouched.")
     parser.add_argument("--report", type=Path, help="Write timing and verification results as JSON")
+    parser.add_argument("--backend", choices=("whisper", "deepgram"),
+                        help="Select a backend for this temporary test; deepgram sends synthesized/supplied audio to the cloud")
+    parser.add_argument("--pipeline", choices=("direct", "pipecat"), help="Deepgram orchestration for this isolated check")
     parser.add_argument("--wav", type=Path, help="Mono PCM16/16000 Hz WAV, at most 30 seconds; otherwise uses macOS speech")
     parser.add_argument("--expect", help="Phrase that must appear in the saved transcript; required with --wav")
     parser.add_argument("--timeout", type=float, default=60, help="Overall streaming timeout in seconds (8-120)")
@@ -125,7 +139,7 @@ def main():
     args.expect = args.expect or PHRASE
     if not normalize(args.expect) or not 8 < args.timeout <= 120:
         parser.error("Use a nonempty phrase and a timeout greater than 8 and at most 120 seconds")
-    print("Running an isolated local Whisper check; normal logs stay untouched.", flush=True)
+    print("Running an isolated recognition check; normal logs stay untouched.", flush=True)
     try:
         asyncio.run(check(args))
     except (TimeoutError, bridge.aiohttp.ClientError, ValueError, OSError, RuntimeError,
