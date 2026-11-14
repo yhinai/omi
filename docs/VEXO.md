@@ -109,3 +109,9 @@ One sustained run received 9,631 packets and drained 3,081,920 samples with zero
 old, corrupt, overflowed or discarded packets. A separate hardware stop test exited
 normally after draining 279 packets. Terminal captions were opened in a PTY; human
 readability was not independently assessed. Physical unplug/replug was not performed.
+
+The target's five migrated model files were verified against SHA-256 hashes from the
+source installation. Its isolated Whisper smoke produced a final with matching JSONL
+and Markdown. The actual `./omi backend whisper` / `./omi backend deepgram` switch
+commands were then exercised with capture stopped, returning to Pipecat/Deepgram.
+Whisper was verified with synthetic speech, not the live band phrase.
