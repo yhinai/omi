@@ -100,3 +100,19 @@ fault scenarios. The optional real-model enrollment test passed. A real isolated
 Pipecat/Deepgram run with diarization, vocabulary hints and a temporary synthetic voice
 profile produced two finals and verified local `You` attribution, JSONL and Markdown.
 The wearer has not been enrolled or measured by these synthetic tests.
+
+## Caption layout
+
+The terminal viewer places anonymous `Speaker N` in the left gutter immediately before
+the existing recording timestamp; timestamp and transcript columns stay fixed. It splits
+multi-speaker finals into separate display turns and can join adjacent chunks of the same
+scoped speaker. It does not insert bracketed speaker tags into sentence text or attach
+an unattributed partial to the preceding labeled speaker. Session export/bookmarks retain
+speaker-before-time formatting. In a narrow window, `S1` may replace `Speaker 1` so the
+timestamp column stays fixed.
+
+These labels are anonymous provider groups, not verified identities. Local verification
+uncertainty remains in the saved metadata; the reading margin omits the repeated
+`(uncertain)` suffix. The rendering change does not rewrite the authoritative journal or
+correct recognition/diarization errors. Speaker IDs remain scoped to their provider
+connection; do not assume `Speaker 1` always identifies the same person after reconnects.

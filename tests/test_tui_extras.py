@@ -831,3 +831,48 @@ class BatteryClockTests(unittest.TestCase):
         self.assertEqual(tui.battery_label(tui.Viewer()),'')
         with mock.patch.object(cli,'current_battery',return_value=None):
             self.assertEqual(tui.battery_label(tui.Viewer(local_battery=True)),'--%')
+
+class SpeakerGutterTests(unittest.TestCase):
+    def speaker_event(self,identity='original'):
+        return event('First voice. Second voice.',event_id=identity,stream_id='stream',sample_offset=0,sample_end_offset=32000,
+            speaker_turns=[dict(speaker_id=0,speaker_key='epoch:0',text='First voice.',sample_offset=0,sample_end_offset=16000,voice_identity={'status':'uncertain'}),
+                           dict(speaker_id=1,speaker_key='epoch:1',text='Second voice.',sample_offset=16000,sample_end_offset=32000)])
+
+    def test_labels_precede_fixed_timestamp_and_never_enter_sentence_text(self):
+        viewer=tui.Viewer(connected=True);viewer.add(self.speaker_event())
+        screen=Screen(26,100)
+        with mock.patch.object(tui.curses,'doupdate'),mock.patch.object(tui,'battery_label',return_value=''):
+            tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
+        _,left,_,_=tui.geometry(26,100)
+        for caption in viewer.captions:
+            line=next(''.join(row) for row in screen.lines if caption.text in ''.join(row))
+            self.assertEqual(line.index(caption.timestamp),left-10)
+            self.assertEqual(line.index(caption.text),left)
+            self.assertLess(line.index(caption.speaker_label),left-10)
+            self.assertNotIn('uncertain',line);self.assertNotIn('[Speaker',line)
+        self.assertEqual(viewer.last_event_id,'original')
+        viewer.add(self.speaker_event());self.assertEqual(len(viewer.captions),2)
+
+    def test_adjacent_same_speaker_chunks_join_and_different_speakers_do_not(self):
+        viewer=tui.Viewer();e=self.speaker_event();e['speaker_turns']=e['speaker_turns'][:1]
+        viewer.add(e)
+        next_event={**e,'event_id':'next','audio_start_at':101.1,'speaker_turns':[{**e['speaker_turns'][0],'text':'Continues.'}]}
+        viewer.add(next_event)
+        self.assertEqual(len(viewer.captions),1)
+        self.assertEqual(viewer.captions[0].text,'First voice. Continues.')
+        viewer.add(self.speaker_event('third'))
+        self.assertEqual(viewer.captions[-1].speaker_label,'Speaker 2')
+
+    def test_partial_is_not_presented_as_the_previous_speaker(self):
+        viewer=tui.Viewer();e=self.speaker_event();viewer.add(e)
+        viewer.add(event('Provisional words',type='partial',stream_id='stream',utterance_id='draft'))
+        self.assertNotEqual(viewer.draft_target_key,viewer.captions[-1].key)
+
+    def test_small_window_keeps_timestamp_column_and_compacts_speaker(self):
+        viewer=tui.Viewer();viewer.add(self.speaker_event())
+        screen=Screen(12,40)
+        with mock.patch.object(tui.curses,'doupdate'):
+            tui.paint(screen,viewer,{'text':0,'muted':1,'accent':2})
+        line=next(''.join(row) for row in screen.lines if 'First voice.' in ''.join(row))
+        self.assertEqual(line.index(viewer.captions[0].timestamp),3)
+        self.assertTrue(line.startswith('S1 '))

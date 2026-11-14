@@ -173,6 +173,8 @@ class Caption:
     rev: int = 0
     timed: bool = False
     speaker_labelled: bool = False
+    speaker_label: str = ""
+    speaker_key: object = None
     _cache: tuple | None = None
 
     @property
@@ -189,6 +191,7 @@ class Row:
     soft_from: int | None = None
     timestamp: str = ""
     bookmarked: bool = False
+    speaker_label: str = ""
 
 
 @dataclass
@@ -270,6 +273,38 @@ class Viewer:
         self.draft_source_at, self.draft_timestamp, self.draft_target_key = None, "", None
 
     def add(self, event):
+        turns = event.get('speaker_turns') if isinstance(event,dict) else None
+        if isinstance(turns,list) and turns and event.get('type','transcript')=='transcript':
+            valid=[t for t in turns[:512] if isinstance(t,dict) and isinstance(t.get('text'),str) and t['text'].strip()]
+            if valid:
+                identity=event.get('event_id')
+                if isinstance(identity,str):
+                    if identity in self.seen:
+                        if self.replaying:self.last_event_id=identity
+                        return
+                    self.seen.append(identity);self.last_event_id=identity
+                for turn in valid:
+                    child={k:v for k,v in event.items() if k not in {'speaker_turns','event_id'}}
+                    number=turn.get('speaker_id')
+                    numbered=isinstance(number,int) and not isinstance(number,bool) and number>=0
+                    child['text']=turn['text']
+                    child['_speaker_label']=f'Speaker {number+1}' if numbered else 'Speaker unknown'
+                    recognition=event.get('recognition')
+                    epoch=recognition.get('connection_epoch') if isinstance(recognition,dict) else None
+                    child['_speaker_key']=(turn.get('speaker_key') or epoch,number if numbered else None)
+                    start=turn.get('sample_offset');base=event.get('sample_offset');source=event.get('audio_start_at')
+                    if (isinstance(start,int) and isinstance(base,int) and isinstance(source,(int,float))
+                            and not isinstance(source,bool) and math.isfinite(source) and start>=base):
+                        child['audio_start_at']=source+(start-base)/16000
+                        try:child['timestamp']=datetime.fromtimestamp(child['audio_start_at']).strftime('%Y-%m-%d %H:%M:%S')
+                        except (ValueError,OverflowError,OSError):pass
+                    for key in ('sample_offset','sample_end_offset'):
+                        if isinstance(turn.get(key),int):child[key]=turn[key]
+                    self._add(child)
+                return
+        self._add(event)
+
+    def _add(self, event):
         if not isinstance(event, dict):
             return
         kind = event.get("type", "transcript")
@@ -363,7 +398,7 @@ class Viewer:
                            if event.get("session_id") is not None else None)
                 previous = self.captions[-1] if self.captions else None
                 same_session = bool(previous is not None and session is not None and session == previous.session)
-                continuous = (previous is not None and previous.kind == "transcript"
+                continuous = (previous is not None and not previous.speaker_labelled and previous.kind == "transcript"
                     and (session is None or session == previous.session)
                     and within_paragraph(self.draft_source_at, previous, DRAFT_NO_TIMING_SEC,
                                          speech_start_offset=event.get("speech_start_offset"),
@@ -429,7 +464,9 @@ class Viewer:
         valid_voice_span = (isinstance(speech_start, int) and not isinstance(speech_start, bool)
                             and isinstance(voice_end, int) and not isinstance(voice_end, bool)
                             and voice_end >= speech_start)
-        continuous = (not event.get("speaker_turns") and kind == "transcript" and previous is not None and previous.kind == kind
+        continuous = (kind == "transcript"
+                      and previous is not None and previous.speaker_key == event.get("_speaker_key")
+                      and bool(previous.speaker_label) == bool(event.get("_speaker_label")) and previous.kind == kind
                       and same_session
                       and within_paragraph(source, previous, speech_start_offset=speech_start,
                                            same_session=same_session))
@@ -453,9 +490,10 @@ class Viewer:
         while words:
             previous = self.captions[-1] if self.captions else None
             sentence_end = previous and len(previous.words) >= 90 and re.search(r"[.!?][^\w]*$", previous.words[-1])
-            append = continuous and previous is not None and not previous.speaker_labelled and len(previous.words) < 150 and not sentence_end
+            append = (continuous and previous is not None and previous.speaker_key == event.get("_speaker_key")
+                      and bool(previous.speaker_label) == bool(event.get("_speaker_label")) and len(previous.words) < 150 and not sentence_end)
             if not append:
-                meaningful = (kind == "transcript" and (previous is None or previous.kind == "gap"
+                meaningful = (kind == "transcript" and (bool(event.get("_speaker_label")) or previous is None or previous.kind == "gap"
                     or (session is not None and previous.session != session)
                     or (source is not None and (self.last_stamp_at is None or source - self.last_stamp_at >= 180))))
                 if reserved_key is not None:
@@ -464,7 +502,9 @@ class Viewer:
                     self.next_key += 1
                     key = self.next_key
                 previous = Caption(key, stamp, [], kind, session, source, meaningful)
-                previous.speaker_labelled = bool(event.get("speaker_turns"))
+                previous.speaker_label = event.get("_speaker_label", "")
+                previous.speaker_key = event.get("_speaker_key")
+                previous.speaker_labelled = bool(previous.speaker_label)
                 self.captions.append(previous)
                 if self.bookmarks:
                     self.bookmarks.intersection_update({c.key for c in self.captions})
@@ -563,7 +603,8 @@ def rows_for(viewer, width):
                 soft = draft_start
             stamp = caption.timestamp if viewer.show_times and (caption.show_stamp or is_bookmarked) and offset == 0 else ""
             rows.append(Row(caption.key, offset, line, "muted" if muted else "text", soft,
-                            timestamp=stamp, bookmarked=is_bookmarked and offset == 0))
+                            timestamp=stamp, bookmarked=is_bookmarked and offset == 0,
+                            speaker_label=caption.speaker_label if offset == 0 else ""))
             offset += len(line)
         rows.append(Row(caption.key, len(full_text) + 1, ""))
     if viewer.draft and not draft_inlined:
@@ -682,9 +723,15 @@ def jump_bookmark(viewer, rows, available, backwards=False):
     viewer.notify(f"Bookmark {index + 1}/{len(bookmarked)} · {target.timestamp}")
 
 
+def caption_text(caption, stamp=False):
+    if caption.speaker_label:
+        return f"{caption.speaker_label} {caption.timestamp} {caption.text}"
+    return f"[{caption.timestamp}] {caption.text}" if stamp else caption.text
+
+
 def bookmarked_text(viewer):
     return "\n\n".join(
-        f"[{c.timestamp}] {c.text}"
+        caption_text(c,stamp=True)
         for c in viewer.captions
         if c.kind == "transcript" and c.key in viewer.bookmarks
     )
@@ -742,7 +789,7 @@ def session_text(viewer):
     for caption in viewer.captions:
         if caption.kind != "transcript":
             continue
-        parts.append(f"[{caption.timestamp}] {caption.text}" if caption.show_stamp else caption.text)
+        parts.append(caption_text(caption,stamp=caption.show_stamp))
     return "\n\n".join(parts)
 
 
@@ -754,7 +801,7 @@ def export_session(viewer, directory):
     header = f"# Omi captions — {datetime.now():%Y-%m-%d %H:%M}\n\n"
     marked = [c for c in viewer.captions if c.kind == "transcript" and c.key in viewer.bookmarks]
     if marked:
-        pin_lines = "\n".join(f"- **[{c.timestamp}]** {c.text}" for c in marked)
+        pin_lines = "\n".join(f"- {caption_text(c,stamp=True)}" if c.speaker_label else f"- **[{c.timestamp}]** {c.text}" for c in marked)
         body = f"## Bookmarked Passages\n\n{pin_lines}\n\n## Full Transcript\n\n{text}\n"
     else:
         body = text + "\n"
@@ -1346,6 +1393,13 @@ def paint(screen, viewer, palette, measure: int | None = READING_MEASURE):
                         put(screen, y, left - (12 if left >= 12 else 10), mark, palette["accent"])
                     else:
                         put(screen, y, left - 10, row.timestamp, palette["muted"])
+                if row.speaker_label and row.timestamp:
+                    end=max(0,left-(13 if row.bookmarked else 11))
+                    label=row.speaker_label
+                    if cells(label)>end:
+                        label='S'+label.split()[-1] if label.split()[-1].isdigit() else '?'
+                    label=fit(label,end)
+                    if label:put(screen,y,end-cells(label),label,palette['muted'],reserve=0)
                 put(screen, y, left, row.text, palette[row.style])
                 if row.soft_from is not None:
                     start_soft = max(0, row.soft_from - row.offset)

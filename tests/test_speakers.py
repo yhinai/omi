@@ -38,8 +38,9 @@ class SpeakerTests(unittest.TestCase):
                    session_id=1,stream_id='s',audio_start_at=10,speaker_turns=turns(self.words(),'epoch'))
         viewer=tui.Viewer();viewer.add(event)
         viewer.add({**event,'event_id':'two','speaker_turns':[],'text':'No attribution.','audio_start_at':10.1})
-        self.assertEqual(len(viewer.captions),2)
-        self.assertIn('[Speaker 1]',viewer.captions[0].text)
+        self.assertEqual(len(viewer.captions),3)
+        self.assertEqual(viewer.captions[0].speaker_label,'Speaker 1')
+        self.assertEqual(viewer.captions[0].text,'Hello.')
         with tempfile.TemporaryDirectory() as td:
             store=TranscriptStore(directory=td,append=lambda _:None,create_event=lambda *a,**kw:event,
                 on_commit=lambda _:None,on_error=lambda *a:self.fail('save failed'),on_recovered=lambda:None)
